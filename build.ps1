@@ -29,7 +29,7 @@ if ($LASTEXITCODE -ne 0) { throw "cmake build(packer) 失败" }
 
 # ---- 阶段 1：确定负载并打包 ----
 if (-not $Target) {
-    $Target = Join-Path $Build "test\Release\test_payload.exe"
+    $Target = Join-Path $Build "test_payload\Release\test_payload.exe"
 }
 if (-not (Test-Path $Target)) { throw "未找到目标程序: $Target" }
 

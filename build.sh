@@ -18,7 +18,7 @@ echo "[2/4] build packer + test_payload"
 cmake --build "$BUILD" --config Release --target packer test_payload --parallel
 
 if [ -z "$TARGET" ]; then
-    TARGET="$BUILD/test/Release/test_payload.exe"
+    TARGET="$BUILD/test_payload/Release/test_payload.exe"
 fi
 [ -f "$TARGET" ] || { echo "错误: 目标不存在 $TARGET"; exit 1; }
 
