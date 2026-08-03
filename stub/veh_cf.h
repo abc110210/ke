@@ -8,7 +8,9 @@
 // ============================================================================
 #pragma once
 #include <windows.h>
+#include <psapi.h>      // GetModuleInformation / MODULEINFO
 #include <cstdint>
+#pragma comment(lib, "psapi.lib")
 
 #include "pe_loader.h"   // getLoadedModuleBase 等
 

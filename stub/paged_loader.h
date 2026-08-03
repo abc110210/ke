@@ -199,9 +199,10 @@ public:
             } else {
                 DWORD old = 0;
                 // 数据页保持可读写（非执行），不门控
+                SIZE_T sz = pageSize;
                 Sys::ProtectVirtualMemory(GetCurrentProcess(),
                     &reinterpret_cast<PVOID>(reinterpret_cast<uintptr_t>(pageBase[i])),
-                    &size, PAGE_READWRITE, &old);
+                    &sz, PAGE_READWRITE, &old);
                 pages[i].decrypted = true;
             }
         }
