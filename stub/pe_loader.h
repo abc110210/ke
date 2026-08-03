@@ -26,6 +26,13 @@
 
 #define PEARMOR_PAGE_SIZE 0x1000
 
+// SECTION_INHERIT 在 WIN32_LEAN_AND_MEAN 下不一定被 windows.h 暴露（与 psapi 同理），
+// 自行定义一份独立枚举，避免依赖 SDK 的暴露情况。值取自 winnt.h：ViewShare=1 / ViewUnmap=2。
+typedef enum _PEARMOR_SECTION_INHERIT {
+    PearmorViewShare = 1,
+    PearmorViewUnmap = 2
+} PEARMOR_SECTION_INHERIT, *PPEARMOR_SECTION_INHERIT;
+
 // ============================================================================
 // 直接系统调用 / PEB 解析 —— 避免依赖 LoadLibraryA 加载目标
 // ============================================================================
@@ -36,7 +43,7 @@ typedef NTSTATUS(NTAPI* pNtCreateFile)(
 
 typedef NTSTATUS(NTAPI* pNtMapViewOfSection)(
     HANDLE, HANDLE, PVOID*, ULONG_PTR, SIZE_T, PLARGE_INTEGER, PSIZE_T,
-    SECTION_INHERIT, ULONG, ULONG);
+    PEARMOR_SECTION_INHERIT, ULONG, ULONG);
 
 typedef NTSTATUS(NTAPI* pNtOpenSection)(PHANDLE, ACCESS_MASK, POBJECT_ATTRIBUTES);
 typedef NTSTATUS(NTAPI* pNtUnmapViewOfSection)(HANDLE, PVOID);
@@ -153,7 +160,7 @@ static inline uintptr_t resolveModuleBase(const wchar_t* moduleName, NtApiTable&
     SIZE_T viewSize = 0;
     NTSTATUS st = nt.NtMapViewOfSection(section, GetCurrentProcess(), &baseAddr,
                                         0, 0, nullptr, &viewSize,
-                                        ViewUnmap, 0, PAGE_READONLY);
+                                        PearmorViewUnmap, 0, PAGE_READONLY);
     nt.NtClose(section);
     if (st != 0) return 0;
     return reinterpret_cast<uintptr_t>(baseAddr);
@@ -262,7 +269,7 @@ public:
             DWORD raw  = sec[i].PointerToRawData;
             DWORD rsz  = sec[i].SizeOfRawData;
             if (va + vsz > sizeOfImage) vsz = sizeOfImage - va;
-            if (raw + rsz > peLen)      rsz = peLen > raw ? peLen - raw : 0;
+            if (raw + rsz > peLen)      rsz = static_cast<DWORD>(peLen > raw ? peLen - raw : 0);
             if (rsz > 0)
                 memcpy(reinterpret_cast<BYTE*>(imageBase) + va, peData + raw, rsz);
             if (vsz > rsz)

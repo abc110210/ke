@@ -9,7 +9,6 @@
 //   5) 跳 OEP（经一次 VEH 混淆跳转演示）
 // 附带: SEH 异常捕获 + 调试日志（写 %TEMP%\pearmor_stub.log）
 // ============================================================================
-#define WIN32_LEAN_AND_MEAN
 #include <windows.h>
 #include <cstdarg>
 #include <cstdio>
