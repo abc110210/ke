@@ -1,0 +1,489 @@
+// ============================================================================
+// paged_loader.h — 分页（按需解密）PE64 加载器  ★P1 核心★
+//
+// 设计要点：
+//   1) 启动时“整镜像一次性解密”仅用于修复重定位/导入（必要步骤）；
+//   2) 修复完成后，所有【代码页】立即重新加密并置 PAGE_NOACCESS；
+//   3) CPU 执行到某未解密代码页 → 触发 ACCESS_VIOLATION → VEH 捕获并
+//      仅解密该页 → 置 PAGE_EXECUTE_READ → 续跑；
+//   4) 监控线程周期性把“空闲超时代码页”重新加密，杜绝完整明文常驻内存；
+//   5) 解密即做 CRC 自校验，被 Patch 直接自毁；周期性扫描 ntdll 钩子防 Dump。
+//
+// 全程使用原生 Nt* 系统调用（syscall.h），绕过 Win32 API 钩子。
+// ============================================================================
+#pragma once
+#include <windows.h>
+#include <cstdint>
+#include <cstring>
+#include <vector>
+#include <mutex>
+#include <atomic>
+
+#include "pe_loader.h"     // ManualPeLoader 静态辅助（重定位/导入/TLS）
+#include "crypto_page.h"   // AesPageCipher 按页加解密
+#include "kdf.h"           // 密钥派生（P2.3 / P2.5）
+#include "syscall.h"       // 原生系统调用
+#include "guard.h"         // 自毁
+#include "anti_dump.h"     // ntdll 钩子检测
+#include "integrity.h"     // 页面 CRC 自校验
+#include "veh_cf.h"        // VEH 控制流混淆
+
+namespace pearmor {
+
+class PagedLoader {
+public:
+    struct PageState {
+        bool     decrypted = false;  // 当前为明文（可执行）
+        uint64_t lastUsed  = 0;      // 最近使用时间戳(ms)
+        bool     isCode    = false;  // 是否代码页（需按需解密/重加密）
+        uint32_t baseCrc   = 0;      // 运行期基准 CRC（重定位/导入修复后建立）
+    };
+
+    PagedLoader() = default;
+    ~PagedLoader() { Release(); }
+
+    // P3.2 非连续内存布局开关。默认开启：代码页分散到各自独立 VirtualAlloc 区域，
+    // 打破标准 PE 连续布局，使 Scylla 等工具无法一次性定位完整镜像。
+    static constexpr bool kNonContig = true;
+
+    // 主入口：加载 + 修复 + 门控代码页 + 注册 VEH + 启动监控
+    // 返回 true 时 outEntryRva 为原始入口 RVA
+    //   innerKey : 由 seed 经 KDF 派生的内层密钥，用于逐页解密代码
+    //   isCode   : 外层密钥解密后的块索引（每页是否代码页），长度 isCodeLen
+    bool Load(const unsigned char* payload, size_t payloadLen,
+              const unsigned char* innerKey,        // 32 字节，由 seed 经 KDF 派生
+              const unsigned char* isCode, uint32_t isCodeLen, // 外层密钥解密后的块索引
+              uint64_t& outEntryRva,
+              const unsigned char* seed32 = nullptr) // P3.5：密钥轮换用种子
+    {
+        if (!payload || payloadLen == 0) return false;
+        cipherData = payload;
+        pageSize   = PEARMOR_PAGE_SIZE;
+        pageCount  = (uint32_t)(payloadLen / pageSize);
+        if (pageCount == 0) return false;
+        if (seed32) memcpy(seed, seed32, 32); // 保存种子供 RotateKey 使用
+
+        // 内层密钥解密代码页；IV 母版 = innerKey 前 16 字节（与 packer 一致）
+        cipher.reset(new AesPageCipher(innerKey, innerKey));
+        if (!cipher->ok) return false;
+
+        pages.resize(pageCount);
+
+        // ---- 解析头，获取基址 / 镜像大小 / 节信息 ----
+        // 先整镜像解密到临时缓冲区以便读头（避免破坏 payload 密文）
+        std::vector<unsigned char> tmp(payloadLen);
+        for (uint32_t i = 0; i < pageCount; i++) {
+            if (!cipher->decryptPage(payload + i * pageSize, i, tmp.data() + i * pageSize, pageSize))
+                return false;
+        }
+
+        auto* dos = reinterpret_cast<IMAGE_DOS_HEADER*>(tmp.data());
+        if (dos->e_magic != IMAGE_DOS_SIGNATURE) return false;
+        auto* nt  = reinterpret_cast<IMAGE_NT_HEADERS*>(tmp.data() + dos->e_lfanew);
+        if (nt->Signature != IMAGE_NT_SIGNATURE) return false;
+        if (nt->OptionalHeader.Magic != IMAGE_NT_OPTIONAL_HDR64_MAGIC) return false;
+
+        const IMAGE_OPTIONAL_HEADER64& opt = nt->OptionalHeader;
+        uint64_t preferredBase = opt.ImageBase;
+        DWORD    sizeOfImage   = opt.SizeOfImage;
+
+        // 标记代码页：以“外层密钥解密出的块索引”为准（P2.5 分层）。
+        // 该索引由 packer 依据节特征计算并用 outerKey 加密，Stub 解密后传入，
+        // 因此没有外层密钥就无法确定哪些页需要门控 —— 双密钥缺一不可。
+        for (uint32_t i = 0; i < pageCount; i++) {
+            pages[i].isCode = (i < isCodeLen) ? (isCode[i] != 0) : false;
+        }
+
+        // ---- 修复用临时连续工作区（解密 + 重定位 + 导入 都在这里完成） ----
+        // 修复后才把各页拷到最终物理位置（非连续或连续），工作区随即释放，
+        // 故“整镜像连续明文”只在修复期短暂存在，运行时内存为非连续碎片。
+        std::vector<unsigned char> work(sizeOfImage);
+        for (uint32_t i = 0; i < pageCount; i++) {
+            if (!cipher->decryptPage(payload + i * pageSize, i,
+                    work.data() + i * pageSize, pageSize))
+                return false;
+        }
+        void* workBase = work.data();
+
+        bool relocated = (reinterpret_cast<uint64_t>(workBase) != preferredBase);
+        if (relocated && !ManualPeLoader::ApplyRelocations(workBase, preferredBase, opt)) return false;
+        if (!ManualPeLoader::FixImports(workBase, opt)) return false;
+        ManualPeLoader::FixDelayImports(workBase, opt);
+        if (opt.DataDirectory[IMAGE_DIRECTORY_ENTRY_TLS].VirtualAddress)
+            ManualPeLoader::RunTlsCallbacks(workBase, opt);
+
+        imageSize = sizeOfImage;
+
+        // ---- P3.2：分配最终物理布局 ----
+        //   代码页：各自独立 VirtualAlloc 区域（非连续）；失败则回退连续块。
+        //   数据页：集中在一块连续区域（非执行，便于访问；代码页已分散足以混淆）。
+        pageBase.resize(pageCount, nullptr);
+        nonContig = false;
+        {
+            bool ok = true;
+            for (uint32_t i = 0; i < pageCount && ok; i++) {
+                if (!pages[i].isCode) continue;     // 代码页才分散
+                PVOID rgn = nullptr; SIZE_T rsz = pageSize;
+                NTSTATUS st = Sys::AllocateVirtualMemory(GetCurrentProcess(), &rgn, 0,
+                    &rsz, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+                if (!NT_SUCCESS(st) || !rgn) { ok = false; break; }
+                pageRegions.push_back(rgn);
+                pageBase[i] = rgn;
+            }
+            if (ok && kNonContig) {
+                nonContig = true;
+            } else {
+                // 回退：释放已分配的零散区域，统一连续分配
+                for (void* r : pageRegions) { SIZE_T z = 0; Sys::FreeVirtualMemory(GetCurrentProcess(), &r, &z); }
+                pageRegions.clear();
+                PVOID base = nullptr; SIZE_T sz = sizeOfImage;
+                NTSTATUS st = Sys::AllocateVirtualMemory(GetCurrentProcess(), &base, 0,
+                    &sz, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+                if (!NT_SUCCESS(st) || !base) return false;
+                imageBase = base;                    // 连续回退：仍用 imageBase
+                for (uint32_t i = 0; i < pageCount; i++) pageBase[i] = base;
+            }
+        }
+
+        // 数据页集中区域（若非连续模式；连续回退时数据页已在 imageBase 连续块内）
+        if (nonContig) {
+            // 统计数据页数量，集中分配一块（至少 1 页）
+            uint32_t dataPages = 0;
+            for (uint32_t i = 0; i < pageCount; i++) if (!pages[i].isCode) dataPages++;
+            if (dataPages == 0) dataPages = 1;       // 头页通常算数据页，兜底
+            dataBlockPages = dataPages;
+            PVOID db = nullptr; SIZE_T dsz = (SIZE_T)dataPages * pageSize;
+            NTSTATUS st = Sys::AllocateVirtualMemory(GetCurrentProcess(), &db, 0,
+                &dsz, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+            if (!NT_SUCCESS(st) || !db) return false;
+            dataBlockBase = db;
+            for (uint32_t i = 0; i < pageCount; i++) {
+                if (!pages[i].isCode) { pageBase[i] = db; db = (unsigned char*)db + pageSize; }
+            }
+        }
+
+        // ---- 把修复后的页拷到最终物理位置 ----
+        for (uint32_t i = 0; i < pageCount; i++) {
+            unsigned char* dst = reinterpret_cast<unsigned char*>(pageBase[i]);
+            memcpy(dst, work.data() + i * pageSize, pageSize);
+        }
+
+        // 注册异常展开表（用首个物理区域的基址，仅用于栈展开识别）
+        {
+            void* tableBase = (nonContig && !pageRegions.empty()) ? pageRegions[0] : imageBase;
+            if (tableBase) {
+                NtApiTable ntApis; resolveNtApis(ntApis);
+                if (ntApis.RtlInsertInvertedFunctionTable) {
+                    ntApis.RtlInsertInvertedFunctionTable(
+                        reinterpret_cast<PVOID>(reinterpret_cast<uintptr_t>(tableBase) & ~(uintptr_t)0xFFFF),
+                        sizeOfImage, 0);
+                }
+            }
+        }
+
+        // P2.4：覆写内存 PE 头（此时数据页仍为 READWRITE，可安全写入），
+        //        对抗 Scylla/ImpRec 自动脱壳。头信息在修复阶段已读取完毕，覆写无副作用。
+        //        非连续模式下 PE 头位于数据块内（数据页不执行，更隐蔽）。
+        if (dataBlockBase) ManualPeLoader::CorruptHeader(dataBlockBase);
+
+        // ---- 门控：代码页重新加密 + NOACCESS；数据页保留明文 ----
+        for (uint32_t i = 0; i < pageCount; i++) {
+            if (pages[i].isCode) {
+                // 修复（重定位/导入）已完成，先记录运行期基准 CRC，再重新加密。
+                // 这样后续“解密即校验”比对的是修复后的真实代码，而非打包期
+                // 原始镜像（否则重定位差异会误触发自毁）。
+                pages[i].baseCrc = fnv1a32(
+                    reinterpret_cast<const unsigned char*>(pageBase[i]),
+                    pageSize);
+                if (!reencryptPageLocked(i)) return false;
+            } else {
+                DWORD old = 0;
+                // 数据页保持可读写（非执行），不门控
+                Sys::ProtectVirtualMemory(GetCurrentProcess(),
+                    &reinterpret_cast<PVOID>(reinterpret_cast<uintptr_t>(pageBase[i])),
+                    &size, PAGE_READWRITE, &old);
+                pages[i].decrypted = true;
+            }
+        }
+
+        // ---- 注册 VEH（按需解密，最高优先级） ----
+        g_instance = this;
+        vehHandle = AddVectoredExceptionHandler(1, &PagedLoader::VehHandler);
+
+        // ---- 反 Dump 监控初始化 ----
+        dumpMon.Init();
+
+        // ---- 启动监控线程（重加密 + 钩子扫描 + 自校验） ----
+        stopMonitor = false;
+        monitorThread = CreateThread(nullptr, 0, &PagedLoader::MonitorThreadProc,
+                                     this, 0, nullptr);
+
+        outEntryRva = opt.AddressOfEntryPoint;
+        return true;
+    }
+
+    // 跳 OEP（经 VEH 控制流混淆演示一次跳转；OEP 页初始 NOACCESS 触发按需解密）
+    int CallEntry(uint64_t entryRva)
+    {
+        if (pageBase.empty() || !pageBase[0]) return -1;
+        pendingRva = entryRva;
+        g_oepRc    = 0;
+        VehCf::RunObfuscated(reinterpret_cast<void(*)()>(&PagedLoader::OepThunk));
+        return g_oepRc;
+    }
+
+    // P3.2：把 RVA 解析为当前物理地址（兼容非连续布局）。
+    //       代码页与数据页可能落在不同区域，统一经此函数定位。
+    void* SafeRvaToVa(uint64_t rva) const
+    {
+        uint32_t i = (uint32_t)(rva / pageSize);
+        if (i >= pageCount || !pageBase[i]) return nullptr;
+        return reinterpret_cast<unsigned char*>(pageBase[i]) + (rva % pageSize);
+    }
+
+    // P3.3：供看门狗调用 —— 校验当前已解密代码页 CRC。返回 false 表示被补丁。
+    bool VerifyDecryptedIntegrity()
+    {
+        std::lock_guard<std::mutex> lk(mtx);
+        for (uint32_t i = 0; i < pageCount; i++) {
+            if (pages[i].isCode && pages[i].decrypted) {
+                unsigned char* dst = reinterpret_cast<unsigned char*>(pageBase[i]);
+                if (!Integrity::VerifyPage(dst, pages[i].baseCrc)) return false;
+            }
+        }
+        return true;
+    }
+
+    // VEH 控制流混淆后的真实入口调用
+    // 注意：经 Rip 重定向进入本函数，没有正常 call 压栈，故不可走 ret 返回，
+    //       统一用 ExitProcess 收尾（与 GUI/正常退出路径一致，避免栈帧错乱）。
+    static void OepThunk()
+    {
+        if (!g_instance) return;
+        auto fn = reinterpret_cast<int(*)()>(g_instance->SafeRvaToVa(g_instance->pendingRva));
+        if (fn) g_oepRc = fn();
+        ExitProcess(g_oepRc);
+    }
+
+    void Release()
+    {
+        stopMonitor = true;
+        if (monitorThread) {
+            WaitForSingleObject(monitorThread, INFINITE);
+            CloseHandle(monitorThread);
+            monitorThread = nullptr;
+        }
+        if (vehHandle) { RemoveVectoredExceptionHandler(vehHandle); vehHandle = nullptr; }
+        // P3.2：释放所有独立区域（代码页）与数据块
+        for (void* r : pageRegions) { SIZE_T z = 0; Sys::FreeVirtualMemory(GetCurrentProcess(), &r, &z); }
+        pageRegions.clear();
+        if (dataBlockBase) {
+            SIZE_T z = 0;
+            Sys::FreeVirtualMemory(GetCurrentProcess(), &dataBlockBase, &z);
+            dataBlockBase = nullptr;
+        }
+        if (imageBase) {    // 连续回退模式下使用
+            SIZE_T sz = 0;
+            Sys::FreeVirtualMemory(GetCurrentProcess(), &imageBase, &sz);
+            imageBase = nullptr;
+        }
+        pageBase.clear();
+        g_instance = nullptr;
+    }
+
+    void SelfDestructNow()
+    {
+        stopMonitor = true;
+        // P3.2：擦除所有独立代码页区域 + 数据块（均为敏感明文载体）
+        for (void* r : pageRegions) {
+            SIZE_T z = 0;
+            guard::SelfDestruct(r, pageSize);
+        }
+        if (dataBlockBase) {
+            SIZE_T z = 0; (void)z;
+            guard::SelfDestruct(dataBlockBase, dataBlockPages * pageSize);
+        }
+        // 连续回退模式下擦除整块
+        if (imageBase) {
+            SIZE_T z = 0; (void)z;
+            guard::SelfDestruct(imageBase, imageSize);
+        }
+    }
+
+    // P3.5：密钥轮换 —— 从种子加“时间盐”重派生 activeKey，更新 cipher。
+    // 已解密的代码页保持原样（仍可由旧 cipher 重加密），仅影响后续按需解密；
+    // 这样休眠/快照抓到的密钥只对应某一时间窗，无法还原全程明文。
+    // 轮换后立刻把临时 key 缓冲清零，敏感密钥不长期驻留堆。
+    bool RotateKey()
+    {
+        unsigned char salt[8];
+        uint64_t t = nowMs();
+        memcpy(salt, &t, 8);
+        unsigned char newKey[32];
+        pearmor::derive_rotated_key(seed, salt, newKey);   // KDF：seed + 时间盐
+        // 持锁完成「派生 + 替换 cipher」，避免监控/看门狗线程在轮换瞬间看到空 cipher
+        {
+            std::lock_guard<std::mutex> lk(mtx);
+            if (!cipher) { memset(newKey, 0, 32); return false; }
+            cipher.reset(new AesPageCipher(newKey, newKey));
+            if (!cipher->ok) { memset(newKey, 0, 32); return false; }
+        }
+        memset(newKey, 0, 32);     // 敏感密钥立即清零
+        return true;
+    }
+
+private:
+    std::unique_ptr<AesPageCipher> cipher;
+    const unsigned char* cipherData = nullptr;
+    void*   imageBase = nullptr;        // 连续回退模式下的整镜像基址
+    size_t  imageSize = 0;
+    uint32_t pageCount = 0;
+    uint32_t pageSize  = PEARMOR_PAGE_SIZE;
+
+    // P3.2：非连续布局。pageBase[i] = 第 i 页的物理基址；代码页各自独立区域。
+    std::vector<void*> pageBase;
+    std::vector<void*> pageRegions;     // 所有独立代码页区域（释放用）
+    void*   dataBlockBase = nullptr;    // 数据页集中块
+    uint32_t dataBlockPages = 0;        // 数据块页数
+    bool    nonContig = false;          // 是否实际启用非连续
+
+    std::vector<PageState> pages;
+    void*   vehHandle = nullptr;
+    HANDLE  monitorThread = nullptr;
+    std::atomic<bool> stopMonitor{false};
+    std::mutex mtx;
+    AntiDump::Monitor dumpMon;
+
+    // P3.5：密钥轮换所需（种子）。派生出的活跃密钥不长期驻留。
+    unsigned char seed[32] = {0};
+
+    uint64_t pendingRva = 0;       // 待执行 OEP 的 RVA（CallEntry 设置，OepThunk 读取）
+    static int g_oepRc;            // OEP 返回值（经 VEH 控制流混淆路径传递）
+
+    static PagedLoader* g_instance;
+
+    static uint64_t nowMs()
+    {
+        static LARGE_INTEGER freq = {0};
+        if (freq.QuadPart == 0) QueryPerformanceFrequency(&freq);
+        LARGE_INTEGER c; QueryPerformanceCounter(&c);
+        return (uint64_t)(c.QuadPart * 1000 / freq.QuadPart);
+    }
+
+    // 解密第 i 页（已持有锁）：解密 -> CRC 校验 -> 置可执行 -> 更新状态
+    bool decryptPageLocked(uint32_t i)
+    {
+        unsigned char* dst = reinterpret_cast<unsigned char*>(pageBase[i]);
+        if (!cipher->decryptPage(cipherData + i * pageSize, i, dst, pageSize))
+            return false;
+        if (!Integrity::VerifyPage(dst, pages[i].baseCrc))
+            return false; // 被篡改（与运行期修复后基准不符）
+        PVOID p = dst; SIZE_T sz = pageSize; ULONG old = 0;
+        Sys::ProtectVirtualMemory(GetCurrentProcess(), &p, &sz, PAGE_EXECUTE_READ, &old);
+        pages[i].decrypted = true;
+        pages[i].lastUsed  = nowMs();
+        return true;
+    }
+
+    // 重新加密第 i 页（已持有锁）：先置 NOACCESS 再写回密文
+    bool reencryptPageLocked(uint32_t i)
+    {
+        unsigned char* dst = reinterpret_cast<unsigned char*>(pageBase[i]);
+        PVOID p = dst; SIZE_T sz = pageSize; ULONG old = 0;
+        Sys::ProtectVirtualMemory(GetCurrentProcess(), &p, &sz, PAGE_NOACCESS, &old);
+        pages[i].decrypted = false; // 先标记加密态，避免 VEH/其它线程读到半成品
+        if (!cipher->encryptPage(dst, i, dst, pageSize))
+            return false;
+        return true;
+    }
+
+    static LONG CALLBACK VehHandler(EXCEPTION_POINTERS* ep)
+    {
+        auto* rec = ep->ExceptionRecord;
+        if (rec->ExceptionCode != EXCEPTION_ACCESS_VIOLATION)
+            return EXCEPTION_CONTINUE_SEARCH;
+        // ExceptionInformation[1] = 引发访问的虚拟地址
+        uintptr_t fault = reinterpret_cast<uintptr_t>(rec->ExceptionInformation[1]);
+        PagedLoader* self = g_instance;
+        if (!self || self->pageBase.empty()) return EXCEPTION_CONTINUE_SEARCH;
+        // P3.2：非连续布局下各页落在不同区域，逐页判定 fault 落在哪一页
+        uint32_t i = self->pageCount;
+        for (uint32_t k = 0; k < self->pageCount; k++) {
+            uintptr_t pb = reinterpret_cast<uintptr_t>(self->pageBase[k]);
+            if (pb && fault >= pb && fault < pb + self->pageSize) { i = k; break; }
+        }
+        if (i >= self->pageCount) {
+            // 兜底：连续回退模式下用 imageBase 线性判定
+            uintptr_t base = reinterpret_cast<uintptr_t>(self->imageBase);
+            if (!base || fault < base || fault >= base + self->imageSize)
+                return EXCEPTION_CONTINUE_SEARCH;
+            i = (uint32_t)((fault - base) / self->pageSize);
+            if (i >= self->pageCount) return EXCEPTION_CONTINUE_SEARCH;
+        }
+
+        std::lock_guard<std::mutex> lk(self->mtx);
+        if (!self->pages[i].isCode) return EXCEPTION_CONTINUE_SEARCH;
+
+        if (!self->pages[i].decrypted) {
+            if (!self->decryptPageLocked(i)) {
+                // 解密/校验失败 → 自毁（进程将终止，无需释放锁）
+                self->SelfDestructNow();
+                return EXCEPTION_EXECUTE_HANDLER;
+            }
+            return EXCEPTION_CONTINUE_EXECUTION;
+        } else {
+            // 已是明文但可能被监控线程临时置了 NOACCESS（重加密竞态）→ 恢复可执行
+            PVOID p = reinterpret_cast<unsigned char*>(self->pageBase[i]);
+            SIZE_T sz = self->pageSize; ULONG old = 0;
+            Sys::ProtectVirtualMemory(GetCurrentProcess(), &p, &sz, PAGE_EXECUTE_READ, &old);
+            self->pages[i].lastUsed = nowMs();
+            return EXCEPTION_CONTINUE_EXECUTION;
+        }
+    }
+
+    static DWORD WINAPI MonitorThreadProc(LPVOID lp)
+    {
+        reinterpret_cast<PagedLoader*>(lp)->MonitorLoop();
+        return 0;
+    }
+
+    void MonitorLoop()
+    {
+        const uint64_t IDLE_MS = 600; // 空闲超过 600ms 的代码页重新加密
+        while (!stopMonitor.load(std::memory_order_relaxed)) {
+            Sleep(200);
+
+            // ---- 1) 空闲代码页重加密 ----
+            {
+                std::lock_guard<std::mutex> lk(mtx);
+                uint64_t now = nowMs();
+                for (uint32_t i = 0; i < pageCount; i++) {
+                    if (pages[i].isCode && pages[i].decrypted &&
+                        (now - pages[i].lastUsed > IDLE_MS)) {
+                        reencryptPageLocked(i);
+                    }
+                }
+            }
+
+            // ---- 2) ntdll 钩子扫描（防 Dump） ----
+            if (dumpMon.Scan()) { SelfDestructNow(); return; }
+
+            // ---- 3) 已解密代码页 CRC 重校验（防补丁） ----
+            {
+                std::lock_guard<std::mutex> lk(mtx);
+                for (uint32_t i = 0; i < pageCount; i++) {
+                    if (pages[i].isCode && pages[i].decrypted) {
+                        unsigned char* dst = reinterpret_cast<unsigned char*>(pageBase[i]);
+                        if (!Integrity::VerifyPage(dst, pages[i].baseCrc)) { SelfDestructNow(); return; }
+                    }
+                }
+            }
+        }
+    }
+};
+
+// 静态成员定义（VEH 用）
+inline PagedLoader* PagedLoader::g_instance = nullptr;
+inline int          PagedLoader::g_oepRc = 0;
+
+} // namespace pearmor
