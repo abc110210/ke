@@ -14,9 +14,14 @@
 #define NT_SUCCESS(x) (((NTSTATUS)(x)) >= 0)
 #endif
 
-// 裸系统调用桩（由 syscall.asm 导出）
+// 裸系统调用桩（由 syscall.asm 导出）。
+// 支持最多 11 个系统调用参数（a1..a11）；a7..a11 带默认 nullptr，
+// 旧包装（≤6 参数）无需改动即可继续编译。
 extern "C" NTSTATUS NtRawSyscall(ULONG ssn, void* a1, void* a2, void* a3,
-                                 void* a4, void* a5, void* a6);
+                                 void* a4, void* a5, void* a6,
+                                 void* a7 = nullptr, void* a8 = nullptr,
+                                 void* a9 = nullptr, void* a10 = nullptr,
+                                 void* a11 = nullptr);
 
 namespace pearmor {
 namespace Sys {
@@ -55,7 +60,6 @@ struct Ssn {
     ULONG NtMapViewOfSection   = 0;   // P3.4：拦截远程 DLL 映射
     ULONG NtCreateThreadEx     = 0;   // P3.4：拦截远程线程创建
     ULONG NtOpenProcess        = 0;   // P3.4：阻断外部打开本进程句柄
-    ULONG NtSetInformationThread = 0; // P3.3：看门狗线程隐藏（ThreadHideFromDebugger）
 };
 
 inline Ssn& ssn()
@@ -199,14 +203,6 @@ inline NTSTATUS OpenProcess(PHANDLE proc, ULONG access, PVOID objAttr, PVOID cli
 {
     return NtRawSyscall(ssn().NtOpenProcess, proc, (void*)(UINT_PTR)access,
                         objAttr, clientId, nullptr, nullptr);
-}
-
-// NtSetInformationThread(ThreadHandle, ThreadInformationClass, ThreadInformation, Length)
-// P3.3：ThreadHideFromDebugger(0x11) 使调试器无法枚举/挂起该线程。
-inline NTSTATUS SetInformationThread(HANDLE hThread, ULONG infoClass, PVOID buf, ULONG len)
-{
-    return NtRawSyscall(ssn().NtSetInformationThread, hThread,
-                        (void*)(UINT_PTR)infoClass, buf, (void*)(UINT_PTR)len, nullptr, nullptr);
 }
 
 } // namespace Sys
