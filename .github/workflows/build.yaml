@@ -38,7 +38,7 @@ jobs:
       - name: 上传工件（加壳后的 EXE + 打包器）
         uses: actions/upload-artifact@v4
         with:
-          name: pearmor-p0
+          name: pearmor-artifacts
           path: |
             packed_app.exe
             build/packer/Release/pearmor-packer.exe
