@@ -269,6 +269,8 @@ public:
                 memset(reinterpret_cast<BYTE*>(imageBase) + va + rsz, 0, vsz - rsz);
         }
 
+        NtApiTable ntApis;   // 提前声明，避免 goto fail 跳过其初始化（C4533）
+
         // 4) 重定位
         if (relocated) {
             if (!ApplyRelocations(imageBase, preferredBase, opt)) { r.err = 0x26; goto fail; }
@@ -289,7 +291,6 @@ public:
         ProtectSections(imageBase, nt);
 
         // 9) 注册到系统异常展开表（使 CRT / SEH 展开能识别手动映射的镜像）
-        NtApiTable ntApis;
         if (resolveNtApis(ntApis) && ntApis.RtlInsertInvertedFunctionTable) {
             // 参数：镜像基址（64KB 对齐）+ 大小；返回 NTSTATUS
             uintptr_t aligned = reinterpret_cast<uintptr_t>(imageBase) & ~(uintptr_t)0xFFFF;
