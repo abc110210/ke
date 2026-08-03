@@ -479,7 +479,7 @@ public:
         BYTE* base = reinterpret_cast<BYTE*>(imageBase);
         auto* tls = reinterpret_cast<IMAGE_TLS_DIRECTORY64*>(base + dir.VirtualAddress);
         if (!tls->AddressOfCallBacks) return true;
-        auto** cb = reinterpret_cast<uint64_t*>(tls->AddressOfCallBacks);
+        uint64_t* cb = reinterpret_cast<uint64_t*>(tls->AddressOfCallBacks);
         for (; *cb; cb++) {
             auto fn = reinterpret_cast<void(WINAPI*)(PVOID, DWORD, PVOID)>(*cb);
             fn(imageBase, DLL_PROCESS_ATTACH, nullptr);
