@@ -14,6 +14,7 @@
 #include <windows.h>
 #include <cstdint>
 #include <atomic>
+#include <functional>
 
 #include "syscall.h"       // NtSetInformationThread / 原生查询
 #include "anti_debug.h"     // 反调试探测
@@ -41,7 +42,7 @@ public:
     // loader   : 受保护对象的加载器（用于 CRC/密钥轮换/SelfDestruct）
     // selfDestruct : 统一自毁回调（擦内存 + 终止）
     explicit Guard(PagedLoader* loader,
-                   void (*selfDestruct)(void) = nullptr)
+                   std::function<void()> selfDestruct = nullptr)
         : loader_(loader), selfDestruct_(selfDestruct) {}
 
     ~Guard() { Stop(); }
@@ -75,7 +76,7 @@ private:
     {
         (void)reason; // 预留日志位
         if (selfDestruct_) selfDestruct_();
-        else guard::SelfDestruct();
+        else pearmor::SelfDestruct();
     }
 
     void Loop()
@@ -114,7 +115,7 @@ private:
     }
 
     PagedLoader* loader_;
-    void (*selfDestruct_)(void);
+    std::function<void()> selfDestruct_;
     HANDLE thread_ = nullptr;
     std::atomic<bool> stop_{false};
 };
