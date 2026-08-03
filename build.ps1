@@ -13,8 +13,8 @@ param(
 $ErrorActionPreference = "Stop"
 $Root   = Split-Path -Parent $MyInvocation.MyCommand.Path
 $Build  = Join-Path $Root "build"
-$Packer = Join-Path $Build "packer\Release\pearmor-packer.exe"
-$Stub   = Join-Path $Build "stub\Release\pearmor-stub.exe"
+$Packer = Join-Path $Build "Release\pearmor-packer.exe"
+$Stub   = Join-Path $Build "Release\pearmor-stub.exe"
 
 if ($Clean -and (Test-Path $Build)) { Remove-Item -Recurse -Force $Build }
 
@@ -29,7 +29,7 @@ if ($LASTEXITCODE -ne 0) { throw "cmake build(packer) 失败" }
 
 # ---- 阶段 1：确定负载并打包 ----
 if (-not $Target) {
-    $Target = Join-Path $Build "test_payload\Release\test_payload.exe"
+    $Target = Join-Path $Build "Release\test_payload.exe"
 }
 if (-not (Test-Path $Target)) { throw "未找到目标程序: $Target" }
 

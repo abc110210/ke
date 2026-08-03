@@ -6,8 +6,8 @@
 set -e
 ROOT="$(cd "$(dirname "$0")" && pwd)"
 BUILD="$ROOT/build"
-PACKER="$BUILD/packer/Release/pearmor-packer.exe"
-STUB="$BUILD/stub/Release/pearmor-stub.exe"
+PACKER="$BUILD/Release/pearmor-packer.exe"
+STUB="$BUILD/Release/pearmor-stub.exe"
 TARGET="${1:-}"
 OUT="${2:-$ROOT/packed_app.exe}"
 
@@ -18,7 +18,7 @@ echo "[2/4] build packer + test_payload"
 cmake --build "$BUILD" --config Release --target packer test_payload --parallel
 
 if [ -z "$TARGET" ]; then
-    TARGET="$BUILD/test_payload/Release/test_payload.exe"
+    TARGET="$BUILD/Release/test_payload.exe"
 fi
 [ -f "$TARGET" ] || { echo "错误: 目标不存在 $TARGET"; exit 1; }
 
