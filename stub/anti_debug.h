@@ -41,22 +41,24 @@ inline bool CheckDebugObject()
     return NT_SUCCESS(st) && h != nullptr;
 }
 
-// 4) 硬件断点：读取 DR0~DR3，任一非 0 即存在调试寄存器断点
+// 4) 硬件断点：读取 DR0~DR3，任一非 0 即存在调试寄存器断点。
+//    重要：DR 寄存器只能在内核态读取，用户态必须经由 NtGetContextThread
+//    （由内核替你读），且必须先挂起自身线程；绝对不能 __readdr（那会发出
+//    mov dr 指令，ring3 下触发 STATUS_PRIVILEGED_INSTRUCTION / 0xC0000096）。
 inline bool CheckHardwareBreakpoints()
 {
+    HANDLE self = GetCurrentThread();
+    if (SuspendThread(self) == (DWORD)-1) return false;
     CONTEXT ctx;
     memset(&ctx, 0, sizeof(ctx));
     ctx.ContextFlags = CONTEXT_DEBUG_REGISTERS;
-    // 用原生 NtGetContextThread 读取自身上下文（需先挂起自身线程较稳妥，
-    // 这里直接读当前线程，DR 在用户态可读）
-    if (Sys::GetContextThread(GetCurrentThread(), &ctx) == 0) {
-        if (ctx.Dr0 || ctx.Dr1 || ctx.Dr2 || ctx.Dr3)
-            return true;
+    bool hit = false;
+    if (NT_SUCCESS(Sys::GetContextThread(self, &ctx)) &&
+        (ctx.Dr0 || ctx.Dr1 || ctx.Dr2 || ctx.Dr3)) {
+        hit = true;
     }
-    // 兜底：直接读 DR 寄存器（要求支持 __readdr）
-    if (__readdr(0) || __readdr(1) || __readdr(2) || __readdr(3))
-        return true;
-    return false;
+    ResumeThread(self);
+    return hit;
 }
 
 // 5) 时间陷阱：固定工作量下，若耗时异常（被单步拖慢）即判定调试
