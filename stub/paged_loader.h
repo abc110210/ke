@@ -297,16 +297,16 @@ public:
         // P3.2：擦除所有独立代码页区域 + 数据块（均为敏感明文载体）
         for (void* r : pageRegions) {
             SIZE_T z = 0;
-            guard::SelfDestruct(r, pageSize);
+            pearmor::SelfDestruct(r, pageSize);
         }
         if (dataBlockBase) {
             SIZE_T z = 0; (void)z;
-            guard::SelfDestruct(dataBlockBase, dataBlockPages * pageSize);
+            pearmor::SelfDestruct(dataBlockBase, dataBlockPages * pageSize);
         }
         // 连续回退模式下擦除整块
         if (imageBase) {
             SIZE_T z = 0; (void)z;
-            guard::SelfDestruct(imageBase, imageSize);
+            pearmor::SelfDestruct(imageBase, imageSize);
         }
     }
 
@@ -403,7 +403,7 @@ private:
         if (rec->ExceptionCode != EXCEPTION_ACCESS_VIOLATION)
             return EXCEPTION_CONTINUE_SEARCH;
         // ExceptionInformation[1] = 引发访问的虚拟地址
-        uintptr_t fault = reinterpret_cast<uintptr_t>(rec->ExceptionInformation[1]);
+        uintptr_t fault = static_cast<uintptr_t>(rec->ExceptionInformation[1]);
         PagedLoader* self = g_instance;
         if (!self || self->pageBase.empty()) return EXCEPTION_CONTINUE_SEARCH;
         // P3.2：非连续布局下各页落在不同区域，逐页判定 fault 落在哪一页
