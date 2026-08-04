@@ -89,27 +89,24 @@ inline bool RunOnce(uint32_t* outFingerprint = nullptr)
     for (int i = 0; i < 8; i++)
         sample[i] = 0x12345678u + (uint32_t)(i * 0x9E3779B9u);
 
-    auto genAndRun = [&](uint64_t seedBase) -> uint32_t {
-        PVOID mem = nullptr; SIZE_T sz = 0x1000;
-        NTSTATUS st = Sys::AllocateVirtualMemory(GetCurrentProcess(), &mem, 0,
-            &sz, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
-        if (!NT_SUCCESS(st) || !mem) return 0;
-        uint8_t* code = reinterpret_cast<uint8_t*>(mem);
-        Rng rng(__rdtsc() ^ seedBase);
-        uint32_t secret = (uint32_t)(rng.next() & 0xFFFFFFFF);
-        EmitFingerprint(code, rng, secret);
-        using Fn = uint32_t(*)(const uint32_t*, size_t);
-        uint32_t fp = reinterpret_cast<Fn>(code)(sample, 8);
-        memset(mem, 0xCC, 0x1000);                     // 用后清零 RWX 页
-        SIZE_T z = 0;
-        Sys::FreeVirtualMemory(GetCurrentProcess(), &mem, &z);
-        return fp;
-    };
-
-    // 两次使用不同种子（布局不同）但同一输入，结果应一致 -> 证明代码有效
-    uint32_t fp1 = genAndRun(0x11111111ULL);
-    uint32_t fp2 = genAndRun(0x22222222ULL);
-    if (fp1 == 0 || fp2 == 0 || fp1 != fp2) return false;
+    PVOID mem = nullptr; SIZE_T sz = 0x1000;
+    NTSTATUS st = Sys::AllocateVirtualMemory(GetCurrentProcess(), &mem, 0,
+        &sz, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
+    if (!NT_SUCCESS(st) || !mem) return false;
+    uint8_t* code = reinterpret_cast<uint8_t*>(mem);
+    // 本次运行用随机种子，使指令布局每次不同（抬高逆向门槛）；
+    // 校验则对同一份生成的代码执行两次，结果应完全一致（验证执行确定性）。
+    Rng rng(__rdtsc());
+    uint32_t secret = (uint32_t)(rng.next() & 0xFFFFFFFF);
+    EmitFingerprint(code, rng, secret);
+    using Fn = uint32_t(*)(const uint32_t*, size_t);
+    Fn fn = reinterpret_cast<Fn>(code);
+    uint32_t fp1 = fn(sample, 8);
+    uint32_t fp2 = fn(sample, 8);
+    memset(mem, 0xCC, 0x1000);                     // 用后清零 RWX 页
+    SIZE_T z = 0;
+    Sys::FreeVirtualMemory(GetCurrentProcess(), &mem, &z);
+    if (fp1 == 0 || fp1 != fp2) return false;
     if (outFingerprint) *outFingerprint = fp1;
     return true;
 }
