@@ -683,8 +683,15 @@ private:
         if (i >= self->pageCount) {
             // 兜底：连续回退模式下用 imageBase 线性判定
             uintptr_t base = reinterpret_cast<uintptr_t>(self->imageBase);
-            if (!base || fault < base || fault >= base + self->imageSize)
+            if (!base || fault < base || fault >= base + self->imageSize) {
+                // CI 61：TopLevelHandler 可能被 Hanbot 覆盖（无 crash.log）——VEH 是第一机会，
+                // 在此记录 Hanbot 自身代码的 AV（RIP=执行指令，fault=被访问的无效地址），
+                // 即使末处理器失效也能定位崩点。
+                DebugLog("[veh] AV 不在镜像内: code=0x%08X addr=%p fault=0x%llX",
+                         (unsigned)rec->ExceptionCode, rec->ExceptionAddress,
+                         (unsigned long long)fault);
                 return EXCEPTION_CONTINUE_SEARCH;
+            }
             i = (uint32_t)((fault - base) / self->pageSize);
             if (i >= self->pageCount) return EXCEPTION_CONTINUE_SEARCH;
         }
