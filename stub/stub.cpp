@@ -21,9 +21,9 @@
 // 定义」导致的 C2065 未声明标识符编译错误。
 static void DebugLog(const char* fmt, ...);
 
-#include "packer_config.h"
 #include "kdf.h"            // 密钥派生（P2.3 / P2.5）
 #include "crypto_page.h"    // AesPageCipher（解密块索引）
+#include "overlay.h"        // 负载拼接格式（stub 自读自身文件末尾）
 #include "syscall.h"
 #include "paged_loader.h"
 #include "anti_debug.h"
@@ -102,13 +102,26 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int)
     // 1) 顶层异常捕获
     SetUnhandledExceptionFilter(TopLevelHandler);
 
-    DebugLog("[stub] start, payload_len=%llu pages=%u",
-             (unsigned long long)PEARMOR_PAYLOAD_LEN,
-             (unsigned)PEARMOR_PAGE_COUNT);
+    // 1.1) 从自身 PE 文件末尾读取 overlay 负载（stub 是负载无关的固定运行时，
+    //      密文由加壳器运行时拼接，无需重新编译）
+    pearmor::Overlay::Footer meta = {};
+    std::vector<unsigned char> payload, indexEnc;
+    if (!pearmor::Overlay::LoadFromSelf(payload, indexEnc, meta)) {
+        DebugLog("[stub] 未发现 overlay 负载：这是未加壳的运行时");
+        fprintf(stderr, "[stub] 未加壳的运行时，请使用 pearmor 加壳器生成成品\n");
+        return -4;
+    }
+    const size_t   payloadLen = payload.size();
+    const uint32_t pageCount  = meta.pageCount;
+    unsigned char  seed32[32];
+    memcpy(seed32, meta.seed, 32);
+    uint64_t entryRva = meta.entryRva;
 
-    if (PEARMOR_PAYLOAD_LEN == 0 || PEARMOR_PAGE_COUNT == 0) {
-        DebugLog("[stub] 空负载：请先用 pearmor-packer 打包生成 packer_config.h 再编译");
-        fprintf(stderr, "[stub] 空负载：请先运行打包器生成 packer_config.h\n");
+    DebugLog("[stub] start, payload_len=%zu pages=%u entryRva=0x%llX",
+             payloadLen, pageCount, (unsigned long long)entryRva);
+
+    if (payloadLen == 0 || pageCount == 0) {
+        DebugLog("[stub] overlay 负载为空");
         return -1;
     }
 
@@ -177,17 +190,17 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int)
         }
     }
 
-    // 5) P2.3 / P2.5：从种子派生分层密钥（二进制里只有 PEARMOR_SEED，无明文密钥）
+    // 5) P2.3 / P2.5：从种子派生分层密钥（二进制里只有 seed，无明文密钥）
     unsigned char innerKey[32], outerKey[32];
-    pearmor::derive_inner_key(PEARMOR_SEED, innerKey);
-    pearmor::derive_outer_key(PEARMOR_SEED, outerKey);
+    pearmor::derive_inner_key(seed32, innerKey);
+    pearmor::derive_outer_key(seed32, outerKey);
 
-    // 外层密钥解密块索引（isCode）：PEARMOR_ENC_INDEX 用 outerKey 一次性 AES-CBC 加密
-    size_t idxLen = (PEARMOR_PAGE_COUNT + 15) & ~(size_t)15;
+    // 外层密钥解密块索引（isCode）：indexEnc 用 outerKey 一次性 AES-CBC 加密
+    size_t idxLen = (size_t)meta.indexLen;
     std::vector<unsigned char> idxPlain(idxLen, 0);
     {
         pearmor::AesPageCipher idxCipher(outerKey, outerKey); // IV = outerKey 前 16 字节
-        if (!idxCipher.decryptPage(PEARMOR_ENC_INDEX, 0, idxPlain.data(), idxLen)) {
+        if (!idxCipher.decryptPage(indexEnc.data(), 0, idxPlain.data(), idxLen)) {
             DebugLog("[stub] 解密块索引失败");
             MessageBoxW(nullptr, L"PEArmor: 解密失败", L"PEArmor", MB_OK | MB_ICONERROR);
             return -3;
@@ -196,10 +209,9 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int)
 
     // 6) 分页加载加密目标（解密 + 修复导入/重定位 + 门控代码页 + 覆写 PE 头）
     pearmor::PagedLoader loader;
-    uint64_t entryRva = 0;
-    if (!loader.Load(PEARMOR_PAYLOAD, (size_t)PEARMOR_PAYLOAD_LEN,
-                     innerKey, idxPlain.data(), (uint32_t)PEARMOR_PAGE_COUNT, entryRva,
-                     PEARMOR_SEED)) {
+    if (!loader.Load(payload.data(), payloadLen,
+                     innerKey, idxPlain.data(), pageCount, entryRva,
+                     seed32)) {
         DebugLog("[stub] 分页加载失败");
         fprintf(stderr, "[stub] 分页加载失败\n");
         return -2;

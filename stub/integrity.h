@@ -8,17 +8,19 @@
 #include <cstdint>
 
 #include "../common/page_crc.h"
-#include "packer_config.h"   // PEARMOR_PAGE_CRC / PEARMOR_PAGE_SIZE
 
 namespace pearmor {
 namespace Integrity {
 
+// 每页大小（与加壳器、paged_loader 的 PEARMOR_PAGE_SIZE 一致）
+static constexpr uint32_t kPageSize = 0x1000;
+
 // 校验某页明文是否与“运行期基准 CRC”一致。
 // 注意：基准必须在重定位/导入修复之后建立（修复会改变代码页内容），
-//       故不再比对打包期原始镜像的 CRC（PEARMOR_PAGE_CRC），避免误触发自毁。
+//       故不再比对打包期原始镜像的 CRC，避免误触发自毁。
 inline bool VerifyPage(const void* plain, uint32_t expectedCrc)
 {
-    return fnv1a32(plain, PEARMOR_PAGE_SIZE) == expectedCrc;
+    return fnv1a32(plain, kPageSize) == expectedCrc;
 }
 
 } // namespace Integrity

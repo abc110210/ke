@@ -395,6 +395,42 @@ public:
     }
 
     // ---------- 导入修复 ----------
+
+    // 解析系统 DLL 模块基址：优先 PEB/自研映射（绕过钩子），失败退回系统 API。
+    // 注意：LoadLibraryA 只用于【系统依赖 DLL】（kernel32/user32/gdi32 等），
+    // 目标 PE 本体仍全程手动映射，不违背"不调用 LoadLibrary 加载目标"的原则。
+    static uintptr_t ResolveSystemModule(const char* dllNameA, const wchar_t* dllNameW,
+                                         NtApiTable& nt)
+    {
+        uintptr_t hMod = resolveModuleBase(dllNameW, nt);
+        if (!hMod) {
+            HMODULE h = GetModuleHandleA(dllNameA);
+            if (!h) h = LoadLibraryA(dllNameA);
+            if (h) hMod = reinterpret_cast<uintptr_t>(h);
+        }
+        return hMod;
+    }
+
+    // 解析系统 DLL 的单个导入项（名字或序数）：优先自研解析，失败退回 GetProcAddress。
+    // ordinal != 0 表示序数导入；否则 name 是导入名（ASCII）。
+    static void* ResolveSystemImport(uintptr_t hMod, const char* name, DWORD ordinal)
+    {
+        void* fn = nullptr;
+        HMODULE hDll = reinterpret_cast<HMODULE>(hMod);
+        if (ordinal) {
+            char ordBuf[16];
+            snprintf(ordBuf, sizeof(ordBuf), "#%u", ordinal);
+            fn = resolveExportFromBase(hMod, ordBuf);
+            if (!fn && hDll)
+                fn = reinterpret_cast<void*>(GetProcAddress(hDll, MAKEINTRESOURCEA(ordinal)));
+        } else {
+            fn = resolveExportFromBase(hMod, name);
+            if (!fn && hDll)
+                fn = reinterpret_cast<void*>(GetProcAddress(hDll, name));
+        }
+        return fn;
+    }
+
     static bool FixImports(void* imageBase, const IMAGE_OPTIONAL_HEADER64& opt)
     {
         auto& dir = opt.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT];
@@ -412,8 +448,11 @@ public:
             wchar_t dllNameW[64];
             MultiByteToWideChar(CP_ACP, 0, dllNameA, -1, dllNameW, 64);
 
-            uintptr_t hMod = resolveModuleBase(dllNameW, nt);
-            HMODULE hDll = reinterpret_cast<HMODULE>(hMod);
+            uintptr_t hMod = ResolveSystemModule(dllNameA, dllNameW, nt);
+            if (!hMod) {
+                DebugLog("[loader] 导入解析失败: 模块不可用 dll=%s", dllNameA);
+                return false;
+            }
 
             // 遍历 OriginalFirstThunk / FirstThunk
             ULONGLONG* oft = desc->OriginalFirstThunk
@@ -423,23 +462,17 @@ public:
             for (; *oft; oft++, ft++) {
                 void* fn = nullptr;
                 const char* fnName = "?";
+                DWORD ordinal = 0;
                 if (IMAGE_SNAP_BY_ORDINAL64(*oft)) {
-                    // 序数导入：构造 "#ordinal" 字符串查询
-                    char ordBuf[16];
-                    snprintf(ordBuf, sizeof(ordBuf), "#%llu",
-                             (unsigned long long)(*oft & 0xFFFF));
-                    fn = resolveExportFromBase(hMod, ordBuf);
-                    fnName = ordBuf;
+                    // 序数导入
+                    ordinal = (DWORD)(*oft & 0xFFFF);
+                    fnName  = "ord";
                 } else {
                     auto* imp = reinterpret_cast<IMAGE_IMPORT_BY_NAME*>(
                         base + static_cast<DWORD>(*oft));
-                    fn = resolveExportFromBase(hMod, imp->Name);
-                    fnName = imp->Name;
+                    fnName = reinterpret_cast<const char*>(imp->Name);
                 }
-                // 兜底：自研解析失败时才退回系统 API（仅系统 DLL，非目标 PE）
-                if (!fn) {
-                    if (hDll) fn = GetProcAddress(hDll, reinterpret_cast<LPCSTR>(*oft & 0xFFFF));
-                }
+                fn = ResolveSystemImport(hMod, fnName, ordinal);
                 if (!fn) {
                     DebugLog("[loader] 导入解析失败: dll=%s fn=%s", dllNameA, fnName);
                     return false;
@@ -462,25 +495,22 @@ public:
             const char* dllNameA = reinterpret_cast<const char*>(base + desc->rvaDLLName);
             wchar_t dllNameW[64];
             MultiByteToWideChar(CP_ACP, 0, dllNameA, -1, dllNameW, 64);
-            uintptr_t hMod = resolveModuleBase(dllNameW, nt);
-            if (!hMod) continue;
+            uintptr_t hMod = ResolveSystemModule(dllNameA, dllNameW, nt);
+            if (!hMod) continue;   // 延迟导入：模块不可用可容忍（惰性加载）
             if (desc->rvaIAT) {
                 auto* iat = reinterpret_cast<ULONGLONG*>(base + desc->rvaIAT);
                 auto* intn = reinterpret_cast<ULONGLONG*>(base + desc->rvaINT);
                 for (ULONG i = 0; intn[i]; i++) {
                     void* fn = nullptr;
                     if (IMAGE_SNAP_BY_ORDINAL64(intn[i])) {
-                        char ordBuf[16];
-                        snprintf(ordBuf, sizeof(ordBuf), "#%llu",
-                                 (unsigned long long)(intn[i] & 0xFFFF));
-                        fn = resolveExportFromBase(hMod, ordBuf);
+                        fn = ResolveSystemImport(hMod, nullptr, (DWORD)(intn[i] & 0xFFFF));
                     } else {
                         auto* imp = reinterpret_cast<IMAGE_IMPORT_BY_NAME*>(
                             base + static_cast<DWORD>(intn[i]));
-                        fn = resolveExportFromBase(hMod, imp->Name);
+                        fn = ResolveSystemImport(hMod,
+                            reinterpret_cast<const char*>(imp->Name), 0);
                     }
-                    iat[i] = reinterpret_cast<ULONGLONG>(fn ? fn : GetProcAddress(
-                        reinterpret_cast<HMODULE>(hMod), reinterpret_cast<LPCSTR>(intn[i] & 0xFFFF)));
+                    iat[i] = reinterpret_cast<ULONGLONG>(fn);
                 }
             }
         }
