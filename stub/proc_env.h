@@ -14,6 +14,7 @@
 #include <windows.h>
 #include <cstdint>
 #include <cstring>
+#include <cwchar>
 #include <vector>
 
 #include "syscall.h"
@@ -38,7 +39,7 @@ struct PROCESS_BASIC_INFORMATION_LOCAL {
     ULONG_PTR InheritedFromUniqueProcessId;
 };
 
-// 可疑进程名（宽字符，不区分大小写比对）
+// 可疑进程名（宽字符，不区分大小写比对 basename）
 static const wchar_t* kSuspicious[] = {
     L"x64dbg.exe", L"x32dbg.exe", L"ida.exe", L"ida64.exe", L"idag.exe",
     L"idaw.exe", L"windbg.exe", L"ollydbg.exe", L"dnSpy.exe", L"dnSpy64.exe",
@@ -49,17 +50,63 @@ static const wchar_t* kSuspicious[] = {
     nullptr
 };
 
-static bool NameInSuspicious(const UNICODE_STRING* name)
+// 正常父进程白名单（被这些进程拉起视为合法，不触发自毁）
+static const wchar_t* kNormalParent[] = {
+    L"explorer.exe", L"winlogon.exe", L"services.exe", L"cmd.exe",
+    L"conhost.exe", L"csrss.exe", L"wininit.exe", L"rundll32.exe",
+    L"powershell.exe", L"pwsh.exe", L"devenv.exe", L"msbuild.exe",
+    L"code.exe", L"svchost.exe", L"RuntimeBroker.exe", nullptr
+};
+
+// 比对进程名 basename 是否落入可疑名单
+static bool NameInSuspicious(const wchar_t* name)
 {
-    if (!name || !name->Buffer || name->Length == 0) return false;
-    // 转小写临时比较：直接用 _wcsnicmp 对宽串前缀比对
+    if (!name || name[0] == 0) return false;
     for (int i = 0; kSuspicious[i]; i++) {
-        size_t wl = wcslen(kSuspicious[i]);
-        if ((size_t)name->Length / 2 >= wl &&
-            _wcsnicmp(name->Buffer, kSuspicious[i], wl) == 0)
-            return true;
+        if (_wcsicmp(name, kSuspicious[i]) == 0) return true;
     }
     return false;
+}
+
+// 通过 PID 取进程镜像名 basename（用户态可读，不碰内核地址）
+// 方法：NtOpenProcess + NtQueryInformationProcess(ProcessImageFileName=27)
+// 返回的用户态 UNICODE_STRING 中的 Buffer 指向我们提供的缓冲区，完全可读。
+// 这规避了 SYSTEM_PROCESS_INFORMATION.ImageName.Buffer 在 Win10+ 指向内核地址、
+// 用户态直接解引用必 0xC0000005 的老坑。
+static bool QueryImageNameByPid(DWORD pid, wchar_t* outName, size_t outCap)
+{
+    if (pid == 0 || outCap == 0) return false;
+    OBJECT_ATTRIBUTES oa;
+    InitializeObjectAttributes(&oa, nullptr, 0, nullptr, nullptr);
+    CLIENT_ID cid = { (HANDLE)(ULONG_PTR)pid, nullptr };
+    HANDLE h = nullptr;
+    NTSTATUS st = Sys::OpenProcess(&h, PROCESS_QUERY_LIMITED_INFORMATION, &oa, &cid);
+    if (!NT_SUCCESS(st) || !h) return false;
+
+    BYTE buf[sizeof(UNICODE_STRING) + 1024] = {0};
+    ULONG ret = 0;
+    st = Sys::QueryInformationProcess(h, 27 /*ProcessImageFileName*/,
+                                      buf, (ULONG)sizeof(buf), &ret);
+    bool ok = false;
+    if (NT_SUCCESS(st)) {
+        auto* us = reinterpret_cast<UNICODE_STRING*>(buf);
+        if (us->Buffer && us->Length > 0) {
+            const wchar_t* p   = us->Buffer;
+            size_t n  = us->Length / 2;   // 字符数
+            const wchar_t* base = p;
+            for (size_t i = 0; i < n; i++) {
+                if (p[i] == L'\\' || p[i] == L'/') base = p + i + 1;
+            }
+            size_t blen = (size_t)(p + n - base);
+            if (blen > 0 && blen + 1 <= outCap) {
+                wcsncpy_s(outName, outCap, base, blen);
+                outName[blen] = 0;
+                ok = true;
+            }
+        }
+    }
+    Sys::CloseHandle(h);
+    return ok;
 }
 
 // 枚举进程：返回 true 表示发现可疑进程
@@ -77,12 +124,15 @@ inline bool FindSuspiciousProcess()
     if (!NT_SUCCESS(Sys::QuerySystemInformation(5, buf.data(), (ULONG)cap, &ret)))
         return false;
 
+    // 只读取 PID 整数（OFF_PID=0x50 跨版本稳定），绝不解引用 ImageName.Buffer
+    const ULONG OFF_PID = 0x50;
     char* p = reinterpret_cast<char*>(buf.data());
     for (;;) {
         auto* spi = reinterpret_cast<SYSTEM_PROCESS_INFORMATION*>(p);
-        auto* name = reinterpret_cast<UNICODE_STRING*>(p + OFF_IMAGENAME);
-        if (NameInSuspicious(name)) return true;
-
+        ULONG_PTR pid = *reinterpret_cast<ULONG_PTR*>(p + OFF_PID);
+        wchar_t name[256] = {0};
+        if (QueryImageNameByPid((DWORD)pid, name, 256) && NameInSuspicious(name))
+            return true;
         if (spi->NextEntryOffset == 0) break;
         p += spi->NextEntryOffset;
     }
@@ -98,45 +148,19 @@ inline bool ParentIsSuspicious()
             &pbi, sizeof(pbi), nullptr)))
         return false;
 
-    ULONG len = 0;
-    Sys::QuerySystemInformation(5, nullptr, 0, &len);
-    if (len == 0) len = 0x20000;
-    SIZE_T cap = (SIZE_T)len + 0x20000;
-    std::vector<unsigned char> buf(cap, 0);
-    ULONG ret = 0;
-    if (!NT_SUCCESS(Sys::QuerySystemInformation(5, buf.data(), (ULONG)cap, &ret)))
-        return false;
+    DWORD parentPid = (DWORD)pbi.InheritedFromUniqueProcessId;
+    if (parentPid == 0) return false;
 
-    ULONG_PTR parentPid = pbi.InheritedFromUniqueProcessId;
-    char* p = reinterpret_cast<char*>(buf.data());
-    for (;;) {
-        auto* spi = reinterpret_cast<SYSTEM_PROCESS_INFORMATION*>(p);
-        ULONG_PTR pid  = *reinterpret_cast<ULONG_PTR*>(p + OFF_PID);
-        ULONG_PTR ppid = *reinterpret_cast<ULONG_PTR*>(p + OFF_PARENTPID);
-        auto* name = reinterpret_cast<UNICODE_STRING*>(p + OFF_IMAGENAME);
-        if (pid == parentPid) {
-            // 父进程是系统关键进程（explorer/winlogon/services/cmd 等）视为正常
-            static const wchar_t* kNormal[] = {
-                L"explorer.exe", L"winlogon.exe", L"services.exe", L"cmd.exe",
-                L"conhost.exe", L"csrss.exe", L"wininit.exe", L"rundll32.exe",
-                L"powershell.exe", L"pwsh.exe", L"devenv.exe", L"msbuild.exe",
-                nullptr
-            };
-            bool normal = false;
-            if (name && name->Buffer) {
-                for (int i = 0; kNormal[i]; i++) {
-                    size_t wl = wcslen(kNormal[i]);
-                    if ((size_t)name->Length / 2 >= wl &&
-                        _wcsnicmp(name->Buffer, kNormal[i], wl) == 0) { normal = true; break; }
-                }
-            }
-            if (!normal && NameInSuspicious(name)) return true;
-            return false; // 父进程非可疑即放行
-        }
-        (void)ppid;
-        if (spi->NextEntryOffset == 0) break;
-        p += spi->NextEntryOffset;
+    wchar_t name[256] = {0};
+    // 取不到父进程镜像名（已退出/无权限）→ 视为安全放行
+    if (!QueryImageNameByPid(parentPid, name, 256)) return false;
+
+    // 白名单优先：正常父进程直接放行（修正旧版 normal 变量被忽略的 bug）
+    for (int i = 0; kNormalParent[i]; i++) {
+        if (_wcsicmp(name, kNormalParent[i]) == 0) return false;
     }
+    // 非白名单，再看是否落入可疑名单
+    if (NameInSuspicious(name)) return true;
     return false;
 }
 

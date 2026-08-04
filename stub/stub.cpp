@@ -145,20 +145,13 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int)
     }
 
     // 4.2) P2.6 进程环境检测（发现逆向/沙箱工具进程名 或 父进程为调试器 -> 自毁）
-    //      注意：原实现直接解引用 SYSTEM_PROCESS_INFORMATION.ImageName.Buffer，
-    //      但 Win10/11 该 Buffer 指向内核态地址，用户态读取必 0xC0000005；
-    //      此 bug 待单独修复（改用 ProcessImageFileName 等用户态可读方式）。
-    //      CI 环境无逆向进程、父进程为测试运行器，故可设 PEARMOR_ALLOW_PROCENV=1 放行。
-    {
-        char allowEnv[8] = {0};
-        bool skipEnv = GetEnvironmentVariableA("PEARMOR_ALLOW_PROCENV", allowEnv, sizeof(allowEnv)) &&
-                       (allowEnv[0] == '1');
-        if (!skipEnv && pearmor::ProcEnv::IsSuspiciousEnvironment()) {
-            DebugLog("[stub] 命中可疑进程/父进程 -> 自毁");
-            pearmor::SelfDestruct();
-        } else if (skipEnv) {
-            DebugLog("[stub] 已设 PEARMOR_ALLOW_PROCENV，跳过进程环境检测");
-        }
+    //      已修复：原实现直接解引用 SYSTEM_PROCESS_INFORMATION.ImageName.Buffer
+    //      （Win10+ 该 Buffer 指向内核态地址，用户态读必 0xC0000005）；
+    //      现改为 NtOpenProcess + ProcessImageFileName(27) 读取用户态镜像名，
+    //      完全规避内核地址，无 AV。CI 环境无逆向进程、父进程为测试运行器 -> 放行。
+    if (pearmor::ProcEnv::IsSuspiciousEnvironment()) {
+        DebugLog("[stub] 命中可疑进程/父进程 -> 自毁");
+        pearmor::SelfDestruct();
     }
 
     // 4.3) P3.1 运行时代码生成（即时代码）：生成一段仅存在于运行时内存的机器码
