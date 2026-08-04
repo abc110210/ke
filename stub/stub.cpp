@@ -149,10 +149,12 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int)
     //      （Win10+ 该 Buffer 指向内核态地址，用户态读必 0xC0000005）；
     //      现改为 NtOpenProcess + ProcessImageFileName(27) 读取用户态镜像名，
     //      完全规避内核地址，无 AV。CI 环境无逆向进程、父进程为测试运行器 -> 放行。
+    DebugLog("[stub] P2.6 进程环境检测执行中...");
     if (pearmor::ProcEnv::IsSuspiciousEnvironment()) {
         DebugLog("[stub] 命中可疑进程/父进程 -> 自毁");
         pearmor::SelfDestruct();
     }
+    DebugLog("[stub] P2.6 进程环境检测通过");
 
     // 4.3) P3.1 运行时代码生成（即时代码）：生成一段仅存在于运行时内存的机器码
     //      并执行校验。无静态对应物、每次布局不同，抬高静态逆向门槛。

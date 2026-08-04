@@ -15,6 +15,7 @@
 #include <windows.h>
 #include <cstdint>
 #include <cstring>
+#include <excpt.h>     // GetExceptionCode（SEH 诊断用）
 
 #include "syscall.h"   // 原生分配（与 P0-P2 一致，绕过 Win32 钩子）
 
@@ -34,16 +35,19 @@ struct Rng {
 // 混合操作顺序由 rng 决定，使每次生成的机器码指令序列不同。
 static uint8_t* EmitFingerprint(uint8_t* p, Rng& rng, uint32_t secret)
 {
-    // 参数搬运（微软 x64 调用约定：rcx=data, rdx=count）：
-    // 循环体用 r8 作数据指针、r9 作元素计数，需先把 rcx/rdx 搬过来，
-    // 否则 r8/r9 是调用前的残留垃圾值（从随机地址读取 / 循环上限错乱）。
-    *p++ = 0x4C; *p++ = 0x89; *p++ = 0xC8;   // mov r8, rcx
-    *p++ = 0x4C; *p++ = 0x89; *p++ = 0xD1;   // mov r9, rdx
-    // rax = secret（初始种子）
-    *p++ = 0xB8; memcpy(p, &secret, 4); p += 4;
-    // r10 = 0（计数器）
-    *p++ = 0x41; *p++ = 0xBA; *p++ = 0x00; *p++ = 0x00; *p++ = 0x00; *p++ = 0x00; // mov r10d,0
-    // 循环体起点（用于回填 jmp）
+    // 寄存器约定（全部使用 0-7 号通用寄存器，彻底避开 REX 扩展位编码错误）：
+    //   rcx = data  (由调用约定给定)
+    //   rdx = count (由调用约定给定)
+    //   rbx = data 指针副本（non-volatile，需 push/pop 保存）
+    //   rsi = 循环计数器（non-volatile，需 push/pop 保存）
+    //   rax = 累加器（初始 = secret）
+    // 访问 [rbx + rsi*4] 全程无需 REX 前缀（rbx/rsi 都在 0-7），仅 inc/cmp/mov 涉及
+    // 64 位时用 REX.W（W 位不涉及扩展寄存器选择，安全）。
+    *p++ = 0x56;                                // push rsi
+    *p++ = 0x53;                                // push rbx
+    *p++ = 0x48; *p++ = 0x89; *p++ = 0xCB;     // mov rbx, rcx   (rbx = data)
+    *p++ = 0x33; *p++ = 0xF6;                  // xor esi, esi   (rsi = 0)
+    *p++ = 0xB8; memcpy(p, &secret, 4); p += 4; // mov eax, secret
     uint8_t* loop = p;
 
     // 三种混合操作，按随机顺序各执行一次
@@ -55,19 +59,18 @@ static uint8_t* EmitFingerprint(uint8_t* p, Rng& rng, uint32_t secret)
     }
     for (int k = 0; k < 3; k++) {
         switch (plan[k]) {
-        case ADD: // add eax, [r8 + r10*4]
-            *p++ = 0x03; *p++ = 0x04; *p++ = 0x90; break;
-        case XOR: // xor eax, [r8 + r10*4]
-            *p++ = 0x33; *p++ = 0x04; *p++ = 0x90; break;
-        case ROL: // add eax, [r8 + r10*4] ; rol eax, 7
-            *p++ = 0x03; *p++ = 0x04; *p++ = 0x90;
+        case ADD: // add eax, [rbx + rsi*4]  (ModRM=04, SIB=9E: scale2 index=rsi base=rbx)
+            *p++ = 0x03; *p++ = 0x04; *p++ = 0x9E; break;
+        case XOR: // xor eax, [rbx + rsi*4]
+            *p++ = 0x33; *p++ = 0x04; *p++ = 0x9E; break;
+        case ROL: // add eax, [rbx + rsi*4] ; rol eax, 7
+            *p++ = 0x03; *p++ = 0x04; *p++ = 0x9E;
             *p++ = 0xC1; *p++ = 0xC8; *p++ = 0x07; break;
         }
     }
 
-    // 计数器++ ; cmp r10, r9 ; jl loop
-    *p++ = 0x49; *p++ = 0xFF; *p++ = 0xC2;            // inc r10
-    *p++ = 0x4D; *p++ = 0x3B; *p++ = 0xCA;            // cmp r10, r9
+    *p++ = 0x48; *p++ = 0xFF; *p++ = 0xC6;   // inc rsi
+    *p++ = 0x48; *p++ = 0x3B; *p++ = 0xF2;   // cmp rsi, rdx
     long disp = (long)((intptr_t)loop - (intptr_t)(p + 2));
     if (disp >= -128 && disp <= 127) {
         *p++ = 0x7C; *p++ = (uint8_t)(int8_t)disp;     // jl loop（短跳）
@@ -76,8 +79,9 @@ static uint8_t* EmitFingerprint(uint8_t* p, Rng& rng, uint32_t secret)
         long d2 = (long)((intptr_t)loop - (intptr_t)(p + 4));
         memcpy(p, &d2, 4); p += 4;
     }
-    // 返回 rax（32 位结果即 eax，约定由调用约定返回）
-    *p++ = 0xC3;                                       // ret
+    *p++ = 0x5B;   // pop rbx
+    *p++ = 0x5E;   // pop rsi
+    *p++ = 0xC3;   // ret
     return p;
 }
 
@@ -104,8 +108,20 @@ inline bool RunOnce(uint32_t* outFingerprint = nullptr)
     EmitFingerprint(code, rng, secret);
     using Fn = uint32_t(*)(const uint32_t*, size_t);
     Fn fn = reinterpret_cast<Fn>(code);
-    uint32_t fp1 = fn(sample, 8);
-    uint32_t fp2 = fn(sample, 8);
+    uint32_t fp1 = 0, fp2 = 0;
+    // SEH 包裹：生成代码执行异常时优雅失败（打印日志后返回 false），
+    // 避免异常直达 TopLevelHandler 无痕终结进程、连诊断日志都没有。
+    __try {
+        fp1 = fn(sample, 8);
+        fp2 = fn(sample, 8);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        DebugLog("[stub] P3.1 执行生成代码时异常 code=0x%08X -> 校验失败",
+                 (unsigned)GetExceptionCode());
+        memset(mem, 0xCC, 0x1000);
+        SIZE_T z = 0;
+        Sys::FreeVirtualMemory(GetCurrentProcess(), &mem, &z);
+        return false;
+    }
     memset(mem, 0xCC, 0x1000);                     // 用后清零 RWX 页
     SIZE_T z = 0;
     Sys::FreeVirtualMemory(GetCurrentProcess(), &mem, &z);
