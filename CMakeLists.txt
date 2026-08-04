@@ -44,7 +44,12 @@ if(MSVC)
         /GS-
         /W3
         /utf-8
-        /guard:cf
+        # 注意：刻意不启用 /guard:cf。
+        # 壳会“间接调用跳进动态 VirtualAlloc 出来的 payload 内存”（OepThunk 里的 fn()），
+        # 目标地址不在壳模块的 CFG 合法调用目标位图内，CFG 校验必失败并 __fastfail
+        # 抛出 STATUS_STACK_BUFFER_OVERRUN(0xC0000404) 使进程秒退且不经过 TopLevelHandler
+        # （表现为“跳 OEP 即崩、无 crash.log”）。壳自身靠 VEH+加密+手动映射防护，
+        # CFG 对保护器无意义且会破坏 OEP 跳转，故关闭。
     )
 endif()
 set_target_properties(stub PROPERTIES
@@ -59,6 +64,12 @@ if(PEARMOR_BUILD_TEST)
         test/test_payload.cpp
     )
     target_compile_definitions(test_payload PRIVATE _CRT_SECURE_NO_WARNINGS)
+    if(MSVC)
+        # /GS-：样例以 /ENTRY:main 直接作为入口，跳过了 CRT 的 __security_init_cookie，
+        # 栈 Cookie 校验无意义且可能引发误报（0xC0000404 fast-fail）。样例本身只用纯
+        # Win32 API + ExitProcess，无 CRT 收尾依赖，关闭 /GS 安全。
+        target_compile_options(test_payload PRIVATE /GS-)
+    endif()
     set_target_properties(test_payload PROPERTIES
         OUTPUT_NAME "test_payload"
         # 直接以 main 为原始入口，避免被壳调用时二次初始化 CRT
