@@ -19,6 +19,7 @@
 
 #include "../common/page_crc.h"   // fnv1a32
 #include "../common/kdf.h"        // 密钥派生（P2.3 / P2.5）
+#include "../common/aes256.h"     // 纯 C++ AES-256-CBC（与 stub 共用，避免 BCrypt 依赖）
 
 static void die(const char* msg) {
     fprintf(stderr, "[packer] 错误: %s\n", msg);
@@ -164,27 +165,13 @@ int main(int argc, char** argv) {
     std::vector<unsigned char> enc(padded, 0);
     std::vector<uint32_t> crc(pageCount, 0);
 
-    BCRYPT_ALG_HANDLE alg = nullptr;
-    BCRYPT_KEY_HANDLE keyH = nullptr;
-    if (BCryptOpenAlgorithmProvider(&alg, BCRYPT_AES_ALGORITHM, NULL, 0) != 0)
-        die("BCryptOpenAlgorithmProvider 失败");
-    if (BCryptSetProperty(alg, BCRYPT_CHAINING_MODE,
-            (PUCHAR)BCRYPT_CHAIN_MODE_CBC, sizeof(BCRYPT_CHAIN_MODE_CBC), 0) != 0)
-        die("设置 CBC 模式失败");
-    if (BCryptGenerateSymmetricKey(alg, &keyH, NULL, 0, (PUCHAR)innerKey, 32, 0) != 0)
-        die("BCryptGenerateSymmetricKey 失败");
-
+    // 逐页 AES-256-CBC 加密（纯 C++ 实现；IV 派生与 stub 的 AesPageCipher(innerKey,innerKey) 一致）
     unsigned char ivPage[16];
     for (uint32_t i = 0; i < pageCount; i++) {
         deriveIv(innerKey, i, ivPage);
-        ULONG done = 0;
-        NTSTATUS st = BCryptEncrypt(keyH, img.data() + i * PAGE, PAGE, NULL,
-            ivPage, 16, enc.data() + i * PAGE, PAGE, &done, 0);
-        if (!BCRYPT_SUCCESS(st)) die("BCryptEncrypt 失败");
+        pearmor::aes256::cbc_encrypt(innerKey, ivPage, img.data() + i * PAGE, PAGE, enc.data() + i * PAGE);
         crc[i] = pearmor::fnv1a32(img.data() + i * PAGE, PAGE);
     }
-    if (keyH) BCryptDestroyKey(keyH);
-    if (alg)  BCryptCloseAlgorithmProvider(alg, 0);
 
     // ---- 外层加密：块索引(isCode) 用 outerKey 一次性 AES-CBC 加密 ----
     // 运行时 Stub 先用 outerKey 解出 isCode，再用 innerKey 逐页解密代码。
@@ -194,23 +181,11 @@ int main(int argc, char** argv) {
     memcpy(idxPlain.data(), isCode.data(), pageCount);
     std::vector<unsigned char> encIndex(idxLen, 0);
     {
-        BCRYPT_ALG_HANDLE a2 = nullptr;
-        BCRYPT_KEY_HANDLE k2 = nullptr;
-        if (BCryptOpenAlgorithmProvider(&a2, BCRYPT_AES_ALGORITHM, NULL, 0) != 0)
-            die("outer BCryptOpenAlgorithmProvider 失败");
-        if (BCryptSetProperty(a2, BCRYPT_CHAINING_MODE,
-                (PUCHAR)BCRYPT_CHAIN_MODE_CBC, sizeof(BCRYPT_CHAIN_MODE_CBC), 0) != 0)
-            die("outer 设置 CBC 模式失败");
-        if (BCryptGenerateSymmetricKey(a2, &k2, NULL, 0, (PUCHAR)outerKey, 32, 0) != 0)
-            die("outer BCryptGenerateSymmetricKey 失败");
+        // 外层加密：块索引(isCode) 用 outerKey 一次性 AES-256-CBC（纯 C++ 实现）
+        // IV = outerKey 前 16 字节，与 stub 的 AesPageCipher(outerKey, outerKey) 一致
         unsigned char oiv[16];
-        memcpy(oiv, outerKey, 16); // IV = outerKey 前 16 字节
-        ULONG done = 0;
-        NTSTATUS st = BCryptEncrypt(k2, idxPlain.data(), (ULONG)idxLen, NULL,
-                                    oiv, 16, encIndex.data(), (ULONG)idxLen, &done, 0);
-        if (!BCRYPT_SUCCESS(st)) die("outer BCryptEncrypt 失败");
-        BCryptDestroyKey(k2);
-        BCryptCloseAlgorithmProvider(a2, 0);
+        memcpy(oiv, outerKey, 16);
+        pearmor::aes256::cbc_encrypt(outerKey, oiv, idxPlain.data(), idxLen, encIndex.data());
     }
 
     // 写头文件
