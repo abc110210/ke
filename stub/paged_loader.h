@@ -57,15 +57,16 @@ public:
     PagedLoader() = default;
     ~PagedLoader() { Release(); }
 
-    // P3.2 非连续内存布局开关。默认开启：代码页分散到各自独立 VirtualAlloc 区域，
-    // 打破标准 PE 连续布局，使 Scylla 等工具无法一次性定位完整镜像。
-    // 默认开启；可用环境变量 PEARMOR_NONCONTIG=0 强制关闭（走连续回退分配），
-    // 用于隔离「非连续布局重定位」相关的潜在问题（CI 定位用）。
+    // P3.2 非连续内存布局开关。
+    // 注意：非连续布局与「需要重定位的镜像」不兼容——重定位/导入修复假设单一连续基址，
+    // 分散后跨页指针会指向未映射内存（CI 21 实测：ApplyRelocations 内 0xC0000005）。
+    // 因此默认【关闭】，走标准连续手动加载（与正常 PE 加载等价，必定正确），
+    // 先跑通 Load+OEP 主体流程。待 pe_loader 支持 page-resident 重定位后再开启。
+    // 显式 PEARMOR_NONCONTIG=1 可启用非连续模式（当前仅用于该专项验证）。
     static bool NonContigEnabled() {
         char v[8] = {0};
         GetEnvironmentVariableA("PEARMOR_NONCONTIG", v, sizeof(v));
-        // 未设置或 "1" => 开启；仅当显式 "0" 时关闭
-        return !(v[0] == '0');
+        return (v[0] == '1'); // 仅显式 "1" 时开启
     }
 
     // 主入口：加载 + 修复 + 门控代码页 + 注册 VEH + 启动监控
@@ -169,7 +170,8 @@ public:
                     &sz, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
                 if (!NT_SUCCESS(st) || !base) { DebugLog("[loader] 连续回退分配失败 st=0x%08X", (unsigned)st); return false; }
                 imageBase = base;                    // 连续回退：仍用 imageBase
-                for (uint32_t i = 0; i < pageCount; i++) pageBase[i] = base;
+                for (uint32_t i = 0; i < pageCount; i++)
+                    pageBase[i] = (unsigned char*)base + (size_t)i * pageSize; // 连续块内各页基址（物理连续）
                 workBase = base;
             }
         }
@@ -184,8 +186,12 @@ public:
         }
 
         bool relocated = (reinterpret_cast<uint64_t>(workBase) != preferredBase);
+        DebugLog("[loader] ckpt: 准备 ApplyRelocations (workBase=%p preferredBase=0x%llX relocated=%d)",
+                 workBase, (unsigned long long)preferredBase, (int)relocated);
         if (relocated && !ManualPeLoader::ApplyRelocations(workBase, preferredBase, opt)) { DebugLog("[loader] 应用重定位失败"); return false; }
+        DebugLog("[loader] ckpt: ApplyRelocations 完成, 准备 FixImports");
         if (!ManualPeLoader::FixImports(workBase, opt)) { DebugLog("[loader] 修复导入表失败"); return false; }
+        DebugLog("[loader] ckpt: FixImports 完成");
         ManualPeLoader::FixDelayImports(workBase, opt);
         if (opt.DataDirectory[IMAGE_DIRECTORY_ENTRY_TLS].VirtualAddress)
             ManualPeLoader::RunTlsCallbacks(workBase, opt);
