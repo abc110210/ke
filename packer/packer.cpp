@@ -160,6 +160,17 @@ int main(int argc, char** argv)
 
     // ---- 读取负载无关的 stub 运行时 ----
     if (!stubPath) stubPath = "pearmor-stub.exe";
+    // 显式检查 stub 存在性，给清晰错误（避免 readFile 的通用「无法打开输入文件」误导成 target 问题）
+    {
+        FILE* _cf = nullptr;
+        if (fopen_s(&_cf, stubPath, "rb") != 0 || !_cf) {
+            if (_cf) fclose(_cf);
+            fprintf(stderr, "[packer] 错误: 找不到壳运行时模板: %s\n", stubPath);
+            fprintf(stderr, "[packer] 请确认 pearmor-stub.exe 与 pearmor-packer.exe 在同一目录\n");
+            return 1;
+        }
+        fclose(_cf);
+    }
     auto stubBytes = readFile(stubPath);
     validateStub(stubBytes);
 
