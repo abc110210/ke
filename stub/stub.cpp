@@ -110,9 +110,16 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int)
     pearmor::Overlay::Footer meta = {};
     std::vector<unsigned char> payload, indexEnc;
     bool overlayOk = false;
+    // ---- r54 诊断变量：记录两种读取方式的每步结果（一次 CI 定位失败点）----
+    bool   dCreate = false; DWORD dCreateErr = 0;
+    bool   dSize = false;   LONGLONG dSizeVal = 0;
+    bool   dSeek = false;
+    DWORD  dFooterRd = 0;   uint64_t dFooterMagic = 0;
+    bool   dPayloadOk = false; bool dIndexOk = false;
+    bool   dMemTried = false; bool dMemPrecheck = false; uint64_t dMemMagic = 0;
     {
-        // 【r53 双保险】优先文件读取（分块+重试；CI 已加 Defender 排除，杀软不拦），
-        // 失败则 fallback 内存镜像读取（VirtualQuery 预检可读性，杜绝 CI 51 的 memcpy AV）。
+        // 【r54 双保险 + 分步诊断】优先文件读取（分块+重试），失败 fallback 内存镜像
+        // （VirtualQuery 预检防 AV）。每步记录结果，CI 日志直接显示卡在哪一步。
         wchar_t path[MAX_PATH] = {0};
         GetModuleFileNameW(nullptr, path, MAX_PATH);
         // ---- 方式 A：文件读取（分块 + 重试）----
@@ -121,17 +128,23 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int)
             h = CreateFileW(path, GENERIC_READ,
                             FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr,
                             OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
-            if (h == INVALID_HANDLE_VALUE) Sleep(200);   // 扛杀软短暂锁
+            if (h == INVALID_HANDLE_VALUE) { dCreateErr = GetLastError(); Sleep(200); }
         }
+        dCreate = (h != INVALID_HANDLE_VALUE);
         if (h != INVALID_HANDLE_VALUE) {
             LARGE_INTEGER fsz = {0};
-            bool ok = (GetFileSizeEx(h, &fsz) && fsz.QuadPart > 80);
+            dSize = (GetFileSizeEx(h, &fsz) != 0);
+            dSizeVal = fsz.QuadPart;
+            bool ok = dSize && fsz.QuadPart > 80;
             if (ok) {
                 LARGE_INTEGER off; off.QuadPart = fsz.QuadPart - 80;
-                ok = SetFilePointerEx(h, off, nullptr, FILE_BEGIN);
+                dSeek = SetFilePointerEx(h, off, nullptr, FILE_BEGIN) != 0;
+                ok = dSeek;
                 DWORD rd = 0;
-                if (ok) ok = (ReadFile(h, &meta, 80, &rd, nullptr) && rd == 80);
-                if (ok) ok = (meta.magic == pearmor::Overlay::kMagic &&
+                if (ok) ok = (ReadFile(h, &meta, 80, &rd, nullptr) != 0);
+                dFooterRd = rd;
+                dFooterMagic = meta.magic;
+                if (ok) ok = (rd == 80 && meta.magic == pearmor::Overlay::kMagic &&
                               meta.version == pearmor::Overlay::kVersion);
                 if (ok) {
                     auto readAll = [&](uint64_t fileOff, void* buf, uint32_t len) -> bool {
@@ -156,15 +169,16 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int)
                         try { payload.resize(meta.payloadLen); indexEnc.resize(meta.indexLen); }
                         catch (...) { ok = false; }
                     }
-                    if (ok) ok = readAll(payloadOff, payload.data(), meta.payloadLen);
-                    if (ok) ok = readAll(indexOff, indexEnc.data(), meta.indexLen);
+                    if (ok) { dPayloadOk = readAll(payloadOff, payload.data(), meta.payloadLen); ok = dPayloadOk; }
+                    if (ok) { dIndexOk = readAll(indexOff, indexEnc.data(), meta.indexLen); ok = dIndexOk; }
                 }
             }
             CloseHandle(h);
             overlayOk = ok;
         }
-        // ---- 方式 B fallback：内存镜像读取（VirtualQuery 预检，防 memcpy AV）----
+        // ---- 方式 B fallback：内存镜像读取（VirtualQuery 预检）----
         if (!overlayOk) {
+            dMemTried = true;
             meta = {};
             payload.clear(); indexEnc.clear();
             HMODULE mod = GetModuleHandleW(nullptr);
@@ -194,9 +208,7 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int)
                 fileSize.QuadPart = ((LONGLONG)fad.nFileSizeHigh << 32) | fad.nFileSizeLow;
             uint64_t overlayTotal = (uint64_t)fileSize.QuadPart - fileDataEnd;
             if (ovMem && overlayTotal >= 80) {
-                // VirtualQuery 逐页预检：overlay 区域必须全部 COMMIT 且可读，否则直接放弃
-                // （CI 51 教训：Windows 不保证 SizeOfImage 之外的 overlay 页已提交/可读，
-                //   直接 memcpy 会 0xC0000005）
+                // VirtualQuery 逐页预检：overlay 区域必须全部 COMMIT 且可读，否则放弃
                 bool memReadable = true;
                 MEMORY_BASIC_INFORMATION mbi;
                 for (uintptr_t a = ovMem; a < ovMem + overlayTotal; a += mbi.RegionSize) {
@@ -208,9 +220,11 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int)
                         break;
                     }
                 }
+                dMemPrecheck = memReadable;
                 if (memReadable) {
                     uint8_t* footerPtr = reinterpret_cast<uint8_t*>(ovMem) + overlayTotal - 80;
                     memcpy(&meta, footerPtr, 80);
+                    dMemMagic = meta.magic;
                     if (meta.magic == pearmor::Overlay::kMagic &&
                         meta.version == pearmor::Overlay::kVersion) {
                         uint64_t need = (uint64_t)meta.payloadLen + (uint64_t)meta.indexLen + 80;
@@ -230,18 +244,17 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int)
         }
     }
     if (!overlayOk) {
-        // 失败诊断：打印内存镜像关键定位信息，便于调整 overlay 内存偏移计算
-        HMODULE mod = GetModuleHandleW(nullptr);
         wchar_t selfPath[MAX_PATH] = {0};
         GetModuleFileNameW(nullptr, selfPath, MAX_PATH);
         LONGLONG fsz = -1;
         WIN32_FILE_ATTRIBUTE_DATA fad = {0};
         if (GetFileAttributesExW(selfPath, GetFileExInfoStandard, &fad))
             fsz = ((LONGLONG)fad.nFileSizeHigh << 32) | fad.nFileSizeLow;
-        DebugLog("[stub] overlay 内存读取失败：自身=%ls 大小=%lld 基址=%p magic=0x%llX ver=%u pageCount=%u payloadLen=%u",
-                 selfPath, fsz, (void*)mod,
-                 (unsigned long long)meta.magic, (unsigned)meta.version,
-                 (unsigned)meta.pageCount, (unsigned)meta.payloadLen);
+        DebugLog("[stub] overlay 读取失败(r54)：文件方式 Create=%d(Err=%lu) Size=%d(%lld) Seek=%d FooterRd=%u FooterMagic=0x%llX Payload=%d Index=%d | 内存方式 Tried=%d Precheck=%d MemMagic=0x%llX | 自身=%ls 大小=%lld",
+                 (int)dCreate, dCreateErr, (int)dSize, dSizeVal, (int)dSeek,
+                 dFooterRd, (unsigned long long)dFooterMagic, (int)dPayloadOk, (int)dIndexOk,
+                 (int)dMemTried, (int)dMemPrecheck, (unsigned long long)dMemMagic,
+                 selfPath, fsz);
         fprintf(stderr, "[stub] 未加壳的运行时，请使用 pearmor 加壳器生成成品\n");
         return -4;
     }
