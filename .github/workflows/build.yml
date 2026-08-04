@@ -1,62 +1,106 @@
-# ============================================================================
-# CI：windows-latest 上完成 编译 -> 打包 -> 运行验证 -> 产出工件
-# 私有仓库内运行，环境受控（GitHub 托管 runner）。
-# ============================================================================
-name: build-and-verify
+name: Build Windows Client
+
+# 客户端是纯 Win32 + C++17、零第三方依赖、/MT 静态链接，
+# 目标机器不需要安装任何 VC++ 运行库。本工作流只负责在 GitHub 上编译出 exe。
+# 仅手动触发（workflow_dispatch），不随 push / PR 自动跑。
 
 on:
-  workflow_dispatch:
+  workflow_dispatch:   # 仅允许在 Actions 页面手动触发
+
+permissions:
+  contents: read
+  id-token: write      # actions/upload-artifact@v4 新版后端需要
+  actions: read
 
 jobs:
   build:
+    name: Build (Windows x64 / Release / /MT)
     runs-on: windows-latest
-
+    defaults:
+      run:
+        shell: pwsh
     steps:
-      - name: 检出代码
+      - name: 拉取代码
         uses: actions/checkout@v4
 
-      - name: 安装 MSVC 工具链
+      # 把 MSVC 工具链（cl / link / rc / lib / include）挂到 PATH。
+      # 注意：不用 VS IDE 生成器，避免 CMake 在某些 runner 上“找不到 Visual Studio 实例”。
+      - name: 配置 MSVC 工具链 (x64)
         uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
 
-      - name: 一键构建（打包器 -> 加密负载 -> 嵌入壳）
-        shell: pwsh
+      # 确保 Ninja 可用（GitHub 的 windows runner 已自带，这里做个兜底）
+      - name: 确保 Ninja 可用
         run: |
-          .\build.ps1
+          if (-not (Get-Command ninja -ErrorAction SilentlyContinue)) {
+            choco install ninja -y
+          }
+          ninja --version
 
-      - name: 运行加壳后的程序（验证解密 + 手动加载 + OEP）
-        shell: pwsh
+      # 获取 WebView2 SDK（仅编译期需要；运行时依赖系统 WebView2 Runtime）
+      - name: 获取 WebView2 SDK
         run: |
-          $out = ".\packed_app.exe"
-          if (-not (Test-Path $out)) { throw "未找到 $out" }
-          $env:PEARMOR_DEBUG = "1"   # 开启壳内调试日志
-          $env:PEARMOR_ALLOW_VM = "1"  # CI runner 本身是 Azure VM 且系统盘<30GB，放行 VM 检测
-          $env:PEARMOR_ALLOW_PROCENV = "1"  # 跳过进程环境检测（其 ImageName.Buffer 内核地址陷阱待修）
-          $env:PEARMOR_ALLOW_CODEGEN = "1"  # 跳过 P3.1 运行时代码生成验证（其校验逻辑待单独修复），先验证加载主体
-          # 带超时运行：防止反调试/挂起导致 runner 被占几小时
-          $timeoutSec = 30
-          $p = Start-Process -FilePath $out -PassThru -RedirectStandardError "stderr.txt"
-          if (-not $p.WaitForExit($timeoutSec * 1000)) {
-            Write-Host "加壳程序 ${timeoutSec}s 内未退出，强制结束并收集日志"
-            Stop-Process -Id $p.Id -Force -ErrorAction SilentlyContinue
-            $timedOut = $true
-          }
-          Write-Host "exit_code = $($p.ExitCode)"
-          # 无论成败都打印诊断日志，便于定位崩溃（如 0xC0000096 特权指令）
-          $tmp = $env:TEMP
-          foreach ($lf in @("$tmp\pearmor_crash.log", "$tmp\pearmor_stub.log", "stderr.txt")) {
-            if (Test-Path $lf) { Write-Host "==== $lf ===="; Get-Content $lf; Write-Host "============" }
-          }
-          if ($timedOut) { throw "加壳程序运行超时（${timeoutSec}s），可能自挂起或死循环" }
-          if ($p.ExitCode -ne 0) { throw "加壳程序退出码非 0 ($($p.ExitCode))" }
-          # 样例程序成功执行会写验证文件
-          if (-not (Test-Path ".\pearmor_payload_ran.txt")) { throw "样例未生成验证文件：OEP 未执行" }
-          Get-Content ".\pearmor_payload_ran.txt"
+          # 查询 NuGet 最新稳定版（避免写死版本与本地不一致，并确保含最新 API）
+          $idx = Invoke-RestMethod "https://api.nuget.org/v3-flatcontainer/microsoft.web.webview2/index.json"
+          $ver = ($idx.versions | Where-Object { $_ -notmatch '-' } | Sort-Object { [version] $_ } | Select-Object -Last 1)
+          Write-Host "WebView2 SDK 版本: $ver"
+          $url = "https://www.nuget.org/api/v2/package/Microsoft.Web.WebView2/$ver"
+          Invoke-WebRequest -Uri $url -OutFile webview2.nupkg
+          Expand-Archive -Path webview2.nupkg -DestinationPath webview2sdk -Force
 
-      - name: 上传工件（加壳后的 EXE + 打包器）
+          # 递归定位真实头文件/库位置，绕开 NuGet 包内部目录结构差异
+          $hdr = Get-ChildItem -Path webview2sdk -Recurse -Filter WebView2.h | Select-Object -First 1
+          if (-not $hdr) { throw "解压后找不到 WebView2.h，请检查 Microsoft.Web.WebView2 包版本 $ver" }
+          $incDir = $hdr.DirectoryName
+
+          # 头文件完整性校验：确认关键 API 已存在，避免旧/损坏 SDK 导致编译失败。
+          # 注意：WebMessage 读取在新版 SDK 中从 get_WebMessageAsString 改名为
+          #       TryGetWebMessageAsString，两者有其一即可（main.cpp 已用 __if_exists 适配）。
+          $htext = Get-Content $hdr.FullName -Raw
+          $hasWebMsg = ($htext -match 'get_WebMessageAsString') -or ($htext -match 'TryGetWebMessageAsString')
+          if (-not $hasWebMsg) {
+              throw "WebView2.h 缺少 WebMessage 读取 API（get_WebMessageAsString / TryGetWebMessageAsString 均不存在，SDK 版本 $ver 不完整）"
+          }
+          foreach ($sym in @('IsGeneralAutofillEnabled','ICoreWebView2Settings5')) {
+              if ($htext -notmatch [regex]::Escape($sym)) {
+                  throw "WebView2.h 缺少必要 API: $sym（SDK 版本 $ver 不完整，请检查）"
+              }
+          }
+
+          $lib = Get-ChildItem -Path webview2sdk -Recurse -Filter WebView2LoaderStatic.lib |
+                 Where-Object { $_.FullName -match '[\\/]x64[\\/]' } | Select-Object -First 1
+          if (-not $lib) { throw "解压后找不到 x64 的 WebView2LoaderStatic.lib" }
+          $libDir = $lib.DirectoryName
+
+          $sdk = "$PWD/webview2sdk"
+          # 用 ASCII 写 GITHUB_ENV，避免 UTF-8 BOM 把首个变量名吞掉导致传递失败
+          "WEBVIEW2_SDK_ROOT=$sdk"       | Out-File -Append -FilePath $env:GITHUB_ENV -Encoding ascii
+          "WEBVIEW2_INCLUDE_DIR=$incDir" | Out-File -Append -FilePath $env:GITHUB_ENV -Encoding ascii
+          "WEBVIEW2_LIB_DIR=$libDir"     | Out-File -Append -FilePath $env:GITHUB_ENV -Encoding ascii
+          Write-Host "WebView2 SDK 根目录: $sdk"
+          Write-Host "WebView2 包含目录 : $incDir"
+          Write-Host "WebView2 链接目录 : $libDir"
+
+      - name: CMake 配置（Ninja 生成器）
+        working-directory: client
+        run: cmake -B build -G "Ninja" -DCMAKE_BUILD_TYPE=Release -DWEBVIEW2_SDK_ROOT="${{ env.WEBVIEW2_SDK_ROOT }}"
+
+      - name: 编译 Release
+        working-directory: client
+        run: cmake --build build --config Release
+
+      - name: 定位生成的 exe
+        working-directory: client
+        run: |
+          $exe = Get-ChildItem -Path build -Recurse -Filter HanbotSavesUploader.exe | Select-Object -First 1
+          if (-not $exe) { throw "没有找到 HanbotSavesUploader.exe，编译可能失败" }
+          echo "EXE_PATH=$($exe.FullName)" | Out-File -Append -FilePath $env:GITHUB_ENV -Encoding utf8
+          Write-Host "已生成可执行文件: $($exe.FullName)"
+
+      - name: 上传构建产物
         uses: actions/upload-artifact@v4
         with:
-          name: pearmor-artifacts
-          path: |
-            packed_app.exe
-            build/packer/Release/pearmor-packer.exe
+          name: HanbotSavesUploader-windows-x64
+          path: ${{ env.EXE_PATH }}
           if-no-files-found: error
