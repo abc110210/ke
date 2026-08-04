@@ -69,6 +69,15 @@ public:
         return (v[0] == '1'); // 仅显式 "1" 时开启
     }
 
+    // 全局禁门控开关（诊断用）。PEARMOR_DISABLE_GATING=1 时所有代码页保持明文可执行，
+    // 不重加密、不置 NOACCESS，用于隔离"门控/VEH/C++ 展开交互"与"镜像重建(重定位/导入/解密)"
+    // 两类问题。默认关（正常门控）。
+    static bool GatingDisabled() {
+        char v[8] = {0};
+        GetEnvironmentVariableA("PEARMOR_DISABLE_GATING", v, sizeof(v));
+        return (v[0] == '1');
+    }
+
     // 主入口：加载 + 修复 + 门控代码页 + 注册 VEH + 启动监控
     // 返回 true 时 outEntryRva 为原始入口 RVA
     //   innerKey : 由 seed 经 KDF 派生的内层密钥，用于逐页解密代码
@@ -197,25 +206,13 @@ public:
             ManualPeLoader::RunTlsCallbacks(workBase, opt);
 
         // ---- 注册异常处理/展开表（RUNTIME_FUNCTION / .pdata）----
-        // 手动映射的镜像若不注册函数表，payload 内的 C++ 异常/SEH 无法做栈展开：
-        // 任何 throw 都会因找不到展开信息而变成未处理异常（0xE06D7363），
-        // 表现为“跳 OEP 即崩、异常地址落在 KERNELBASE 派发点”。这是手动 PE
-        // 加载器让 payload 的 C++ 异常/SEH 正常工作的标准必做步骤。
-        {
-            auto& exc = opt.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXCEPTION];
-            if (exc.VirtualAddress && exc.Size) {
-                PVOID pdata = reinterpret_cast<unsigned char*>(workBase) + exc.VirtualAddress;
-                ULONG count = exc.Size / sizeof(RUNTIME_FUNCTION);
-                if (::RtlAddFunctionTable(reinterpret_cast<PRUNTIME_FUNCTION>(pdata),
-                                           count, reinterpret_cast<ULONG64>(workBase))) {
-                    DebugLog("[loader] ckpt: 已注册函数表(pdata) count=%u", count);
-                } else {
-                    DebugLog("[loader] ckpt: RtlAddFunctionTable 失败(忽略)");
-                }
-            } else {
-                DebugLog("[loader] ckpt: 无异常目录, 跳过函数表注册");
-            }
-        }
+        // 注意：此前曾在此调用 RtlAddFunctionTable 注册手动映射镜像的 .pdata，
+        // 但 CI 25 实测反而把"可捕获的 C++ 异常(0xE06D7363)"变成了"展开期不可捕获的
+        // 访问违规(0xC0000005)"——因为本加载器通过 VEH 缺页恢复跳入 payload，入口处的
+        // 栈/展开上下文与"正常 call 链"不一致，注册的函数表让 x64 展开器在展开 main 帧时
+        // 踩非法内存。鉴于 payload(test_payload)为纯 Win32、无 C++ 异常，且手动映射语境下
+        // 注册 pdata 弊大于利，此处【不再注册】，保持进程默认行为。
+        DebugLog("[loader] ckpt: 跳过 RtlAddFunctionTable 注册（避免展开期不可捕获 AV）");
 
         imageSize = sizeOfImage;
 
@@ -259,8 +256,35 @@ public:
         }
 
         // ---- 门控：代码页重新加密 + NOACCESS；数据页保留明文 ----
-        DebugLog("[loader] ckpt: 进入门控循环 pages=%u", pageCount);
+        // 关键修正（CI 25 复盘）：入口页【绝不】门控（保持 EXECUTE_READ），否则"跳 OEP
+        // 即触发缺页→VEH 恢复→C++ 展开上下文错乱"会把可捕获异常变成不可捕获 AV。
+        // 入口页本就是最先执行的代码，门控它无保护收益，徒增 fragility。
+        const uint32_t entryPage = (uint32_t)(opt.AddressOfEntryPoint / pageSize);
+        gatingEnabled = !GatingDisabled();
+        DebugLog("[loader] ckpt: 进入门控循环 pages=%u entryPage=%u gatingEnabled=%d",
+                 pageCount, entryPage, (int)gatingEnabled);
         for (uint32_t i = 0; i < pageCount; i++) {
+            if (i == entryPage) {
+                // 入口页：必须可执行，绝不置 NOACCESS/非执行
+                DWORD old = 0; SIZE_T sz = pageSize; PVOID p = pageBase[i];
+                Sys::ProtectVirtualMemory(GetCurrentProcess(), &p, &sz, PAGE_EXECUTE_READ, &old);
+                pages[i].decrypted = true;
+                pages[i].baseCrc = fnv1a32(reinterpret_cast<const unsigned char*>(pageBase[i]), pageSize);
+                DebugLog("[loader] ckpt: 入口页 i=%u 保持 EXECUTE_READ(不门控)", i);
+                continue;
+            }
+            if (!gatingEnabled) {
+                // 诊断模式：所有页保持明文，代码页可执行、数据页可读写
+                DWORD old = 0; SIZE_T sz = pageSize; PVOID p = pageBase[i];
+                if (pages[i].isCode) {
+                    Sys::ProtectVirtualMemory(GetCurrentProcess(), &p, &sz, PAGE_EXECUTE_READ, &old);
+                    pages[i].baseCrc = fnv1a32(reinterpret_cast<const unsigned char*>(pageBase[i]), pageSize);
+                } else {
+                    Sys::ProtectVirtualMemory(GetCurrentProcess(), &p, &sz, PAGE_READWRITE, &old);
+                }
+                pages[i].decrypted = true;
+                continue;
+            }
             if (pages[i].isCode) {
                 DebugLog("[loader] ckpt: 门控代码页 i=%u", i);
                 // 修复（重定位/导入）已完成，先记录运行期基准 CRC，再重新加密。
@@ -273,7 +297,6 @@ public:
                 DebugLog("[loader] ckpt: 代码页 i=%u 已重加密+NOACCESS", i);
             } else {
                 DWORD old = 0;
-                // 数据页保持可读写（非执行），不门控
                 SIZE_T sz = pageSize;
                 PVOID p = pageBase[i];
                 Sys::ProtectVirtualMemory(GetCurrentProcess(), &p, &sz, PAGE_READWRITE, &old);
@@ -302,17 +325,19 @@ public:
         return true;
     }
 
-    // 跳 OEP（经 VEH 控制流混淆演示一次跳转；OEP 页初始 NOACCESS 触发按需解密）
+    // 跳 OEP（入口页保持 EXECUTE_READ 直接执行；其它代码页首次执行时由 VEH 按需解密）
     int CallEntry(uint64_t entryRva)
     {
         if (pageBase.empty() || !pageBase[0]) return -1;
         pendingRva = entryRva;
         g_oepRc    = 0;
-        DebugLog("[stub] 直接跳 OEP entryRva=0x%llX", (unsigned long long)entryRva);
+        const uint32_t ep = (uint32_t)(entryRva / pageSize);
+        DebugLog("[stub] 直接跳 OEP entryRva=0x%llX 入口页 i=%u 已解密=%d 门控使能=%d",
+                 (unsigned long long)entryRva, ep,
+                 (int)(ep < pages.size() ? pages[ep].decrypted : -1), (int)gatingEnabled);
         // 直接跳 OEP（去掉 VehCf::RunObfuscated 的 __debugbreak 0xCC 演示混淆）：
-        // OEP 落在被门控的 NOACCESS 代码页，跳入即触发按需解密 VEH 正常执行，
-        // 无需额外异常控制流混淆。把“跳 OEP”绑在演示性混淆上，在 CI 无调试器环境
-        // 下 0xCC 终止路径不走标准 TopLevelHandler，导致无 crash.log 且 OEP 永远跳不了。
+        // 入口页保持 EXECUTE_READ，跳入即正常执行，不再依赖 VEH 缺页恢复（避免展开上下文错乱）。
+        // 其它代码页仍在首次执行时触发 VEH 按需解密。
         OepThunk();
         return g_oepRc;
     }
@@ -339,9 +364,9 @@ public:
         return true;
     }
 
-    // VEH 控制流混淆后的真实入口调用
-    // 注意：经 Rip 重定向进入本函数，没有正常 call 压栈，故不可走 ret 返回，
-    //       统一用 ExitProcess 收尾（与 GUI/正常退出路径一致，避免栈帧错乱）。
+    // 真正的 OEP 调用点（由 CallEntry 直接调用，入口页已是 EXECUTE_READ）。
+    // 用 ExitProcess 收尾：main 内自身也会 ExitProcess；此处兜底确保无论 OEP 是否
+    // 正常返回都走统一退出路径，避免栈帧错乱（OepThunk 由普通 call 进入，非 VEH Rip 重定向）。
     static int OepExceptFilter(EXCEPTION_POINTERS* ep)
     {
         auto* rec = ep->ExceptionRecord;
@@ -352,7 +377,9 @@ public:
     static void OepThunk()
     {
         if (!g_instance) return;
-        auto fn = reinterpret_cast<int(*)()>(g_instance->SafeRvaToVa(g_instance->pendingRva));
+        void* va = g_instance->SafeRvaToVa(g_instance->pendingRva);
+        DebugLog("[oep] OepThunk 进入, 入口 VA=%p (若后续无 [oep] 日志即崩 => 崩在 payload 执行期)", va);
+        auto fn = reinterpret_cast<int(*)()>(va);
         if (fn) {
             __try {
                 g_oepRc = fn();
@@ -360,7 +387,10 @@ public:
                 DebugLog("[oep] OEP 执行期间抛异常，已就地捕获（rc=-2）");
                 g_oepRc = -2;
             }
+        } else {
+            DebugLog("[oep] SafeRvaToVa 返回空, 入口解析失败");
         }
+        DebugLog("[oep] OEP 返回路径(正常不应到达, main 内已 ExitProcess)");
         ExitProcess(g_oepRc);
     }
 
@@ -445,6 +475,7 @@ private:
     void*   dataBlockBase = nullptr;    // 数据页集中块
     uint32_t dataBlockPages = 0;        // 数据块页数
     bool    nonContig = false;          // 是否实际启用非连续
+    bool    gatingEnabled = true;       // 门控总开关（PEARMOR_DISABLE_GATING=1 时置 false）
 
     std::vector<PageState> pages;
     void*   vehHandle = nullptr;
@@ -561,7 +592,7 @@ private:
                 std::lock_guard<std::mutex> lk(mtx);
                 uint64_t now = nowMs();
                 for (uint32_t i = 0; i < pageCount; i++) {
-                    if (pages[i].isCode && pages[i].decrypted &&
+                    if (gatingEnabled && pages[i].isCode && pages[i].decrypted &&
                         (now - pages[i].lastUsed > IDLE_MS)) {
                         reencryptPageLocked(i);
                     }
