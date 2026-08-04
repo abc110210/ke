@@ -323,10 +323,17 @@ public:
         //        非连续模式：PE 头在数据块内（dataBlockBase）；连续回退模式：在 imageBase 开头。
         //        【CI 42 后补齐】此前仅 dataBlockBase（非连续）触发，连续回退模式（当前默认）
         //        下一直未执行 —— 改为两模式都覆写。
+        //        【CI 60 隔离诊断】真实目标（Hanbot）CRT 初始化可能读自身 PE 头（资源/TLS/节表），
+        //        覆写后读到损坏头 → 初始化失败退出 0xC0000005。设 PEARMOR_NO_CORRUPT_HEADER=1 跳过，
+        //        用于隔离「CorruptHeader 破坏运行」vs「其它运行期问题」。
         void* headerTarget = dataBlockBase ? dataBlockBase : imageBase;
-        if (headerTarget) {
+        char noCorrupt[8] = {0};
+        GetEnvironmentVariableA("PEARMOR_NO_CORRUPT_HEADER", noCorrupt, sizeof(noCorrupt));
+        if (headerTarget && noCorrupt[0] != '1') {
             DebugLog("[loader] ckpt: 覆写内存 PE 头 (CorruptHeader) target=%p", headerTarget);
             ManualPeLoader::CorruptHeader(headerTarget);
+        } else if (headerTarget) {
+            DebugLog("[loader] ckpt: 跳过 CorruptHeader（PEARMOR_NO_CORRUPT_HEADER=1，诊断用）");
         }
 
         // ---- 门控：代码页重新加密 + NOACCESS；数据页保留明文 ----
