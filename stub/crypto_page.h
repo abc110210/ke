@@ -3,43 +3,32 @@
 // 关键：每个 4KB 页使用「独立派生 IV」= master_iv XOR (uint128)pageIndex，
 //       因此任意单页都能独立解密 / 重加密，无需一次性处理整镜像。
 // 该 IV 派生公式必须与 packer 完全一致（见 packer.cpp）。
+//
+// 实现说明：改用 common/aes256.h 的自带纯 C++ AES（不再依赖 Windows BCrypt），
+// 因为 BCrypt 在 VEH 异常处理上下文里重入会崩溃于 bcryptprimitives.dll，
+// 而壳的"按需分页解密"正是在 VEH 中调解密。packer 也改用同一份 aes256.h，
+// 保证加解密逐字节一致。
 // ============================================================================
 #pragma once
-#include <windows.h>
-#include <bcrypt.h>
 #include <cstdint>
 #include <cstring>
+#include "aes256.h"
 
 namespace pearmor {
 
 struct AesPageCipher {
-    BCRYPT_ALG_HANDLE  alg   = nullptr;
-    BCRYPT_KEY_HANDLE  keyH  = nullptr;
-    unsigned char      ivMaster[16] = {0};
-    bool               ok    = false;
+    unsigned char key32[32]   = {0};   // 解密密钥（AES-256）
+    unsigned char ivMaster[16] = {0};   // IV 母版（= 密钥/外层密钥前 16 字节）
+    bool          ok           = false;
 
-    AesPageCipher(const unsigned char* key32, const unsigned char* iv16)
+    AesPageCipher(const unsigned char* key, const unsigned char* iv16)
     {
-        if (BCryptOpenAlgorithmProvider(&alg, BCRYPT_AES_ALGORITHM, nullptr, 0) != 0)
-            return;
-        if (BCryptSetProperty(alg, BCRYPT_CHAINING_MODE,
-                reinterpret_cast<PUCHAR>(const_cast<wchar_t*>(BCRYPT_CHAIN_MODE_CBC)),
-                sizeof(BCRYPT_CHAIN_MODE_CBC), 0) != 0) {
-            BCryptCloseAlgorithmProvider(alg, 0); alg = nullptr; return;
-        }
-        if (BCryptGenerateSymmetricKey(alg, &keyH, nullptr, 0,
-                const_cast<PUCHAR>(key32), 32, 0) != 0) {
-            BCryptCloseAlgorithmProvider(alg, 0); alg = nullptr; return;
-        }
+        memcpy(key32, key, 32);
         memcpy(ivMaster, iv16, 16);
-        ok = true;
+        ok = true;   // 纯实现无需运行时初始化，恒成功
     }
 
-    ~AesPageCipher()
-    {
-        if (keyH) BCryptDestroyKey(keyH);
-        if (alg)  BCryptCloseAlgorithmProvider(alg, 0);
-    }
+    ~AesPageCipher() { memset(key32, 0, sizeof(key32)); }
 
     // IV_i = master_iv XOR (uint128)pageIndex（低 8 字节放页号）
     void deriveIv(uint32_t pageIndex, unsigned char outIv[16]) const
@@ -54,22 +43,16 @@ struct AesPageCipher {
                      unsigned char* outPlain, size_t pageBytes) const
     {
         unsigned char iv[16]; deriveIv(pageIndex, iv);
-        ULONG done = 0;
-        NTSTATUS st = BCryptDecrypt(keyH, const_cast<PUCHAR>(cipherPage),
-            static_cast<ULONG>(pageBytes), nullptr, iv, 16,
-            outPlain, static_cast<ULONG>(pageBytes), &done, 0);
-        return BCRYPT_SUCCESS(st);
+        aes256::cbc_decrypt(key32, iv, cipherPage, pageBytes, outPlain);
+        return true;   // 纯实现不失败（输入长度恒为页对齐）
     }
 
     bool encryptPage(const unsigned char* plainPage, uint32_t pageIndex,
                      unsigned char* outCipher, size_t pageBytes) const
     {
         unsigned char iv[16]; deriveIv(pageIndex, iv);
-        ULONG done = 0;
-        NTSTATUS st = BCryptEncrypt(keyH, const_cast<PUCHAR>(plainPage),
-            static_cast<ULONG>(pageBytes), nullptr, iv, 16,
-            outCipher, static_cast<ULONG>(pageBytes), &done, 0);
-        return BCRYPT_SUCCESS(st);
+        aes256::cbc_encrypt(key32, iv, plainPage, pageBytes, outCipher);
+        return true;
     }
 };
 
