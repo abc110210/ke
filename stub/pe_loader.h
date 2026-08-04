@@ -523,9 +523,21 @@ public:
         BYTE* base = reinterpret_cast<BYTE*>(imageBase);
         auto* tls = reinterpret_cast<IMAGE_TLS_DIRECTORY64*>(base + dir.VirtualAddress);
         if (!tls->AddressOfCallBacks) return true;
-        uint64_t* cb = reinterpret_cast<uint64_t*>(tls->AddressOfCallBacks);
-        for (; *cb; cb++) {
-            auto fn = reinterpret_cast<void(WINAPI*)(PVOID, DWORD, PVOID)>(*cb);
+        // 【CI 55 根因】TLS 目录的 AddressOfCallBacks 是【链接时 VA】（按 preferredBase 算），
+        // 重定位表不覆盖 PE 头里的 TLS 目录 → 手动加载后必须按 delta 修正到实际基址，
+        // 否则指向 0x140000000 未映射区 → 崩溃地址超镜像（workBase+0x354BC0）。
+        uintptr_t pref  = opt.ImageBase;
+        uintptr_t delta = reinterpret_cast<uintptr_t>(imageBase) - pref;
+        uint64_t* cb = reinterpret_cast<uint64_t*>(tls->AddressOfCallBacks + delta);
+        DebugLog("[loader] TLS 回调: TLS_RVA=0x%X AddressOfCallBacks=0x%llX 修正后cb=%p cb[0]=0x%llX imageBase=%p",
+                 dir.VirtualAddress, (unsigned long long)tls->AddressOfCallBacks,
+                 (void*)cb, (unsigned long long)(cb ? *cb : 0), imageBase);
+        for (uint32_t i = 0; cb[i]; i++) {
+            uintptr_t callAddr = static_cast<uintptr_t>(cb[i]);
+            // 若回调地址仍是链接时 VA（preferredBase 区间）→ 手动 +delta 修正
+            if (callAddr >= pref && callAddr < pref + opt.SizeOfImage)
+                callAddr += delta;
+            auto fn = reinterpret_cast<void(WINAPI*)(PVOID, DWORD, PVOID)>(callAddr);
             fn(imageBase, DLL_PROCESS_ATTACH, nullptr);
         }
         return true;
