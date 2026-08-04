@@ -28,6 +28,18 @@ jobs:
         run: |
           $out = ".\packed_app.exe"
           if (-not (Test-Path $out)) { throw "未找到 $out" }
+          # 加壳成功的最直接证据：产物末尾必须带 overlay Footer（magic "PEARMOROV"）。
+          # 若无 → packer 没把密文拼进去（裸 stub），运行必然报「未发现 overlay」。
+          $fs = [System.IO.File]::OpenRead((Resolve-Path $out))
+          $fs.Seek(-80, [System.IO.SeekOrigin]::End) | Out-Null
+          $buf = New-Object byte[] 8
+          $fs.Read($buf, 0, 8) | Out-Null
+          $fs.Close()
+          $magic = [System.BitConverter]::ToUInt64($buf, 0)
+          if ($magic -ne 0x564F524F4D524145) {
+            throw "加壳产物缺少 overlay Footer（magic=0x{0:X16}）：$out 未成功拼接密文" -f $magic
+          }
+          Write-Host "overlay Footer 校验通过（密文已拼接），产物大小: $((Get-Item $out).Length) 字节"
           $env:PEARMOR_DEBUG = "1"   # 开启壳内调试日志
           $env:PEARMOR_ALLOW_VM = "1"  # CI runner 本身是 Azure VM 且系统盘<30GB，放行 VM 检测
           # 带超时运行：防止反调试/挂起导致 runner 被占几小时
