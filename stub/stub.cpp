@@ -111,45 +111,104 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int)
     std::vector<unsigned char> payload, indexEnc;
     bool overlayOk = false;
     {
-        // 【r52 根治】从自身【内存镜像】读 overlay，完全不碰文件系统。
-        // CI 49/50 实证：文件读取路径在 runner 上被杀软/实时扫描干预（footer 80B 能读、
-        // 1.1MB payload 读不满/被锁）——而进程启动时整个 exe（含 overlay）已被 Windows
-        // 映射进内存，内存读取不受文件系统状态影响。文件大小仅用属性查询（不打开文件）。
-        HMODULE mod = GetModuleHandleW(nullptr);
-        uint8_t* base = reinterpret_cast<uint8_t*>(mod);
-        auto* dos = reinterpret_cast<IMAGE_DOS_HEADER*>(base);
-        if (dos->e_magic == IMAGE_DOS_SIGNATURE) {
+        // 【r53 双保险】优先文件读取（分块+重试；CI 已加 Defender 排除，杀软不拦），
+        // 失败则 fallback 内存镜像读取（VirtualQuery 预检可读性，杜绝 CI 51 的 memcpy AV）。
+        wchar_t path[MAX_PATH] = {0};
+        GetModuleFileNameW(nullptr, path, MAX_PATH);
+        // ---- 方式 A：文件读取（分块 + 重试）----
+        HANDLE h = INVALID_HANDLE_VALUE;
+        for (int attempt = 0; attempt < 8 && h == INVALID_HANDLE_VALUE; attempt++) {
+            h = CreateFileW(path, GENERIC_READ,
+                            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr,
+                            OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+            if (h == INVALID_HANDLE_VALUE) Sleep(200);   // 扛杀软短暂锁
+        }
+        if (h != INVALID_HANDLE_VALUE) {
+            LARGE_INTEGER fsz = {0};
+            bool ok = (GetFileSizeEx(h, &fsz) && fsz.QuadPart > 80);
+            if (ok) {
+                LARGE_INTEGER off; off.QuadPart = fsz.QuadPart - 80;
+                ok = SetFilePointerEx(h, off, nullptr, FILE_BEGIN);
+                DWORD rd = 0;
+                if (ok) ok = (ReadFile(h, &meta, 80, &rd, nullptr) && rd == 80);
+                if (ok) ok = (meta.magic == pearmor::Overlay::kMagic &&
+                              meta.version == pearmor::Overlay::kVersion);
+                if (ok) {
+                    auto readAll = [&](uint64_t fileOff, void* buf, uint32_t len) -> bool {
+                        LARGE_INTEGER o; o.QuadPart = (LONGLONG)fileOff;
+                        if (!SetFilePointerEx(h, o, nullptr, FILE_BEGIN)) return false;
+                        uint8_t* p = reinterpret_cast<uint8_t*>(buf);
+                        uint32_t total = 0;
+                        constexpr uint32_t CHUNK = 0x10000;   // 64KB
+                        while (total < len) {
+                            DWORD want = (len - total) > CHUNK ? CHUNK : (len - total);
+                            DWORD got = 0;
+                            if (!ReadFile(h, p + total, want, &got, nullptr) || got == 0)
+                                return false;
+                            total += got;
+                        }
+                        return true;
+                    };
+                    uint64_t indexOff   = (uint64_t)fsz.QuadPart - 80;
+                    uint64_t payloadOff = indexOff - (uint64_t)meta.indexLen - (uint64_t)meta.payloadLen;
+                    ok = (payloadOff <= indexOff);
+                    if (ok) {
+                        try { payload.resize(meta.payloadLen); indexEnc.resize(meta.indexLen); }
+                        catch (...) { ok = false; }
+                    }
+                    if (ok) ok = readAll(payloadOff, payload.data(), meta.payloadLen);
+                    if (ok) ok = readAll(indexOff, indexEnc.data(), meta.indexLen);
+                }
+            }
+            CloseHandle(h);
+            overlayOk = ok;
+        }
+        // ---- 方式 B fallback：内存镜像读取（VirtualQuery 预检，防 memcpy AV）----
+        if (!overlayOk) {
+            meta = {};
+            payload.clear(); indexEnc.clear();
+            HMODULE mod = GetModuleHandleW(nullptr);
+            uint8_t* base = reinterpret_cast<uint8_t*>(mod);
+            auto* dos = reinterpret_cast<IMAGE_DOS_HEADER*>(base);
             auto* nt = reinterpret_cast<IMAGE_NT_HEADERS*>(base + dos->e_lfanew);
-            if (nt->Signature == IMAGE_NT_SIGNATURE) {
-                IMAGE_SECTION_HEADER* sec = IMAGE_FIRST_SECTION(nt);
-                DWORD fileDataEnd = nt->OptionalHeader.SizeOfHeaders;  // 文件数据末尾（overlay 起点）
-                IMAGE_SECTION_HEADER* lastSec = nullptr;
-                for (WORD i = 0; i < nt->FileHeader.NumberOfSections; i++) {
-                    DWORD end = sec[i].PointerToRawData + sec[i].SizeOfRawData;
-                    if (end > fileDataEnd) fileDataEnd = end;
-                    if (sec[i].SizeOfRawData > 0) lastSec = &sec[i];
+            IMAGE_SECTION_HEADER* sec = IMAGE_FIRST_SECTION(nt);
+            DWORD fileDataEnd = nt->OptionalHeader.SizeOfHeaders;
+            IMAGE_SECTION_HEADER* lastSec = nullptr;
+            for (WORD i = 0; i < nt->FileHeader.NumberOfSections; i++) {
+                DWORD end = sec[i].PointerToRawData + sec[i].SizeOfRawData;
+                if (end > fileDataEnd) fileDataEnd = end;
+                if (sec[i].SizeOfRawData > 0) lastSec = &sec[i];
+            }
+            DWORD align = nt->OptionalHeader.SectionAlignment;
+            if (align < 0x1000) align = 0x1000;
+            uintptr_t ovMem = 0;
+            if (lastSec) {
+                DWORD lastSize = (lastSec->Misc.VirtualSize > lastSec->SizeOfRawData
+                                    ? lastSec->Misc.VirtualSize : lastSec->SizeOfRawData);
+                DWORD memEnd = lastSec->VirtualAddress + ((lastSize + align - 1) & ~(align - 1));
+                ovMem = reinterpret_cast<uintptr_t>(base) + memEnd;
+            }
+            LARGE_INTEGER fileSize = {0};
+            WIN32_FILE_ATTRIBUTE_DATA fad = {0};
+            if (GetFileAttributesExW(path, GetFileExInfoStandard, &fad))
+                fileSize.QuadPart = ((LONGLONG)fad.nFileSizeHigh << 32) | fad.nFileSizeLow;
+            uint64_t overlayTotal = (uint64_t)fileSize.QuadPart - fileDataEnd;
+            if (ovMem && overlayTotal >= 80) {
+                // VirtualQuery 逐页预检：overlay 区域必须全部 COMMIT 且可读，否则直接放弃
+                // （CI 51 教训：Windows 不保证 SizeOfImage 之外的 overlay 页已提交/可读，
+                //   直接 memcpy 会 0xC0000005）
+                bool memReadable = true;
+                MEMORY_BASIC_INFORMATION mbi;
+                for (uintptr_t a = ovMem; a < ovMem + overlayTotal; a += mbi.RegionSize) {
+                    if (VirtualQuery(reinterpret_cast<LPCVOID>(a), &mbi, sizeof(mbi)) == 0 ||
+                        mbi.State != MEM_COMMIT ||
+                        (mbi.Protect & (PAGE_READONLY | PAGE_READWRITE | PAGE_WRITECOPY |
+                                        PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY)) == 0) {
+                        memReadable = false;
+                        break;
+                    }
                 }
-                // overlay 内存起始 = 最后一个节的内存结束位置（VirtualAddress + 对齐后大小）
-                DWORD align = nt->OptionalHeader.SectionAlignment;
-                if (align < 0x1000) align = 0x1000;
-                DWORD lastSize = lastSec ? (lastSec->Misc.VirtualSize > lastSec->SizeOfRawData
-                                              ? lastSec->Misc.VirtualSize : lastSec->SizeOfRawData) : 0;
-                uintptr_t ovMem = 0;
-                if (lastSec) {
-                    DWORD memEnd = lastSec->VirtualAddress + ((lastSize + align - 1) & ~(align - 1));
-                    ovMem = reinterpret_cast<uintptr_t>(base) + memEnd;
-                }
-                // overlay 总长 = 文件大小 - 文件数据末尾（footer 在 overlay 末尾 80B）
-                LARGE_INTEGER fileSize = {0};
-                {
-                    wchar_t path[MAX_PATH] = {0};
-                    GetModuleFileNameW(nullptr, path, MAX_PATH);
-                    WIN32_FILE_ATTRIBUTE_DATA fad = {0};
-                    if (GetFileAttributesExW(path, GetFileExInfoStandard, &fad))
-                        fileSize.QuadPart = ((LONGLONG)fad.nFileSizeHigh << 32) | fad.nFileSizeLow;
-                }
-                uint64_t overlayTotal = (uint64_t)fileSize.QuadPart - fileDataEnd;
-                if (ovMem && fileSize.QuadPart > 0 && overlayTotal >= 80) {
+                if (memReadable) {
                     uint8_t* footerPtr = reinterpret_cast<uint8_t*>(ovMem) + overlayTotal - 80;
                     memcpy(&meta, footerPtr, 80);
                     if (meta.magic == pearmor::Overlay::kMagic &&
