@@ -571,32 +571,43 @@ private:
         return (uint64_t)(c.QuadPart * 1000 / freq.QuadPart);
     }
 
-    // 解密第 i 页（已持有锁）：解密 -> CRC 校验 -> 置可执行 -> 更新状态
+    // 解密第 i 页（已持有锁）：先置可写再解密，最后置回可执行并更新状态。
+    // 【CI 40 根因实证】门控页是 PAGE_NOACCESS，若先写明文会触发二次 AV →
+    // VEH 处理器重入 → 同线程对 std::mutex 递归加锁 → _Mtx_lock 抛 std::system_error
+    // (0xE06D7363 未捕获)。顺序铁律：NOACCESS -> READWRITE -> 写明文 -> 校验 -> EXECUTE_READ。
     bool decryptPageLocked(uint32_t i)
     {
         unsigned char* dst = reinterpret_cast<unsigned char*>(pageBase[i]);
+        PVOID p = dst; SIZE_T sz = pageSize; ULONG old = 0;
+        if (!NT_SUCCESS(Sys::ProtectVirtualMemory(GetCurrentProcess(), &p, &sz, PAGE_READWRITE, &old)))
+            return false;
         if (!cipher->decryptPage(cipherData + i * pageSize, i, dst, pageSize))
             return false;
         if (!Integrity::VerifyPage(dst, pages[i].baseCrc))
             return false; // 被篡改（与运行期修复后基准不符）
-        PVOID p = dst; SIZE_T sz = pageSize; ULONG old = 0;
-        Sys::ProtectVirtualMemory(GetCurrentProcess(), &p, &sz, PAGE_EXECUTE_READ, &old);
+        if (!NT_SUCCESS(Sys::ProtectVirtualMemory(GetCurrentProcess(), &p, &sz, PAGE_EXECUTE_READ, &old)))
+            return false;
         pages[i].decrypted = true;
         pages[i].lastUsed  = nowMs();
         return true;
     }
 
-    // 重新加密第 i 页（已持有锁）：先在原地加密（页仍可读写），再置 NOACCESS
+    // 重新加密第 i 页（已持有锁）：先置可写再原地加密（运行时页是 EXECUTE_READ，
+    // 直接写同样会二次 AV），再置 NOACCESS。
     // 注意：绝不能先置 NOACCESS 再读页 —— 那会立刻 0xC0000005（读 NOACCESS 页）。
     bool reencryptPageLocked(uint32_t i)
     {
         unsigned char* dst = reinterpret_cast<unsigned char*>(pageBase[i]);
         DebugLog("[loader] ckpt: reencrypt i=%u 加密写回前", i);
+        PVOID p = dst; SIZE_T sz = pageSize; ULONG old = 0;
+        // 顺序铁律：EXECUTE_READ(或 NOACCESS) -> READWRITE -> 写密文 -> NOACCESS
+        if (!NT_SUCCESS(Sys::ProtectVirtualMemory(GetCurrentProcess(), &p, &sz, PAGE_READWRITE, &old)))
+            return false;
         if (!cipher->encryptPage(dst, i, dst, pageSize))
             return false;
         DebugLog("[loader] ckpt: reencrypt i=%u 置NOACCESS前", i);
-        PVOID p = dst; SIZE_T sz = pageSize; ULONG old = 0;
-        Sys::ProtectVirtualMemory(GetCurrentProcess(), &p, &sz, PAGE_NOACCESS, &old);
+        if (!NT_SUCCESS(Sys::ProtectVirtualMemory(GetCurrentProcess(), &p, &sz, PAGE_NOACCESS, &old)))
+            return false;
         pages[i].decrypted = false; // 标记加密态，避免 VEH/其它线程读到半成品
         DebugLog("[loader] ckpt: reencrypt i=%u 完成", i);
         return true;
@@ -626,6 +637,13 @@ private:
         uintptr_t fault = static_cast<uintptr_t>(rec->ExceptionInformation[1]);
         PagedLoader* self = g_instance;
         if (!self || self->pageBase.empty()) return EXCEPTION_CONTINUE_SEARCH;
+        // 重入保护（CI 40 教训）：本线程已在 VEH 处理器内（持锁期间又发生 AV/嵌套异常）时，
+        // 若继续递归处理会对 std::mutex 同线程递归加锁 → MSVCP140 _Mtx_lock 抛
+        // std::system_error(0xE06D7363) 未捕获。此处直接放行，让嵌套异常正常传播。
+        static thread_local bool tl_inHandler = false;
+        if (tl_inHandler) return EXCEPTION_CONTINUE_SEARCH;
+        tl_inHandler = true;
+        struct ResetTl { bool* p; ~ResetTl() { *p = false; } } tlReset{ &tl_inHandler };
         // P3.2：非连续布局下各页落在不同区域，逐页判定 fault 落在哪一页
         uint32_t i = self->pageCount;
         for (uint32_t k = 0; k < self->pageCount; k++) {
