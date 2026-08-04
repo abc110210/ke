@@ -521,7 +521,20 @@ public:
     {
         auto& dir = opt.DataDirectory[IMAGE_DIRECTORY_ENTRY_TLS];
         BYTE* base = reinterpret_cast<BYTE*>(imageBase);
+        // 【CI 57 诊断】崩溃在「执行 TLS 回调」且首个 TLS 诊断未打出 → 读 TLS 目录结构时 AV。
+        // 打印 TLS_RVA/SizeOfImage/tls 指针定位；并防御：TLS 目录地址无效则跳过（不崩）。
+        DebugLog("[loader] TLS 回调 入口: TLS_RVA=0x%X SizeOfImage=0x%X imageBase=%p",
+                 dir.VirtualAddress, opt.SizeOfImage, imageBase);
+        MEMORY_BASIC_INFORMATION mbiTls = {};
+        if (dir.VirtualAddress >= opt.SizeOfImage ||
+            VirtualQuery(reinterpret_cast<LPCVOID>(base + dir.VirtualAddress), &mbiTls, sizeof(mbiTls)) == 0 ||
+            mbiTls.State != MEM_COMMIT) {
+            DebugLog("[loader] TLS 回调跳过: TLS_RVA=0x%X 超出/不可读", dir.VirtualAddress);
+            return true;
+        }
         auto* tls = reinterpret_cast<IMAGE_TLS_DIRECTORY64*>(base + dir.VirtualAddress);
+        DebugLog("[loader] TLS 回调 tls=%p AddressOfCallBacks=0x%llX",
+                 (void*)tls, (unsigned long long)tls->AddressOfCallBacks);
         if (!tls->AddressOfCallBacks) return true;
         // 【CI 55 根因】TLS 目录的 AddressOfCallBacks 是【链接时 VA】（按 preferredBase 算），
         // 重定位表不覆盖 PE 头里的 TLS 目录 → 手动加载后必须按 delta 修正到实际基址，
@@ -534,9 +547,8 @@ public:
         // 执行完由门控循环重新设置各页保护。
         DWORD oldProt = 0;
         VirtualProtect(imageBase, opt.SizeOfImage, PAGE_EXECUTE_READWRITE, &oldProt);
-        DebugLog("[loader] TLS 回调: TLS_RVA=0x%X 修正后cb=%p cb[0]=0x%llX imageBase=%p",
-                 dir.VirtualAddress, (void*)cb,
-                 (unsigned long long)(cb ? *cb : 0), imageBase);
+        DebugLog("[loader] TLS 回调: 修正后cb=%p cb[0]=0x%llX",
+                 (void*)cb, (unsigned long long)(cb ? *cb : 0));
         for (uint32_t i = 0; cb[i]; i++) {
             uintptr_t callAddr = static_cast<uintptr_t>(cb[i]);
             // 若回调地址仍是链接时 VA（preferredBase 区间）→ 手动 +delta 修正
