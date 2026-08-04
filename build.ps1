@@ -36,8 +36,16 @@ Write-Host "[2/3] 编译 加壳器 + 壳运行时 + 样例..." -ForegroundColor 
 if ($LASTEXITCODE -ne 0) { throw "cmake build 失败" }
 
 # ---- 阶段 2：确定目标并加壳 ----
+# 目标优先级：显式 -Target > test/ 下用户放入的 exe > test_payload 自检样例
 if (-not $Target) {
-    $Target = Join-Path $Build "Release\test_payload.exe"
+    $userExe = Get-ChildItem (Join-Path $Root "test") -Filter *.exe -File -ErrorAction SilentlyContinue |
+               Select-Object -First 1
+    if ($userExe) {
+        $Target = $userExe.FullName
+        Write-Host "[3/3] 检测到用户目标: $Target（放入 test 文件夹的 exe 自动成为加壳对象）" -ForegroundColor Yellow
+    } else {
+        $Target = Join-Path $Build "Release\test_payload.exe"
+    }
 }
 if (-not (Test-Path $Target)) { throw "未找到目标程序: $Target" }
 if (-not $Out) { $Out = Join-Path $Root "packed_app.exe" }
