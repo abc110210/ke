@@ -45,17 +45,70 @@ static int CallRtlInsertInvertedFunctionTable(pRtlInsertInvertedFunctionTable fn
     }
 }
 
-// 独立 SEH 辅助：从任意地址安全读取一个指针宽度的值。越界/不可读时返回 0。
-// 单独成函数（参数全 POD、内部才用 __try、不调用 DebugLog/不构造 RAII 对象），
-// 以满足 MSVC C2712 约束——禁止在含 C++ 对象展开的函数里用 __try。
-// 用于 VEH 手动走栈时读取可能无效的栈帧返回地址。
-static uintptr_t SafeReadPtr(uintptr_t addr)
+// 正经走栈：从异常现场（通常停在 KERNELBASE!RaiseException 内）用 RtlVirtualUnwind 逐帧展开，
+// 只展开系统/CRT 帧（它们自带 .pdata，可正常展开），停在「进入 payload 的前一帧」——
+// 该帧的返回地址即 payload 内真实 throw 调用点（call _CxxThrowException 之下一条指令）。
+// 不依赖 payload 注册 .pdata（CI 36 教训：不完整 pdata 会引发展开死循环）。
+// 用途：CI 诊断"为何一进 OEP 就抛 0xE06D7363"，精确定位 throw 站点模块。
+static void LogRealThrowSite(EXCEPTION_POINTERS* ep)
 {
-    if (!addr || addr == (uintptr_t)-1) return 0;
-    __try {
-        return *reinterpret_cast<volatile uintptr_t*>(addr);
-    } __except (EXCEPTION_EXECUTE_HANDLER) {
-        return 0;
+    using PFN_Lookup = PRUNTIME_FUNCTION (NTAPI*)(ULONG64, PULONG64, PVOID);
+    using PFN_Unwind  = PVOID (NTAPI*)(ULONG, ULONG64, ULONG64, PRUNTIME_FUNCTION, PCONTEXT, PVOID*, PULONG64, PVOID);
+    static PFN_Lookup pLookup = nullptr;
+    static PFN_Unwind  pUnwind = nullptr;
+    static bool resolved = false;
+    if (!resolved) {
+        if (HMODULE ntdll = GetModuleHandleA("ntdll.dll")) {
+            pLookup = (PFN_Lookup)GetProcAddress(ntdll, "RtlLookupFunctionEntry");
+            pUnwind = (PFN_Unwind )GetProcAddress(ntdll, "RtlVirtualUnwind");
+        }
+        resolved = true;
+    }
+    if (!pLookup || !pUnwind) { DebugLog("[veh] LogRealThrowSite: Rtl* 未解析，跳过"); return; }
+
+    CONTEXT ctx;
+    memset(&ctx, 0, sizeof(ctx));
+    ctx.Rip = ep->ContextRecord->Rip;
+    ctx.Rsp = ep->ContextRecord->Rsp;
+    ctx.Rbp = ep->ContextRecord->Rbp;
+    ctx.Rbx = ep->ContextRecord->Rbx;
+    ctx.Rsi = ep->ContextRecord->Rsi;
+    ctx.Rdi = ep->ContextRecord->Rdi;
+    ctx.R12 = ep->ContextRecord->R12;
+    ctx.R13 = ep->ContextRecord->R13;
+    ctx.R14 = ep->ContextRecord->R14;
+    ctx.R15 = ep->ContextRecord->R15;
+
+    uintptr_t pb = 0, pe = 0;
+    if (PagedLoader::g_instance && !PagedLoader::g_instance->pageBase.empty()) {
+        pb = (uintptr_t)PagedLoader::g_instance->pageBase[0];
+        pe = pb + (size_t)PagedLoader::g_instance->pageBase.size() * PagedLoader::g_instance->pageSize;
+    }
+
+    DebugLog("[veh] === 正经走栈定位真实 throw 站点（从 RaiseException 现场向上展开）===");
+    if (pb) DebugLog("[veh] payload 基址区间=[%p, %p) （#N 落在此区间即 payload 自身抛）", (void*)pb, (void*)pe);
+    for (int d = 0; d < 16; d++) {
+        ULONG64 imgBase = 0;
+        PRUNTIME_FUNCTION fe = pLookup(ctx.Rip, &imgBase, nullptr);
+        if (!fe) {
+            DebugLog("[veh]   #%d rip=%p 无 .pdata（payload/未知帧边界）—— 上方一帧即真实 throw 调用点",
+                     d, (void*)ctx.Rip);
+            break;
+        }
+        ULONG64 establisher = 0;
+        PVOID  handlerData = nullptr;
+        // HandlerType=0：只计算调用者上下文，不触发任何语言处理器（避免重入 VEH）
+        pUnwind(0, imgBase, ctx.Rip, fe, &ctx, &handlerData, &establisher, nullptr);
+        char mod[256] = {0};
+        HMODULE hMod = nullptr;
+        if (GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+                               GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                               (LPCWSTR)ctx.Rip, &hMod) && hMod)
+            GetModuleFileNameA(hMod, mod, sizeof(mod));
+        bool inPayload = (ctx.Rip >= pb && ctx.Rip < pe);
+        DebugLog("[veh]   #%d rip=%p module=%s%s",
+                 d, (void*)ctx.Rip, mod, inPayload ? "  <<< 落在 payload 内(真实 throw 站点)" : "");
+        if (inPayload) break;
     }
 }
 
@@ -560,25 +613,11 @@ private:
         // 诊断钩子：C++ 异常(0xE06D7363)在展开前于 VEH 层截获并记录抛点模块，
         // 便于 CI 定位（无需依赖 .pdata 展开）。不吞异常，继续搜索让进程以该退出码终止。
         if (rec->ExceptionCode == 0xE06D7363) {
-            // 从异常上下文（RaiseException 内部）手动走栈，定位【真实抛点】。
-            // ExceptionAddress 落在 KERNELBASE!RaiseException，无参考价值；
-            // 真实 throw 在其上方几帧（payload 自身代码 / payload 的 CRT）。
-            // 手动按"叶子帧"近似推进 Rsp（无 pdata 时与 RtlUnwindEx 行为一致）：
-            //   #0 = _CxxThrowException（msvcrt）→ #1 = 实际 throw 站点 → #2 = 调用者。
-            uintptr_t rsp = ep->ContextRecord->Rsp;
-            for (int d = 0; d < 12; d++) {
-                uintptr_t ret = SafeReadPtr(rsp);
-                if (!ret || ret == (uintptr_t)-1) break;
-                char mod[256] = {0};
-                HMODULE hMod = nullptr;
-                if (GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
-                                       GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
-                                       reinterpret_cast<LPCWSTR>(ret), &hMod) && hMod)
-                    GetModuleFileNameA(hMod, mod, sizeof(mod));
-                DebugLog("[veh]   #%d ret=%p module=%s", d, reinterpret_cast<void*>(ret), mod);
-                rsp += 8;
-            }
-            DebugLog("[veh] C++ 异常未捕获 code=0xE06D7363 (真实抛点在上方栈帧，#1 通常为 payload 自身)");
+            // 诊断钩子：C++ 异常在展开前于 VEH 层截获。用 RtlVirtualUnwind 正经走栈
+            // 定位【真实抛点】，不依赖 payload 注册 .pdata（CI 36 教训：不完整 pdata 会展开死循环）。
+            // 不吞异常，返回 CONTINUE_SEARCH 让进程以该退出码终止。
+            LogRealThrowSite(ep);
+            DebugLog("[veh] C++ 异常未捕获 code=0xE06D7363 (真实抛点见上方走栈，落在 payload 内即 payload 自身)");
             return EXCEPTION_CONTINUE_SEARCH;
         }
         if (rec->ExceptionCode != EXCEPTION_ACCESS_VIOLATION)
