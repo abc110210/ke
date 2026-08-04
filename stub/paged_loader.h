@@ -59,7 +59,14 @@ public:
 
     // P3.2 非连续内存布局开关。默认开启：代码页分散到各自独立 VirtualAlloc 区域，
     // 打破标准 PE 连续布局，使 Scylla 等工具无法一次性定位完整镜像。
-    static constexpr bool kNonContig = true;
+    // 默认开启；可用环境变量 PEARMOR_NONCONTIG=0 强制关闭（走连续回退分配），
+    // 用于隔离「非连续布局重定位」相关的潜在问题（CI 定位用）。
+    static bool NonContigEnabled() {
+        char v[8] = {0};
+        GetEnvironmentVariableA("PEARMOR_NONCONTIG", v, sizeof(v));
+        // 未设置或 "1" => 开启；仅当显式 "0" 时关闭
+        return !(v[0] == '0');
+    }
 
     // 主入口：加载 + 修复 + 门控代码页 + 注册 VEH + 启动监控
     // 返回 true 时 outEntryRva 为原始入口 RVA
@@ -112,21 +119,69 @@ public:
             pages[i].isCode = (i < isCodeLen) ? (isCode[i] != 0) : false;
         }
 
-        // ---- 修复用临时连续工作区（解密 + 重定位 + 导入 都在这里完成） ----
-        // 修复后才把各页拷到最终物理位置（非连续或连续），工作区随即释放，
-        // 故“整镜像连续明文”只在修复期短暂存在，运行时内存为非连续碎片。
-        // 注意：work 必须能容纳全部 pageCount*pageSize 字节（解密循环按整页解密），
-        //       而 sizeOfImage 可能不是整页倍数，故按 padded 分配，避免越界写入。
-        size_t workLen = (size_t)pageCount * pageSize;
-        std::vector<unsigned char> work(workLen);
+        // ---- 分配最终物理布局（P3.2）+ 修复用工作区 ----
+        // 关键：工作区(work) 与最终物理位置(pageBase) 必须落到【同一组虚拟地址】，
+        //       这样重定位按 work 算出的 delta 才与最终运行地址一致。否则非连续模式
+        //       下跨页指针会被修正到已释放的临时缓冲地址，跳 OEP 必崩。
+        //   非连续：代码页各自独立区域，数据页一块连续区域；work 复用这些区域。
+        //   连续回退：整镜像一块连续区域，work 直接复用它（delta=0，重定位天然对）。
+        pageBase.resize(pageCount, nullptr);
+        nonContig = false;
+        void* workBase = nullptr;
+
+        {
+            bool ok = true;
+            // 1) 先尝试非连续：代码页分散分配，数据页统计数量
+            uint32_t dataPages = 0;
+            for (uint32_t i = 0; i < pageCount; i++) if (!pages[i].isCode) dataPages++;
+            if (dataPages == 0) dataPages = 1;     // 头页通常算数据页，兜底
+
+            for (uint32_t i = 0; i < pageCount && ok; i++) {
+                if (!pages[i].isCode) continue;     // 代码页才分散
+                PVOID rgn = nullptr; SIZE_T rsz = pageSize;
+                NTSTATUS st = Sys::AllocateVirtualMemory(GetCurrentProcess(), &rgn, 0,
+                    &rsz, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+                if (!NT_SUCCESS(st) || !rgn) { ok = false; break; }
+                pageRegions.push_back(rgn);
+                pageBase[i] = rgn;
+            }
+            // 非连续：数据块也分配（work 复用其地址；运行期数据块不释放）
+            if (ok && NonContigEnabled()) {
+                SIZE_T dsz = (SIZE_T)dataPages * pageSize;
+                PVOID db = nullptr;
+                NTSTATUS st = Sys::AllocateVirtualMemory(GetCurrentProcess(), &db, 0,
+                    &dsz, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+                if (!NT_SUCCESS(st) || !db) { ok = false; }
+                else {
+                    dataBlockBase = db; dataBlockPages = dataPages;
+                    for (uint32_t i = 0; i < pageCount; i++)
+                        if (!pages[i].isCode) { pageBase[i] = db; db = (unsigned char*)db + pageSize; }
+                    workBase = pageBase[0];          // 数据页基址当作整镜像工作区基址
+                    nonContig = true;
+                }
+            }
+            // 2) 回退：释放零散区域，统一连续分配（work 复用 imageBase）
+            if (!nonContig) {
+                for (void* r : pageRegions) { SIZE_T z = 0; Sys::FreeVirtualMemory(GetCurrentProcess(), &r, &z); }
+                pageRegions.clear();
+                PVOID base = nullptr; SIZE_T sz = sizeOfImage;
+                NTSTATUS st = Sys::AllocateVirtualMemory(GetCurrentProcess(), &base, 0,
+                    &sz, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+                if (!NT_SUCCESS(st) || !base) { DebugLog("[loader] 连续回退分配失败 st=0x%08X", (unsigned)st); return false; }
+                imageBase = base;                    // 连续回退：仍用 imageBase
+                for (uint32_t i = 0; i < pageCount; i++) pageBase[i] = base;
+                workBase = base;
+            }
+        }
+
+        // ---- 解密到最终物理位置（work == pageBase，故无需再 memcpy） ----
         for (uint32_t i = 0; i < pageCount; i++) {
             if (!cipher->decryptPage(payload + i * pageSize, i,
-                    work.data() + i * pageSize, pageSize)) {
+                    reinterpret_cast<unsigned char*>(pageBase[i]), pageSize)) {
                 DebugLog("[loader] 解密工作区页 i=%u 失败", i);
                 return false;
             }
         }
-        void* workBase = work.data();
 
         bool relocated = (reinterpret_cast<uint64_t>(workBase) != preferredBase);
         if (relocated && !ManualPeLoader::ApplyRelocations(workBase, preferredBase, opt)) { DebugLog("[loader] 应用重定位失败"); return false; }
@@ -137,61 +192,9 @@ public:
 
         imageSize = sizeOfImage;
 
-        // ---- P3.2：分配最终物理布局 ----
-        //   代码页：各自独立 VirtualAlloc 区域（非连续）；失败则回退连续块。
-        //   数据页：集中在一块连续区域（非执行，便于访问；代码页已分散足以混淆）。
-        pageBase.resize(pageCount, nullptr);
-        nonContig = false;
-        {
-            bool ok = true;
-            for (uint32_t i = 0; i < pageCount && ok; i++) {
-                if (!pages[i].isCode) continue;     // 代码页才分散
-                PVOID rgn = nullptr; SIZE_T rsz = pageSize;
-                NTSTATUS st = Sys::AllocateVirtualMemory(GetCurrentProcess(), &rgn, 0,
-                    &rsz, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
-                if (!NT_SUCCESS(st) || !rgn) { ok = false; break; }
-                pageRegions.push_back(rgn);
-                pageBase[i] = rgn;
-            }
-            if (ok && kNonContig) {
-                nonContig = true;
-            } else {
-                // 回退：释放已分配的零散区域，统一连续分配
-                for (void* r : pageRegions) { SIZE_T z = 0; Sys::FreeVirtualMemory(GetCurrentProcess(), &r, &z); }
-                pageRegions.clear();
-                PVOID base = nullptr; SIZE_T sz = sizeOfImage;
-                NTSTATUS st = Sys::AllocateVirtualMemory(GetCurrentProcess(), &base, 0,
-                    &sz, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
-                if (!NT_SUCCESS(st) || !base) { DebugLog("[loader] 连续回退分配失败 st=0x%08X", (unsigned)st); return false; }
-                imageBase = base;                    // 连续回退：仍用 imageBase
-                for (uint32_t i = 0; i < pageCount; i++) pageBase[i] = base;
-            }
-        }
-
-        // 数据页集中区域（若非连续模式；连续回退时数据页已在 imageBase 连续块内）
-        if (nonContig) {
-            // 统计数据页数量，集中分配一块（至少 1 页）
-            uint32_t dataPages = 0;
-            for (uint32_t i = 0; i < pageCount; i++) if (!pages[i].isCode) dataPages++;
-            if (dataPages == 0) dataPages = 1;       // 头页通常算数据页，兜底
-            dataBlockPages = dataPages;
-            PVOID db = nullptr; SIZE_T dsz = (SIZE_T)dataPages * pageSize;
-            NTSTATUS st = Sys::AllocateVirtualMemory(GetCurrentProcess(), &db, 0,
-                &dsz, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
-            if (!NT_SUCCESS(st) || !db) { DebugLog("[loader] 数据块分配失败 st=0x%08X", (unsigned)st); return false; }
-            dataBlockBase = db;
-            for (uint32_t i = 0; i < pageCount; i++) {
-                if (!pages[i].isCode) { pageBase[i] = db; db = (unsigned char*)db + pageSize; }
-            }
-        }
-
-        // ---- 把修复后的页拷到最终物理位置 ----
-        for (uint32_t i = 0; i < pageCount; i++) {
-            unsigned char* dst = reinterpret_cast<unsigned char*>(pageBase[i]);
-            memcpy(dst, work.data() + i * pageSize, pageSize);
-        }
-
-        DebugLog("[loader] ckpt: 页已拷到物理位置, 准备注册展开表");
+        // 数据页/代码页均已落到最终物理位置（work == pageBase，无需 memcpy）。
+        // 非连续模式下数据块已在上方分配（dataBlockBase），连续模式下整块即 imageBase。
+        DebugLog("[loader] ckpt: 页已就位(无 memcpy, work==pageBase), 准备注册展开表");
         // 注意：RtlInsertInvertedFunctionTable 是未文档化的 ntdll 内部函数，签名随
         // Windows 版本变化；对手动映射的镜像调用可能破坏进程内 LdrpInvertedFunctionTable
         // 导致崩溃，且对“正常跑到 OEP 写文件”的 MVP 验证毫无必要。故默认关闭，
@@ -267,8 +270,8 @@ public:
         DebugLog("[loader] ckpt: 监控线程已启动 hwnd=%p", (void*)monitorThread);
 
         outEntryRva = opt.AddressOfEntryPoint;
-        DebugLog("[loader] Load 成功: pages=%u nonContig=%d entryRva=0x%llX",
-                 pageCount, (int)nonContig, (unsigned long long)outEntryRva);
+        DebugLog("[loader] Load 成功: pages=%u nonContig=%d (kNonContig=%d) entryRva=0x%llX",
+                 pageCount, (int)nonContig, (int)NonContigEnabled(), (unsigned long long)outEntryRva);
         return true;
     }
 

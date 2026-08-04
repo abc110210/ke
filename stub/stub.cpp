@@ -229,6 +229,9 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int)
     // 6.3) 跳原始入口（经 VEH 控制流混淆演示一次跳转；首执行触发按需解密）
     int rc = loader.CallEntry(entryRva);
     DebugLog("[stub] OEP 返回 rc=%d", rc);
+    if (rc == 0) {
+        DebugLog("[stub] OEP 正常执行完毕，样例应已写 pearmor_payload_ran.txt");
+    }
 
     // 7) 释放映射（正常退出路径；自毁路径已在内部终止进程）
     loader.Release();
