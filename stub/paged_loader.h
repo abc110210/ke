@@ -287,7 +287,12 @@ public:
         if (pageBase.empty() || !pageBase[0]) return -1;
         pendingRva = entryRva;
         g_oepRc    = 0;
-        VehCf::RunObfuscated(reinterpret_cast<void(*)()>(&PagedLoader::OepThunk));
+        DebugLog("[stub] 直接跳 OEP entryRva=0x%llX", (unsigned long long)entryRva);
+        // 直接跳 OEP（去掉 VehCf::RunObfuscated 的 __debugbreak 0xCC 演示混淆）：
+        // OEP 落在被门控的 NOACCESS 代码页，跳入即触发按需解密 VEH 正常执行，
+        // 无需额外异常控制流混淆。把“跳 OEP”绑在演示性混淆上，在 CI 无调试器环境
+        // 下 0xCC 终止路径不走标准 TopLevelHandler，导致无 crash.log 且 OEP 永远跳不了。
+        OepThunk();
         return g_oepRc;
     }
 
