@@ -32,7 +32,6 @@ jobs:
           $env:PEARMOR_ALLOW_VM = "1"  # CI runner 本身是 Azure VM 且系统盘<30GB，放行 VM 检测
           $env:PEARMOR_ALLOW_PROCENV = "1"  # 跳过进程环境检测（其 ImageName.Buffer 内核地址陷阱待修）
           $env:PEARMOR_ALLOW_CODEGEN = "1"  # 跳过 P3.1 运行时代码生成验证（其校验逻辑待单独修复），先验证加载主体
-          $env:PEARMOR_DISABLE_GATING = "1"  # 诊断(临时): CI 26 关闭门控, 隔离"门控/VEH/C++展开交互"与"镜像重建(重定位/导入/解密)"两类问题。确认根因后删除此行
           # 带超时运行：防止反调试/挂起导致 runner 被占几小时
           $timeoutSec = 30
           $p = Start-Process -FilePath $out -PassThru -RedirectStandardError "stderr.txt"
