@@ -1,12 +1,14 @@
 // ============================================================================
-// pearmor-packer.cpp
-// 本地打包器 (P1)：读取 64 位 PE -> 构建内存镜像 -> 按 4KB 页独立 AES-256-CBC
-// 加密（每页派生独立 IV）-> 生成 stub 嵌入头（含代码页标志 + 每页 CRC）。
+// pearmor-packer.cpp — C++ 程序加壳器（overlay 拼接版）
+// 读取 64 位 PE -> 构建内存镜像 -> 按 4KB 页独立 AES-256-CBC 加密（每页派生
+// 独立 IV）-> 把密文负载 + 加密索引 + footer 拼接进预编译的 stub 运行时末尾
+// （overlay），产出加壳后的成品 exe。stub 启动时自读自身文件取出负载。
 //
 // 关键：每页 IV_i = master_iv XOR (uint128)pageIndex，与 stub/crypto_page.h 完全一致，
 //       使得加载器可对任意单页独立解密/重加密，无需一次性处理整镜像。
 //
-// 用法: pearmor-packer <输入.exe> <输出.h> [--seed-hex <64hex>]
+// 用法: pearmor-packer <输入.exe> [-o <输出.exe>] [-stub <stub.exe>] [--seed-hex <64hex>]
+//       -stub 缺省时在同目录找 pearmor-stub.exe
 // ============================================================================
 #include <windows.h>
 #include <bcrypt.h>
@@ -20,6 +22,7 @@
 #include "../common/page_crc.h"   // fnv1a32
 #include "../common/kdf.h"        // 密钥派生（P2.3 / P2.5）
 #include "../common/aes256.h"     // 纯 C++ AES-256-CBC（与 stub 共用，避免 BCrypt 依赖）
+#include "../stub/overlay.h"      // overlay 拼接格式（Footer 与 stub 字节级一致）
 
 static void die(const char* msg) {
     fprintf(stderr, "[packer] 错误: %s\n", msg);
@@ -38,6 +41,25 @@ static std::vector<unsigned char> readFile(const char* path) {
     if (fread(buf.data(), 1, buf.size(), f) != buf.size()) die("读取输入文件失败");
     fclose(f);
     return buf;
+}
+
+// --- 写文件 ---
+static void writeFile(const char* path, const std::vector<unsigned char>& data) {
+    FILE* f = nullptr;
+    if (fopen_s(&f, path, "wb") != 0 || !f) die("无法写输出文件");
+    if (fwrite(data.data(), 1, data.size(), f) != data.size()) die("写输出文件失败");
+    fclose(f);
+}
+
+// --- 校验 stub 是合法 PE64（负载无关的运行时） ---
+static void validateStub(const std::vector<unsigned char>& pe) {
+    if (pe.size() < 0x40) die("stub 文件太小，不是合法 PE");
+    if (*(WORD*)&pe[0] != 0x5A4D) die("stub 缺少 MZ 头");
+    DWORD peOff = *(DWORD*)&pe[0x3C];
+    if (peOff + 0x18 > pe.size()) die("stub PE 头偏移越界");
+    if (*(DWORD*)&pe[peOff] != 0x00004550) die("stub 缺少 PE\\0\\0 签名");
+    WORD machine = *(WORD*)&pe[peOff + 4];
+    if (machine != 0x8664) die("stub 不是 x64 (PE32+)");
 }
 
 // --- 校验 64 位 PE ---
@@ -104,40 +126,55 @@ static std::vector<unsigned char> buildImage(const std::vector<unsigned char>& f
     return img;
 }
 
-int main(int argc, char** argv) {
-    if (argc < 3) {
-        printf(
-            "pearmor-packer — C++ 程序加壳打包器 (P1 分页加密 + P2 密钥分层)\n"
-            "用法: pearmor-packer <输入.exe> <输出.h> [--seed-hex <64hex>]\n");
-        return 1;
-    }
-    const char* inPath  = argv[1];
-    const char* outPath = argv[2];
-
-    // P2.3 / P2.5：不再写死密钥。生成随机种子 seed，运行时由 Stub 用 KDF 派生
-    //   innerKey（解密代码页）与 outerKey（解密块索引）——“外层/内层”分层。
-    // 二进制里只剩 seed，无任何 32 字节明文密钥常量。
+int main(int argc, char** argv)
+{
+    // ---- 参数解析 ----
+    const char* inPath   = nullptr;
+    const char* outPath  = nullptr;
+    const char* stubPath = nullptr;
     unsigned char seed[32];
     bool seedGiven = false;
-    for (int i = 3; i + 1 < argc; i += 2) {
-        if (strcmp(argv[i], "--seed-hex") == 0) {
+    for (int i = 1; i < argc; i++) {
+        if (strcmp(argv[i], "-o") == 0 && i + 1 < argc) { outPath = argv[++i]; }
+        else if (strcmp(argv[i], "-stub") == 0 && i + 1 < argc) { stubPath = argv[++i]; }
+        else if (strcmp(argv[i], "--seed-hex") == 0 && i + 1 < argc) {
             if (!hexToBytes(argv[i + 1], seed, 32)) die("--seed-hex 应为 64 个 hex 字符");
-            seedGiven = true;
+            seedGiven = true; i++;
         }
-        // 旧的 --key-hex / --iv-hex 已废弃，忽略以保持与旧构建脚本兼容
+        else if (!inPath) { inPath = argv[i]; }
+        else die("未知参数");
     }
+    if (!inPath) {
+        printf(
+            "pearmor-packer — C++ 程序加壳器（overlay 拼接版）\n"
+            "用法: pearmor-packer <输入.exe> [-o <输出.exe>] [-stub <stub.exe>]\n"
+            "      [-stub] 缺省时在同目录找 pearmor-stub.exe\n");
+        return 1;
+    }
+
+    // P2.3 / P2.5：随机种子 seed，运行时由 Stub 用 KDF 派生 innerKey/outerKey
     if (!seedGiven) {
         if (BCryptGenRandom(nullptr, seed, 32, BCRYPT_USE_SYSTEM_PREFERRED_RNG) != 0)
             die("生成随机种子失败");
     }
 
-    unsigned char innerKey[32], outerKey[32];
-    pearmor::derive_inner_key(seed, innerKey);
-    pearmor::derive_outer_key(seed, outerKey);
+    // ---- 读取负载无关的 stub 运行时 ----
+    if (!stubPath) stubPath = "pearmor-stub.exe";
+    auto stubBytes = readFile(stubPath);
+    validateStub(stubBytes);
 
+    // ---- 目标 PE ----
     auto file = readFile(inPath);
     validatePE64(file);
     auto img = buildImage(file);
+    DWORD peOff = *(DWORD*)&file[0x3C];
+    auto* nt = (IMAGE_NT_HEADERS*)(file.data() + peOff);
+    DWORD entryRva = nt->OptionalHeader.AddressOfEntryPoint;
+    if (entryRva == 0) die("目标无入口点(AddressOfEntryPoint==0)");
+
+    unsigned char innerKey[32], outerKey[32];
+    pearmor::derive_inner_key(seed, innerKey);
+    pearmor::derive_outer_key(seed, outerKey);
 
     const uint32_t PAGE = 4096;
     size_t padded = (img.size() + PAGE - 1) / PAGE * PAGE;
@@ -145,8 +182,6 @@ int main(int argc, char** argv) {
     uint32_t pageCount = (uint32_t)(padded / PAGE);
 
     // 解析节，确定每页是否为代码页
-    DWORD peOff = *(DWORD*)&file[0x3C];
-    auto* nt = (IMAGE_NT_HEADERS*)(file.data() + peOff);
     std::vector<uint8_t> isCode(pageCount, 0);
     IMAGE_SECTION_HEADER* sec = IMAGE_FIRST_SECTION(nt);
     for (uint32_t i = 0; i < pageCount; i++) {
@@ -164,81 +199,54 @@ int main(int argc, char** argv) {
     // 每页独立加密 + 计算明文 CRC
     std::vector<unsigned char> enc(padded, 0);
     std::vector<uint32_t> crc(pageCount, 0);
-
-    // 逐页 AES-256-CBC 加密（纯 C++ 实现；IV 派生与 stub 的 AesPageCipher(innerKey,innerKey) 一致）
     unsigned char ivPage[16];
     for (uint32_t i = 0; i < pageCount; i++) {
         deriveIv(innerKey, i, ivPage);
         pearmor::aes256::cbc_encrypt(innerKey, ivPage, img.data() + i * PAGE, PAGE, enc.data() + i * PAGE);
         crc[i] = pearmor::fnv1a32(img.data() + i * PAGE, PAGE);
     }
+    (void)crc; // 每页明文 CRC 预留（后续用于运行期解密校验）
 
-    // ---- 外层加密：块索引(isCode) 用 outerKey 一次性 AES-CBC 加密 ----
-    // 运行时 Stub 先用 outerKey 解出 isCode，再用 innerKey 逐页解密代码。
-    // 两把密钥由 seed 经 KDF 派生且互不相关 —— 拿到密文也不易反推。
+    // 外层加密：块索引(isCode) 用 outerKey 一次性 AES-CBC 加密
     size_t idxLen = (pageCount + 15) & ~(size_t)15;
     std::vector<uint8_t> idxPlain(idxLen, 0);
     memcpy(idxPlain.data(), isCode.data(), pageCount);
     std::vector<unsigned char> encIndex(idxLen, 0);
     {
-        // 外层加密：块索引(isCode) 用 outerKey 一次性 AES-256-CBC（纯 C++ 实现）
-        // IV = outerKey 前 16 字节，与 stub 的 AesPageCipher(outerKey, outerKey) 一致
         unsigned char oiv[16];
         memcpy(oiv, outerKey, 16);
         pearmor::aes256::cbc_encrypt(outerKey, oiv, idxPlain.data(), idxLen, encIndex.data());
     }
 
-    // 写头文件
-    FILE* f = nullptr;
-    if (fopen_s(&f, outPath, "w") != 0 || !f) die("无法写输出头文件");
+    // ---- 组装 overlay footer（与 stub/overlay.h 字节级一致） ----
+    pearmor::Overlay::Footer footer = {};
+    footer.magic       = pearmor::Overlay::kMagic;
+    footer.version     = pearmor::Overlay::kVersion;
+    footer.pageSize    = PAGE;
+    footer.pageCount   = pageCount;
+    footer.payloadLen  = (uint32_t)enc.size();
+    footer.indexLen    = (uint32_t)encIndex.size();
+    memcpy(footer.seed, seed, 32);
+    footer.entryRva    = entryRva;
+    footer.payloadCrc  = pearmor::fnv1a32(enc.data(), enc.size());
 
-    fprintf(f, "// 由 pearmor-packer 自动生成，请勿手改。\n");
-    fprintf(f, "#pragma once\n\n");
-    fprintf(f, "#define PEARMOR_MAGIC 0x524F414D52414550ULL // \"PEARMOR\"\n");
-    fprintf(f, "#define PEARMOR_PAGE_SIZE 0x1000\n");
-    fprintf(f, "#define PEARMOR_PAGE_COUNT %uU\n", pageCount);
-    fprintf(f, "#define PEARMOR_PAYLOAD_LEN %zuULL\n", enc.size());
+    // ---- 拼接：stub + 密文 + 加密索引 + footer ----
+    std::vector<unsigned char> out;
+    out.reserve(stubBytes.size() + enc.size() + encIndex.size() + sizeof(footer));
+    out.insert(out.end(), stubBytes.begin(), stubBytes.end());
+    out.insert(out.end(), enc.begin(), enc.end());
+    out.insert(out.end(), encIndex.begin(), encIndex.end());
+    const unsigned char* fp = reinterpret_cast<const unsigned char*>(&footer);
+    out.insert(out.end(), fp, fp + sizeof(footer));
 
-    fprintf(f, "static const unsigned char PEARMOR_PAYLOAD[] = {\n");
-    for (size_t i = 0; i < enc.size(); i++) {
-        if (i % 16 == 0) fprintf(f, "    ");
-        fprintf(f, "0x%02X", enc[i]);
-        if (i + 1 < enc.size()) fprintf(f, ",");
-        if ((i + 1) % 16 == 0) fprintf(f, "\n");
+    if (!outPath) {
+        static std::string defOut;
+        defOut = std::string(inPath) + "_packed.exe";
+        outPath = defOut.c_str();
     }
-    if (enc.size() % 16 != 0) fprintf(f, "\n");
-    fprintf(f, "};\n\n");
+    writeFile(outPath, out);
 
-    fprintf(f, "static const uint32_t PEARMOR_PAGE_CRC[] = {\n");
-    for (uint32_t i = 0; i < pageCount; i++) {
-        if (i % 8 == 0) fprintf(f, "    ");
-        fprintf(f, "0x%08X", crc[i]);
-        if (i + 1 < pageCount) fprintf(f, ",");
-        if ((i + 1) % 8 == 0) fprintf(f, "\n");
-    }
-    if (pageCount % 8 != 0) fprintf(f, "\n");
-    fprintf(f, "};\n\n");
-
-    fprintf(f, "static const unsigned char PEARMOR_SEED[32] = {\n    ");
-    for (int i = 0; i < 32; i++) {
-        fprintf(f, "0x%02X", seed[i]);
-        if (i < 31) fprintf(f, ",");
-    }
-    fprintf(f, "\n};\n\n");
-
-    // 外层加密后的块索引（isCode）。Stub 用 outerKey 解密得到每页是否代码页。
-    fprintf(f, "static const unsigned char PEARMOR_ENC_INDEX[] = {\n");
-    for (size_t i = 0; i < encIndex.size(); i++) {
-        if (i % 16 == 0) fprintf(f, "    ");
-        fprintf(f, "0x%02X", encIndex[i]);
-        if (i + 1 < encIndex.size()) fprintf(f, ",");
-        if ((i + 1) % 16 == 0) fprintf(f, "\n");
-    }
-    if (encIndex.size() % 16 != 0) fprintf(f, "\n");
-    fprintf(f, "};\n");
-    fclose(f);
-
-    printf("[packer] 完成: %s -> %s (%zu 字节密文, %u 页, AES-256-CBC 分页, 种子派生分层密钥)\n",
-        inPath, outPath, enc.size(), pageCount);
+    printf("[packer] 完成: %s -> %s (%zu 字节密文, %u 页, 入口 RVA=0x%X, overlay 拼接)\n",
+        inPath, outPath, enc.size(), pageCount, entryRva);
     return 0;
 }
