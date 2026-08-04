@@ -263,9 +263,16 @@ public:
         DebugLog("[loader] ckpt: ApplyRelocations 完成, 准备 FixImports");
         if (!ManualPeLoader::FixImports(workBase, opt)) { DebugLog("[loader] 修复导入表失败"); return false; }
         DebugLog("[loader] ckpt: FixImports 完成");
+        DebugLog("[loader] ckpt: FixImports 完成, 准备 FixDelayImports");
+        // CI 54 定位：崩在 FixImports 完成 与「跳过 RtlAddFunctionTable」之间，
+        // 即 FixDelayImports 或 TLS 回调执行 —— 分步打日志锁定。
         ManualPeLoader::FixDelayImports(workBase, opt);
-        if (opt.DataDirectory[IMAGE_DIRECTORY_ENTRY_TLS].VirtualAddress)
+        DebugLog("[loader] ckpt: FixDelayImports 完成");
+        if (opt.DataDirectory[IMAGE_DIRECTORY_ENTRY_TLS].VirtualAddress) {
+            DebugLog("[loader] ckpt: payload 含 TLS 目录, 执行 TLS 回调");
             ManualPeLoader::RunTlsCallbacks(workBase, opt);
+            DebugLog("[loader] ckpt: TLS 回调执行完成");
+        }
 
         // ---- 注册异常展开表（RUNTIME_FUNCTION / .pdata）----
         // 实测结论（CI 36）：注册 RtlAddFunctionTable 反而导致「C++ 异常展开死循环」，
