@@ -45,10 +45,15 @@ if (-not $Target) {
         Write-Host "[3/3] 检测到用户目标: $Target（放入 test 文件夹的 exe 自动成为加壳对象）" -ForegroundColor Yellow
     } else {
         $Target = Join-Path $Build "Release\test_payload.exe"
+        Write-Host "[3/3] test/ 下未发现用户 exe（若已放入请检查 .gitignore 是否忽略 *.exe），改用样例 test_payload" -ForegroundColor Yellow
     }
 }
 if (-not (Test-Path $Target)) { throw "未找到目标程序: $Target" }
-if (-not $Out) { $Out = Join-Path $Root "packed_app.exe" }
+if (-not $Out) {
+    # 产物名带目标主名（如 HanbotSavesUploader_packed.exe），用户从 artifact 一眼认出
+    $baseName = [System.IO.Path]::GetFileNameWithoutExtension($Target)
+    $Out = Join-Path $Root ($baseName + "_packed.exe")
+}
 
 Write-Host "[3/3] 加壳 $Target -> $Out" -ForegroundColor Cyan
 & $Packer $Target -o $Out -stub $Stub
