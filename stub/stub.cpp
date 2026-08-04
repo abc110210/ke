@@ -162,8 +162,12 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int)
                         }
                         return true;
                     };
-                    uint64_t indexOff   = (uint64_t)fsz.QuadPart - 80;
-                    uint64_t payloadOff = indexOff - (uint64_t)meta.indexLen - (uint64_t)meta.payloadLen;
+                    // 布局：stub | payload(payloadLen) | index(indexLen) | footer(80)
+                    // index 偏移 = 文件末尾 - 80 - indexLen；payload 偏移 = index 偏移 - payloadLen。
+                    // 【CI 53 实证】此前 indexOff 少了 -indexLen（写成 fsz-80=footer 位置），
+                    // 从 footer 处读 indexLen 字节 → 超文件末尾 → 读不满 → Index=0。
+                    uint64_t indexOff   = (uint64_t)fsz.QuadPart - 80 - (uint64_t)meta.indexLen;
+                    uint64_t payloadOff = indexOff - (uint64_t)meta.payloadLen;
                     ok = (payloadOff <= indexOff);
                     if (ok) {
                         try { payload.resize(meta.payloadLen); indexEnc.resize(meta.indexLen); }
