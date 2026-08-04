@@ -50,7 +50,8 @@ static int CallRtlInsertInvertedFunctionTable(pRtlInsertInvertedFunctionTable fn
 // 该帧的返回地址即 payload 内真实 throw 调用点（call _CxxThrowException 之下一条指令）。
 // 不依赖 payload 注册 .pdata（CI 36 教训：不完整 pdata 会引发展开死循环）。
 // 用途：CI 诊断"为何一进 OEP 就抛 0xE06D7363"，精确定位 throw 站点模块。
-static void LogRealThrowSite(EXCEPTION_POINTERS* ep)
+// pb/pe 为 payload 基址区间（由 VehHandler 计算传入，避免本函数依赖 PagedLoader 完整类型）。
+static void LogRealThrowSite(EXCEPTION_POINTERS* ep, uintptr_t pb, uintptr_t pe)
 {
     using PFN_Lookup = PRUNTIME_FUNCTION (NTAPI*)(ULONG64, PULONG64, PVOID);
     using PFN_Unwind  = PVOID (NTAPI*)(ULONG, ULONG64, ULONG64, PRUNTIME_FUNCTION, PCONTEXT, PVOID*, PULONG64, PVOID);
@@ -78,12 +79,6 @@ static void LogRealThrowSite(EXCEPTION_POINTERS* ep)
     ctx.R13 = ep->ContextRecord->R13;
     ctx.R14 = ep->ContextRecord->R14;
     ctx.R15 = ep->ContextRecord->R15;
-
-    uintptr_t pb = 0, pe = 0;
-    if (PagedLoader::g_instance && !PagedLoader::g_instance->pageBase.empty()) {
-        pb = (uintptr_t)PagedLoader::g_instance->pageBase[0];
-        pe = pb + (size_t)PagedLoader::g_instance->pageBase.size() * PagedLoader::g_instance->pageSize;
-    }
 
     DebugLog("[veh] === 正经走栈定位真实 throw 站点（从 RaiseException 现场向上展开）===");
     if (pb) DebugLog("[veh] payload 基址区间=[%p, %p) （#N 落在此区间即 payload 自身抛）", (void*)pb, (void*)pe);
@@ -616,7 +611,12 @@ private:
             // 诊断钩子：C++ 异常在展开前于 VEH 层截获。用 RtlVirtualUnwind 正经走栈
             // 定位【真实抛点】，不依赖 payload 注册 .pdata（CI 36 教训：不完整 pdata 会展开死循环）。
             // 不吞异常，返回 CONTINUE_SEARCH 让进程以该退出码终止。
-            LogRealThrowSite(ep);
+            uintptr_t pb = 0, pe = 0;
+            if (g_instance && !g_instance->pageBase.empty()) {
+                pb = (uintptr_t)g_instance->pageBase[0];
+                pe = pb + (size_t)g_instance->pageBase.size() * g_instance->pageSize;
+            }
+            LogRealThrowSite(ep, pb, pe);
             DebugLog("[veh] C++ 异常未捕获 code=0xE06D7363 (真实抛点见上方走栈，落在 payload 内即 payload 自身)");
             return EXCEPTION_CONTINUE_SEARCH;
         }
