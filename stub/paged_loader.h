@@ -575,13 +575,20 @@ private:
     // 【CI 40 根因实证】门控页是 PAGE_NOACCESS，若先写明文会触发二次 AV →
     // VEH 处理器重入 → 同线程对 std::mutex 递归加锁 → _Mtx_lock 抛 std::system_error
     // (0xE06D7363 未捕获)。顺序铁律：NOACCESS -> READWRITE -> 写明文 -> 校验 -> EXECUTE_READ。
+    // 【CI 41 根因实证】解密源必须是「页面内存的重加密密文」，而非打包期 cipherData：
+    // 页面里存的是「重定位/导入修复后明文」的密文（门控时 encryptPage 原地写回），
+    // baseCrc 也是按修复后明文建立（integrity.h 注释：修复会改变代码页内容）。
+    // 用 cipherData 解出的是未修复原始明文 → CRC 不符 → 误判被篡改 → 自毁 0xC0000001。
+    // 另：CBC 不能原地解密（ivc 需读当前块密文，但已被 out 覆盖），先拷密文到栈缓冲再解回。
     bool decryptPageLocked(uint32_t i)
     {
         unsigned char* dst = reinterpret_cast<unsigned char*>(pageBase[i]);
         PVOID p = dst; SIZE_T sz = pageSize; ULONG old = 0;
         if (!NT_SUCCESS(Sys::ProtectVirtualMemory(GetCurrentProcess(), &p, &sz, PAGE_READWRITE, &old)))
             return false;
-        if (!cipher->decryptPage(cipherData + i * pageSize, i, dst, pageSize))
+        unsigned char tmp[PEARMOR_PAGE_SIZE];   // 栈缓冲：拷页面密文，防 CBC 原地解密破坏链
+        memcpy(tmp, dst, pageSize);
+        if (!cipher->decryptPage(tmp, i, dst, pageSize))
             return false;
         if (!Integrity::VerifyPage(dst, pages[i].baseCrc))
             return false; // 被篡改（与运行期修复后基准不符）
