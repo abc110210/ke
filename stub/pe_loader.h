@@ -529,16 +529,23 @@ public:
         uintptr_t pref  = opt.ImageBase;
         uintptr_t delta = reinterpret_cast<uintptr_t>(imageBase) - pref;
         uint64_t* cb = reinterpret_cast<uint64_t*>(tls->AddressOfCallBacks + delta);
-        DebugLog("[loader] TLS 回调: TLS_RVA=0x%X AddressOfCallBacks=0x%llX 修正后cb=%p cb[0]=0x%llX imageBase=%p",
-                 dir.VirtualAddress, (unsigned long long)tls->AddressOfCallBacks,
-                 (void*)cb, (unsigned long long)(cb ? *cb : 0), imageBase);
+        // 【CI 56】回调执行前临时把镜像置为可执行：门控前代码页还是 RW，
+        // 执行回调代码会被 DEP/NX 拦截 → 0xC0000005（崩溃地址落在 stub 模块附近）。
+        // 执行完由门控循环重新设置各页保护。
+        DWORD oldProt = 0;
+        VirtualProtect(imageBase, opt.SizeOfImage, PAGE_EXECUTE_READWRITE, &oldProt);
+        DebugLog("[loader] TLS 回调: TLS_RVA=0x%X 修正后cb=%p cb[0]=0x%llX imageBase=%p",
+                 dir.VirtualAddress, (void*)cb,
+                 (unsigned long long)(cb ? *cb : 0), imageBase);
         for (uint32_t i = 0; cb[i]; i++) {
             uintptr_t callAddr = static_cast<uintptr_t>(cb[i]);
             // 若回调地址仍是链接时 VA（preferredBase 区间）→ 手动 +delta 修正
             if (callAddr >= pref && callAddr < pref + opt.SizeOfImage)
                 callAddr += delta;
+            DebugLog("[loader] TLS 回调 #%u -> 0x%llX", i, (unsigned long long)callAddr);
             auto fn = reinterpret_cast<void(WINAPI*)(PVOID, DWORD, PVOID)>(callAddr);
             fn(imageBase, DLL_PROCESS_ATTACH, nullptr);
+            DebugLog("[loader] TLS 回调 #%u 返回", i);
         }
         return true;
     }

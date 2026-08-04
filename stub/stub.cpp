@@ -74,23 +74,28 @@ static LONG WINAPI TopLevelHandler(EXCEPTION_POINTERS* ep)
     // 定位崩溃地址所属模块（CI 诊断用：区分 壳本体 / 负载 / 系统 DLL 数据区）
     char mod[512] = {0};
     HMODULE hMod = nullptr;
+    uintptr_t modBase = 0;
     if (GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
                            GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
                            reinterpret_cast<LPCWSTR>(addr), &hMod) && hMod) {
         GetModuleFileNameA(hMod, mod, sizeof(mod));
+        modBase = reinterpret_cast<uintptr_t>(hMod);
     }
-
     // 无条件写固定崩溃日志（不依赖 PEARMOR_DEBUG，便于 CI 捕获）
     char path[MAX_PATH] = {0};
     if (GetTempPathA(MAX_PATH, path)) {
         strcat_s(path, "pearmor_crash.log");
         FILE* f = nullptr;
         if (fopen_s(&f, path, "w") == 0 && f) {
-            fprintf(f, "[crash] code=0x%08X addr=0x%p module=%s\n", code, addr, mod);
+            fprintf(f, "[crash] code=0x%08X addr=0x%p module=%s 模块内偏移=0x%llX\n",
+                    code, addr, mod,
+                    (unsigned long long)(modBase ? (reinterpret_cast<uintptr_t>(addr) - modBase) : 0));
             fclose(f);
         }
     }
-    fprintf(stderr, "[crash] code=0x%08X addr=0x%p module=%s\n", code, addr, mod);
+    fprintf(stderr, "[crash] code=0x%08X addr=0x%p module=%s 模块内偏移=0x%llX\n",
+            code, addr, mod,
+            (unsigned long long)(modBase ? (reinterpret_cast<uintptr_t>(addr) - modBase) : 0));
     return EXCEPTION_EXECUTE_HANDLER;
 }
 
