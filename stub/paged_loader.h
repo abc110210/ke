@@ -45,6 +45,20 @@ static int CallRtlInsertInvertedFunctionTable(pRtlInsertInvertedFunctionTable fn
     }
 }
 
+// 独立 SEH 辅助：从任意地址安全读取一个指针宽度的值。越界/不可读时返回 0。
+// 单独成函数（参数全 POD、内部才用 __try、不调用 DebugLog/不构造 RAII 对象），
+// 以满足 MSVC C2712 约束——禁止在含 C++ 对象展开的函数里用 __try。
+// 用于 VEH 手动走栈时读取可能无效的栈帧返回地址。
+static uintptr_t SafeReadPtr(uintptr_t addr)
+{
+    if (!addr || addr == (uintptr_t)-1) return 0;
+    __try {
+        return *reinterpret_cast<volatile uintptr_t*>(addr);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return 0;
+    }
+}
+
 class PagedLoader {
 public:
     struct PageState {
@@ -553,9 +567,7 @@ private:
             //   #0 = _CxxThrowException（msvcrt）→ #1 = 实际 throw 站点 → #2 = 调用者。
             uintptr_t rsp = ep->ContextRecord->Rsp;
             for (int d = 0; d < 12; d++) {
-                uintptr_t ret = 0;
-                __try { ret = *reinterpret_cast<volatile uintptr_t*>(rsp); }
-                __except (EXCEPTION_EXECUTE_HANDLER) { ret = 0; }
+                uintptr_t ret = SafeReadPtr(rsp);
                 if (!ret || ret == (uintptr_t)-1) break;
                 char mod[256] = {0};
                 HMODULE hMod = nullptr;
