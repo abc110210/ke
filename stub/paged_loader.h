@@ -435,17 +435,18 @@ private:
         return true;
     }
 
-    // 重新加密第 i 页（已持有锁）：先置 NOACCESS 再写回密文
+    // 重新加密第 i 页（已持有锁）：先在原地加密（页仍可读写），再置 NOACCESS
+    // 注意：绝不能先置 NOACCESS 再读页 —— 那会立刻 0xC0000005（读 NOACCESS 页）。
     bool reencryptPageLocked(uint32_t i)
     {
         unsigned char* dst = reinterpret_cast<unsigned char*>(pageBase[i]);
-        DebugLog("[loader] ckpt: reencrypt i=%u 置NOACCESS前", i);
-        PVOID p = dst; SIZE_T sz = pageSize; ULONG old = 0;
-        Sys::ProtectVirtualMemory(GetCurrentProcess(), &p, &sz, PAGE_NOACCESS, &old);
-        pages[i].decrypted = false; // 先标记加密态，避免 VEH/其它线程读到半成品
         DebugLog("[loader] ckpt: reencrypt i=%u 加密写回前", i);
         if (!cipher->encryptPage(dst, i, dst, pageSize))
             return false;
+        DebugLog("[loader] ckpt: reencrypt i=%u 置NOACCESS前", i);
+        PVOID p = dst; SIZE_T sz = pageSize; ULONG old = 0;
+        Sys::ProtectVirtualMemory(GetCurrentProcess(), &p, &sz, PAGE_NOACCESS, &old);
+        pages[i].decrypted = false; // 标记加密态，避免 VEH/其它线程读到半成品
         DebugLog("[loader] ckpt: reencrypt i=%u 完成", i);
         return true;
     }
