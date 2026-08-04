@@ -131,24 +131,34 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int)
             if (ok) ok = (meta.magic == pearmor::Overlay::kMagic &&
                           meta.version == pearmor::Overlay::kVersion);
             if (ok) {
+                // 分块读取 helper：循环读满，免疫 ReadFile 对超大块的部分读取
+                // （CI 49 实证：80B footer 读取成功，但一次 ReadFile 1.1MB payload 失败/读不满；
+                //  分块后逐块累加，读到 EOF 前必然读满。）
+                auto readAll = [&](uint64_t fileOff, void* buf, uint32_t len) -> bool {
+                    LARGE_INTEGER o; o.QuadPart = (LONGLONG)fileOff;
+                    if (!SetFilePointerEx(h, o, nullptr, FILE_BEGIN)) return false;
+                    uint8_t* p = reinterpret_cast<uint8_t*>(buf);
+                    uint32_t total = 0;
+                    constexpr uint32_t CHUNK = 0x10000;   // 64KB
+                    while (total < len) {
+                        DWORD want = (len - total) > CHUNK ? CHUNK : (len - total);
+                        DWORD got = 0;
+                        if (!ReadFile(h, p + total, want, &got, nullptr) || got == 0)
+                            return false;
+                        total += got;
+                    }
+                    return true;
+                };
                 uint64_t indexOff   = (uint64_t)fsz.QuadPart - 80;
                 uint64_t payloadOff = indexOff - (uint64_t)meta.indexLen - (uint64_t)meta.payloadLen;
                 ok = (payloadOff <= indexOff);
                 if (ok) {
                     payload.resize(meta.payloadLen);
-                    LARGE_INTEGER po; po.QuadPart = (LONGLONG)payloadOff;
-                    DWORD rd2 = 0;
-                    ok = SetFilePointerEx(h, po, nullptr, FILE_BEGIN) &&
-                         ReadFile(h, payload.data(), meta.payloadLen, &rd2, nullptr) &&
-                         rd2 == meta.payloadLen;
+                    ok = readAll(payloadOff, payload.data(), meta.payloadLen);
                 }
                 if (ok) {
                     indexEnc.resize(meta.indexLen);
-                    LARGE_INTEGER io; io.QuadPart = (LONGLONG)indexOff;
-                    DWORD rd3 = 0;
-                    ok = SetFilePointerEx(h, io, nullptr, FILE_BEGIN) &&
-                         ReadFile(h, indexEnc.data(), meta.indexLen, &rd3, nullptr) &&
-                         rd3 == meta.indexLen;
+                    ok = readAll(indexOff, indexEnc.data(), meta.indexLen);
                 }
             }
         }
