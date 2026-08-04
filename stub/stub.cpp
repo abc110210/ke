@@ -122,8 +122,8 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int)
         if (h2 != INVALID_HANDLE_VALUE) {
             LARGE_INTEGER fsz2, off2;
             DWORD rd2 = 0;
-            if (GetFileSizeEx(h2, &fsz2) && fsz2.QuadPart >= 8) {
-                off2.QuadPart = fsz2.QuadPart - 8;
+            if (GetFileSizeEx(h2, &fsz2) && fsz2.QuadPart >= 80) {
+                off2.QuadPart = fsz2.QuadPart - 80;   // 读 Footer 起始处（-80），与 LoadFromSelf/PowerShell 一致
                 if (SetFilePointerEx(h2, off2, nullptr, FILE_BEGIN))
                     ReadFile(h2, &actualMagic, 8, &rd2, nullptr);
             }
