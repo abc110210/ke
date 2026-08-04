@@ -92,7 +92,10 @@ inline bool RunOnce(uint32_t* outFingerprint = nullptr)
     PVOID mem = nullptr; SIZE_T sz = 0x1000;
     NTSTATUS st = Sys::AllocateVirtualMemory(GetCurrentProcess(), &mem, 0,
         &sz, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
-    if (!NT_SUCCESS(st) || !mem) return false;
+    if (!NT_SUCCESS(st) || !mem) {
+        DebugLog("[stub] P3.1 alloc 失败 st=0x%08X mem=%p", (unsigned)st, mem);
+        return false;
+    }
     uint8_t* code = reinterpret_cast<uint8_t*>(mem);
     // 本次运行用随机种子，使指令布局每次不同（抬高逆向门槛）；
     // 校验则对同一份生成的代码执行两次，结果应完全一致（验证执行确定性）。
@@ -106,7 +109,8 @@ inline bool RunOnce(uint32_t* outFingerprint = nullptr)
     memset(mem, 0xCC, 0x1000);                     // 用后清零 RWX 页
     SIZE_T z = 0;
     Sys::FreeVirtualMemory(GetCurrentProcess(), &mem, &z);
-    if (fp1 == 0 || fp1 != fp2) return false;
+    if (fp1 == 0) { DebugLog("[stub] P3.1 fp1==0 (secret=0x%08X)", secret); return false; }
+    if (fp1 != fp2) { DebugLog("[stub] P3.1 fp1!=fp2 (0x%08X vs 0x%08X)", fp1, fp2); return false; }
     if (outFingerprint) *outFingerprint = fp1;
     return true;
 }
