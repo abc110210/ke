@@ -111,70 +111,76 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int)
     std::vector<unsigned char> payload, indexEnc;
     bool overlayOk = false;
     {
-        wchar_t path[MAX_PATH] = {0};
-        GetModuleFileNameW(nullptr, path, MAX_PATH);
-        HANDLE h = INVALID_HANDLE_VALUE;
-        for (int attempt = 0; attempt < 5 && h == INVALID_HANDLE_VALUE; attempt++) {
-            h = CreateFileW(path, GENERIC_READ,
-                            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr,
-                            OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
-            if (h == INVALID_HANDLE_VALUE) Sleep(100);  // 扛杀软/实时扫描短暂锁
-        }
-        bool ok = (h != INVALID_HANDLE_VALUE);
-        LARGE_INTEGER fsz = {0};
-        if (ok) ok = (GetFileSizeEx(h, &fsz) && fsz.QuadPart > 80);
-        if (ok) {
-            LARGE_INTEGER off; off.QuadPart = fsz.QuadPart - 80;
-            ok = SetFilePointerEx(h, off, nullptr, FILE_BEGIN);
-            DWORD rd = 0;
-            if (ok) ok = (ReadFile(h, &meta, 80, &rd, nullptr) && rd == 80);
-            if (ok) ok = (meta.magic == pearmor::Overlay::kMagic &&
-                          meta.version == pearmor::Overlay::kVersion);
-            if (ok) {
-                // 分块读取 helper：循环读满，免疫 ReadFile 对超大块的部分读取
-                // （CI 49 实证：80B footer 读取成功，但一次 ReadFile 1.1MB payload 失败/读不满；
-                //  分块后逐块累加，读到 EOF 前必然读满。）
-                auto readAll = [&](uint64_t fileOff, void* buf, uint32_t len) -> bool {
-                    LARGE_INTEGER o; o.QuadPart = (LONGLONG)fileOff;
-                    if (!SetFilePointerEx(h, o, nullptr, FILE_BEGIN)) return false;
-                    uint8_t* p = reinterpret_cast<uint8_t*>(buf);
-                    uint32_t total = 0;
-                    constexpr uint32_t CHUNK = 0x10000;   // 64KB
-                    while (total < len) {
-                        DWORD want = (len - total) > CHUNK ? CHUNK : (len - total);
-                        DWORD got = 0;
-                        if (!ReadFile(h, p + total, want, &got, nullptr) || got == 0)
-                            return false;
-                        total += got;
-                    }
-                    return true;
-                };
-                uint64_t indexOff   = (uint64_t)fsz.QuadPart - 80;
-                uint64_t payloadOff = indexOff - (uint64_t)meta.indexLen - (uint64_t)meta.payloadLen;
-                ok = (payloadOff <= indexOff);
-                if (ok) {
-                    payload.resize(meta.payloadLen);
-                    ok = readAll(payloadOff, payload.data(), meta.payloadLen);
+        // 【r52 根治】从自身【内存镜像】读 overlay，完全不碰文件系统。
+        // CI 49/50 实证：文件读取路径在 runner 上被杀软/实时扫描干预（footer 80B 能读、
+        // 1.1MB payload 读不满/被锁）——而进程启动时整个 exe（含 overlay）已被 Windows
+        // 映射进内存，内存读取不受文件系统状态影响。文件大小仅用属性查询（不打开文件）。
+        HMODULE mod = GetModuleHandleW(nullptr);
+        uint8_t* base = reinterpret_cast<uint8_t*>(mod);
+        auto* dos = reinterpret_cast<IMAGE_DOS_HEADER*>(base);
+        if (dos->e_magic == IMAGE_DOS_SIGNATURE) {
+            auto* nt = reinterpret_cast<IMAGE_NT_HEADERS*>(base + dos->e_lfanew);
+            if (nt->Signature == IMAGE_NT_SIGNATURE) {
+                IMAGE_SECTION_HEADER* sec = IMAGE_FIRST_SECTION(nt);
+                DWORD fileDataEnd = nt->OptionalHeader.SizeOfHeaders;  // 文件数据末尾（overlay 起点）
+                IMAGE_SECTION_HEADER* lastSec = nullptr;
+                for (WORD i = 0; i < nt->FileHeader.NumberOfSections; i++) {
+                    DWORD end = sec[i].PointerToRawData + sec[i].SizeOfRawData;
+                    if (end > fileDataEnd) fileDataEnd = end;
+                    if (sec[i].SizeOfRawData > 0) lastSec = &sec[i];
                 }
-                if (ok) {
-                    indexEnc.resize(meta.indexLen);
-                    ok = readAll(indexOff, indexEnc.data(), meta.indexLen);
+                // overlay 内存起始 = 最后一个节的内存结束位置（VirtualAddress + 对齐后大小）
+                DWORD align = nt->OptionalHeader.SectionAlignment;
+                if (align < 0x1000) align = 0x1000;
+                DWORD lastSize = lastSec ? (lastSec->Misc.VirtualSize > lastSec->SizeOfRawData
+                                              ? lastSec->Misc.VirtualSize : lastSec->SizeOfRawData) : 0;
+                uintptr_t ovMem = 0;
+                if (lastSec) {
+                    DWORD memEnd = lastSec->VirtualAddress + ((lastSize + align - 1) & ~(align - 1));
+                    ovMem = reinterpret_cast<uintptr_t>(base) + memEnd;
+                }
+                // overlay 总长 = 文件大小 - 文件数据末尾（footer 在 overlay 末尾 80B）
+                LARGE_INTEGER fileSize = {0};
+                {
+                    wchar_t path[MAX_PATH] = {0};
+                    GetModuleFileNameW(nullptr, path, MAX_PATH);
+                    WIN32_FILE_ATTRIBUTE_DATA fad = {0};
+                    if (GetFileAttributesExW(path, GetFileExInfoStandard, &fad))
+                        fileSize.QuadPart = ((LONGLONG)fad.nFileSizeHigh << 32) | fad.nFileSizeLow;
+                }
+                uint64_t overlayTotal = (uint64_t)fileSize.QuadPart - fileDataEnd;
+                if (ovMem && fileSize.QuadPart > 0 && overlayTotal >= 80) {
+                    uint8_t* footerPtr = reinterpret_cast<uint8_t*>(ovMem) + overlayTotal - 80;
+                    memcpy(&meta, footerPtr, 80);
+                    if (meta.magic == pearmor::Overlay::kMagic &&
+                        meta.version == pearmor::Overlay::kVersion) {
+                        uint64_t need = (uint64_t)meta.payloadLen + (uint64_t)meta.indexLen + 80;
+                        if (need <= overlayTotal) {
+                            try {
+                                payload.resize(meta.payloadLen);
+                                indexEnc.resize(meta.indexLen);
+                                memcpy(payload.data(), reinterpret_cast<void*>(ovMem), meta.payloadLen);
+                                memcpy(indexEnc.data(), reinterpret_cast<void*>(ovMem + meta.payloadLen),
+                                       meta.indexLen);
+                                overlayOk = true;
+                            } catch (...) { overlayOk = false; }
+                        }
+                    }
                 }
             }
         }
-        if (h != INVALID_HANDLE_VALUE) CloseHandle(h);
-        overlayOk = ok;
     }
     if (!overlayOk) {
-        // 失败诊断：打印自身文件路径 + 大小 + 已读到的 footer 首字段，一眼区分失败原因
+        // 失败诊断：打印内存镜像关键定位信息，便于调整 overlay 内存偏移计算
+        HMODULE mod = GetModuleHandleW(nullptr);
         wchar_t selfPath[MAX_PATH] = {0};
         GetModuleFileNameW(nullptr, selfPath, MAX_PATH);
         LONGLONG fsz = -1;
         WIN32_FILE_ATTRIBUTE_DATA fad = {0};
         if (GetFileAttributesExW(selfPath, GetFileExInfoStandard, &fad))
             fsz = ((LONGLONG)fad.nFileSizeHigh << 32) | fad.nFileSizeLow;
-        DebugLog("[stub] overlay 读取失败：自身文件=%ls 大小=%lld magic=0x%llX ver=%u pageCount=%u payloadLen=%u",
-                 selfPath, fsz,
+        DebugLog("[stub] overlay 内存读取失败：自身=%ls 大小=%lld 基址=%p magic=0x%llX ver=%u pageCount=%u payloadLen=%u",
+                 selfPath, fsz, (void*)mod,
                  (unsigned long long)meta.magic, (unsigned)meta.version,
                  (unsigned)meta.pageCount, (unsigned)meta.payloadLen);
         fprintf(stderr, "[stub] 未加壳的运行时，请使用 pearmor 加壳器生成成品\n");
