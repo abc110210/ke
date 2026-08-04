@@ -70,6 +70,8 @@ static LONG WINAPI TopLevelHandler(EXCEPTION_POINTERS* ep)
 {
     DWORD code = ep->ExceptionRecord->ExceptionCode;
     void* addr = ep->ExceptionRecord->ExceptionAddress;
+    // CI 59：exit=0xC0000005 但无 crash.log → 确认 TopLevelHandler 是否被调用
+    DebugLog("[crash] TopLevelHandler 触发: code=0x%08X addr=%p", (unsigned)code, addr);
 
     // 定位崩溃地址所属模块（CI 诊断用：区分 壳本体 / 负载 / 系统 DLL 数据区）
     char mod[512] = {0};

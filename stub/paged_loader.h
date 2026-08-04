@@ -658,7 +658,13 @@ private:
         // 若继续递归处理会对 std::mutex 同线程递归加锁 → MSVCP140 _Mtx_lock 抛
         // std::system_error(0xE06D7363) 未捕获。此处直接放行，让嵌套异常正常传播。
         static thread_local bool tl_inHandler = false;
-        if (tl_inHandler) return EXCEPTION_CONTINUE_SEARCH;
+        if (tl_inHandler) {
+            // CI 59：VEH 处理器内嵌套异常 → 进程直接终止（无 crash.log）。记录嵌套 AV 现场。
+            DebugLog("[veh] 重入保护触发: 嵌套异常 code=0x%08X addr=%p fault=0x%llX",
+                     (unsigned)rec->ExceptionCode, rec->ExceptionAddress,
+                     (unsigned long long)fault);
+            return EXCEPTION_CONTINUE_SEARCH;
+        }
         tl_inHandler = true;
         struct ResetTl { bool* p; ~ResetTl() { *p = false; } } tlReset{ &tl_inHandler };
         // P3.2：非连续布局下各页落在不同区域，逐页判定 fault 落在哪一页
@@ -681,7 +687,10 @@ private:
 
         if (!self->pages[i].decrypted) {
             if (!self->decryptPageLocked(i)) {
-                // 解密/校验失败 → 自毁（进程将终止，无需释放锁）
+                // CI 59 诊断：解密失败静默自毁看不出原因 → 记录页号/CRC/保护状态
+                DebugLog("[loader] veh: 解密失败 i=%u fault=0x%llX baseCrc=0x%08X decrypted=%d",
+                         i, (unsigned long long)fault,
+                         (unsigned)self->pages[i].baseCrc, (int)self->pages[i].decrypted);
                 self->SelfDestructNow();
                 return EXCEPTION_EXECUTE_HANDLER;
             }
