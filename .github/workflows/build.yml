@@ -23,17 +23,13 @@ jobs:
         run: |
           .\build.ps1
 
-      - name: 运行加壳后的程序（验证解密 + 手动加载 + OEP）
+      - name: 运行加壳后的程序（收集日志诊断；样例模式额外断言验证文件）
         shell: pwsh
         run: |
           $out = ".\packed_app.exe"
           if (-not (Test-Path $out)) { throw "未找到 $out" }
           $env:PEARMOR_DEBUG = "1"   # 开启壳内调试日志
           $env:PEARMOR_ALLOW_VM = "1"  # CI runner 本身是 Azure VM 且系统盘<30GB，放行 VM 检测
-          # 说明：
-          #   - PEARMOR_ALLOW_PROCENV 已删除：proc_env.h 改用 NtOpenProcess+ProcessImageFileName(27)
-          #     读取用户态镜像名，规避 ImageName.Buffer 内核地址 0xC0000005，检测默认生效。
-          #   - PEARMOR_ALLOW_CODEGEN 已删除：CodeGen::RunOnce 现默认执行，CI 直接验证生成/校验路径。
           # 带超时运行：防止反调试/挂起导致 runner 被占几小时
           $timeoutSec = 30
           $p = Start-Process -FilePath $out -PassThru -RedirectStandardError "stderr.txt"
@@ -49,10 +45,17 @@ jobs:
             if (Test-Path $lf) { Write-Host "==== $lf ===="; Get-Content $lf; Write-Host "============" }
           }
           if ($timedOut) { throw "加壳程序运行超时（${timeoutSec}s），可能自挂起或死循环" }
-          if ($p.ExitCode -ne 0) { throw "加壳程序退出码非 0 ($($p.ExitCode))" }
-          # 样例程序成功执行会写验证文件
-          if (-not (Test-Path ".\pearmor_payload_ran.txt")) { throw "样例未生成验证文件：OEP 未执行" }
-          Get-Content ".\pearmor_payload_ran.txt"
+          # 用户目标模式（test/ 有用户放入的 exe）：加壳成功即达标，运行结果仅作诊断
+          # （真实程序的退出码/行为各异，不能按样例标准断言）
+          $userMode = (Get-ChildItem ".\test" -Filter *.exe -File -ErrorAction SilentlyContinue).Count -gt 0
+          if ($userMode) {
+            Write-Host "用户目标模式：加壳成功即达标，运行日志见上（供诊断）"
+          } else {
+            # 样例模式：严格回归（样例程序成功执行会写验证文件）
+            if ($p.ExitCode -ne 0) { throw "样例退出码非 0 ($($p.ExitCode))" }
+            if (-not (Test-Path ".\pearmor_payload_ran.txt")) { throw "样例未生成验证文件：OEP 未执行" }
+            Get-Content ".\pearmor_payload_ran.txt"
+          }
 
       - name: 上传工件（加壳后的 EXE + 打包器 + 壳运行时）
         uses: actions/upload-artifact@v4
