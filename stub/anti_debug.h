@@ -45,20 +45,11 @@ inline bool CheckDebugObject()
 //    重要：DR 寄存器只能在内核态读取，用户态必须经由 NtGetContextThread
 //    （由内核替你读），且必须先挂起自身线程；绝对不能 __readdr（那会发出
 //    mov dr 指令，ring3 下触发 STATUS_PRIVILEGED_INSTRUCTION / 0xC0000096）。
+// 临时禁用硬件断点检测：自挂起/恢复当前线程在 CI 环境导致永久挂起。
+// 后续改用更安全的方式（例如用内核对象事件或单独快照线程）再恢复。
 inline bool CheckHardwareBreakpoints()
 {
-    HANDLE self = GetCurrentThread();
-    if (SuspendThread(self) == (DWORD)-1) return false;
-    CONTEXT ctx;
-    memset(&ctx, 0, sizeof(ctx));
-    ctx.ContextFlags = CONTEXT_DEBUG_REGISTERS;
-    bool hit = false;
-    if (NT_SUCCESS(Sys::GetContextThread(self, &ctx)) &&
-        (ctx.Dr0 || ctx.Dr1 || ctx.Dr2 || ctx.Dr3)) {
-        hit = true;
-    }
-    ResumeThread(self);
-    return hit;
+    return false;
 }
 
 // 5) 时间陷阱：固定工作量下，若耗时异常（被单步拖慢）即判定调试
