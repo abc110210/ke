@@ -30,8 +30,10 @@ jobs:
           if (-not (Test-Path $out)) { throw "未找到 $out" }
           $env:PEARMOR_DEBUG = "1"   # 开启壳内调试日志
           $env:PEARMOR_ALLOW_VM = "1"  # CI runner 本身是 Azure VM 且系统盘<30GB，放行 VM 检测
-          $env:PEARMOR_ALLOW_PROCENV = "1"  # 跳过进程环境检测（其 ImageName.Buffer 内核地址陷阱待修）
-          $env:PEARMOR_ALLOW_CODEGEN = "1"  # 跳过 P3.1 运行时代码生成验证（其校验逻辑待单独修复），先验证加载主体
+          # 说明：
+          #   - PEARMOR_ALLOW_PROCENV 已删除：proc_env.h 改用 NtOpenProcess+ProcessImageFileName(27)
+          #     读取用户态镜像名，规避 ImageName.Buffer 内核地址 0xC0000005，检测默认生效。
+          #   - PEARMOR_ALLOW_CODEGEN 已删除：CodeGen::RunOnce 现默认执行，CI 直接验证生成/校验路径。
           # 带超时运行：防止反调试/挂起导致 runner 被占几小时
           $timeoutSec = 30
           $p = Start-Process -FilePath $out -PassThru -RedirectStandardError "stderr.txt"
