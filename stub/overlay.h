@@ -51,8 +51,12 @@ inline bool LoadFromSelf(std::vector<unsigned char>& payloadOut,
     wchar_t path[MAX_PATH] = {0};
     if (GetModuleFileNameW(nullptr, path, MAX_PATH) == 0) return false;
 
-    HANDLE h = CreateFileW(path, GENERIC_READ, FILE_SHARE_READ, nullptr,
+    HANDLE h = CreateFileW(path, GENERIC_READ,
+                           FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr,
                            OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+    // 注意：读自身文件必须用最大共享。CI 实测（2026-08-05）：若只用 FILE_SHARE_READ，
+    // 与 runner 上杀软/实时扫描以写模式短暂占用冲突 → CreateFileW 失败 → 误报
+    // 「未发现 overlay」（PowerShell 校验同文件却通过，印证是打开共享问题而非文件问题）。
     if (h == INVALID_HANDLE_VALUE) return false;
 
     LARGE_INTEGER fsz;

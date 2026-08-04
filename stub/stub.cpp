@@ -107,14 +107,31 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int)
     pearmor::Overlay::Footer meta = {};
     std::vector<unsigned char> payload, indexEnc;
     if (!pearmor::Overlay::LoadFromSelf(payload, indexEnc, meta)) {
-        // 诊断增强：打印自身文件路径 + 大小，一眼区分「裸 stub（没拼密文）」vs「读自身失败」
+        // 诊断增强：打印自身文件路径 + 大小，并二次读取末尾 8 字节 magic 对比期望值，
+        // 一眼区分「文件真没 footer」vs「读取逻辑/共享冲突」。
         wchar_t selfPath[MAX_PATH] = {0};
         GetModuleFileNameW(nullptr, selfPath, MAX_PATH);
         LONGLONG fsz = -1;
         WIN32_FILE_ATTRIBUTE_DATA fad = {0};
         if (GetFileAttributesExW(selfPath, GetFileExInfoStandard, &fad))
             fsz = ((LONGLONG)fad.nFileSizeHigh << 32) | fad.nFileSizeLow;
-        DebugLog("[stub] 未发现 overlay 负载：自身文件=%ls 大小=%lld 字节", selfPath, fsz);
+        uint64_t actualMagic = 0;
+        HANDLE h2 = CreateFileW(selfPath, GENERIC_READ,
+                                FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr,
+                                OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+        if (h2 != INVALID_HANDLE_VALUE) {
+            LARGE_INTEGER fsz2, off2;
+            DWORD rd2 = 0;
+            if (GetFileSizeEx(h2, &fsz2) && fsz2.QuadPart >= 8) {
+                off2.QuadPart = fsz2.QuadPart - 8;
+                if (SetFilePointerEx(h2, off2, nullptr, FILE_BEGIN))
+                    ReadFile(h2, &actualMagic, 8, &rd2, nullptr);
+            }
+            CloseHandle(h2);
+        }
+        DebugLog("[stub] 未发现 overlay 负载：自身文件=%ls 大小=%lld 期望magic=0x%llX 实际magic=0x%llX",
+                 selfPath, fsz, (unsigned long long)pearmor::Overlay::kMagic,
+                 (unsigned long long)actualMagic);
         fprintf(stderr, "[stub] 未加壳的运行时，请使用 pearmor 加壳器生成成品\n");
         return -4;
     }
