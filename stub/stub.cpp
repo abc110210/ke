@@ -107,7 +107,14 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int)
     pearmor::Overlay::Footer meta = {};
     std::vector<unsigned char> payload, indexEnc;
     if (!pearmor::Overlay::LoadFromSelf(payload, indexEnc, meta)) {
-        DebugLog("[stub] 未发现 overlay 负载：这是未加壳的运行时");
+        // 诊断增强：打印自身文件路径 + 大小，一眼区分「裸 stub（没拼密文）」vs「读自身失败」
+        wchar_t selfPath[MAX_PATH] = {0};
+        GetModuleFileNameW(nullptr, selfPath, MAX_PATH);
+        LONGLONG fsz = -1;
+        WIN32_FILE_ATTRIBUTE_DATA fad = {0};
+        if (GetFileAttributesExW(selfPath, GetFileExInfoStandard, &fad))
+            fsz = ((LONGLONG)fad.nFileSizeHigh << 32) | fad.nFileSizeLow;
+        DebugLog("[stub] 未发现 overlay 负载：自身文件=%ls 大小=%lld 字节", selfPath, fsz);
         fprintf(stderr, "[stub] 未加壳的运行时，请使用 pearmor 加壳器生成成品\n");
         return -4;
     }
