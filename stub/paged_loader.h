@@ -564,6 +564,9 @@ private:
                 self->SelfDestructNow();
                 return EXCEPTION_EXECUTE_HANDLER;
             }
+            // CI 铁证：非入口代码页在门控后被实际访问 → VEH 缺页解密被真实触发
+            DebugLog("[loader] veh: 按需解密代码页 i=%u fault=0x%llX",
+                     i, (unsigned long long)fault);
             return EXCEPTION_CONTINUE_EXECUTION;
         } else {
             // 已是明文但可能被监控线程临时置了 NOACCESS（重加密竞态）→ 恢复可执行
