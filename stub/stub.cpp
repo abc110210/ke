@@ -108,7 +108,7 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int)
 
     if (PEARMOR_PAYLOAD_LEN == 0 || PEARMOR_PAGE_COUNT == 0) {
         DebugLog("[stub] 空负载：请先用 pearmor-packer 打包生成 packer_config.h 再编译");
-        MessageBoxW(nullptr, L"空负载：请先运行打包器生成 packer_config.h", L"PEArmor", MB_OK | MB_ICONERROR);
+        fprintf(stderr, "[stub] 空负载：请先运行打包器生成 packer_config.h\n");
         return -1;
     }
 
@@ -206,9 +206,7 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int)
                      innerKey, idxPlain.data(), (uint32_t)PEARMOR_PAGE_COUNT, entryRva,
                      PEARMOR_SEED)) {
         DebugLog("[stub] 分页加载失败");
-        wchar_t msg[128];
-        swprintf_s(msg, L"PEArmor: 分页加载失败");
-        MessageBoxW(nullptr, msg, L"PEArmor", MB_OK | MB_ICONERROR);
+        fprintf(stderr, "[stub] 分页加载失败\n");
         return -2;
     }
     DebugLog("[stub] 分页加载成功 OEP_RVA=0x%llX", (unsigned long long)entryRva);

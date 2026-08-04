@@ -422,22 +422,28 @@ public:
             ULONGLONG* ft  = reinterpret_cast<ULONGLONG*>(base + desc->FirstThunk);
             for (; *oft; oft++, ft++) {
                 void* fn = nullptr;
+                const char* fnName = "?";
                 if (IMAGE_SNAP_BY_ORDINAL64(*oft)) {
                     // 序数导入：构造 "#ordinal" 字符串查询
                     char ordBuf[16];
                     snprintf(ordBuf, sizeof(ordBuf), "#%llu",
                              (unsigned long long)(*oft & 0xFFFF));
                     fn = resolveExportFromBase(hMod, ordBuf);
+                    fnName = ordBuf;
                 } else {
                     auto* imp = reinterpret_cast<IMAGE_IMPORT_BY_NAME*>(
                         base + static_cast<DWORD>(*oft));
                     fn = resolveExportFromBase(hMod, imp->Name);
+                    fnName = imp->Name;
                 }
                 // 兜底：自研解析失败时才退回系统 API（仅系统 DLL，非目标 PE）
                 if (!fn) {
                     if (hDll) fn = GetProcAddress(hDll, reinterpret_cast<LPCSTR>(*oft & 0xFFFF));
                 }
-                if (!fn) return false;
+                if (!fn) {
+                    DebugLog("[loader] 导入解析失败: dll=%s fn=%s", dllNameA, fnName);
+                    return false;
+                }
                 *ft = reinterpret_cast<ULONGLONG>(fn);
             }
         }

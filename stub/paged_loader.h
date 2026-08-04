@@ -65,7 +65,7 @@ public:
 
         // 内层密钥解密代码页；IV 母版 = innerKey 前 16 字节（与 packer 一致）
         cipher.reset(new AesPageCipher(innerKey, innerKey));
-        if (!cipher->ok) return false;
+        if (!cipher->ok) { DebugLog("[loader] AesPageCipher 初始化失败"); return false; }
 
         pages.resize(pageCount);
 
@@ -73,15 +73,17 @@ public:
         // 先整镜像解密到临时缓冲区以便读头（避免破坏 payload 密文）
         std::vector<unsigned char> tmp(payloadLen);
         for (uint32_t i = 0; i < pageCount; i++) {
-            if (!cipher->decryptPage(payload + i * pageSize, i, tmp.data() + i * pageSize, pageSize))
+            if (!cipher->decryptPage(payload + i * pageSize, i, tmp.data() + i * pageSize, pageSize)) {
+                DebugLog("[loader] 解密临时页 i=%u 失败", i);
                 return false;
+            }
         }
 
         auto* dos = reinterpret_cast<IMAGE_DOS_HEADER*>(tmp.data());
-        if (dos->e_magic != IMAGE_DOS_SIGNATURE) return false;
+        if (dos->e_magic != IMAGE_DOS_SIGNATURE) { DebugLog("[loader] DOS 签名校验失败"); return false; }
         auto* nt  = reinterpret_cast<IMAGE_NT_HEADERS*>(tmp.data() + dos->e_lfanew);
-        if (nt->Signature != IMAGE_NT_SIGNATURE) return false;
-        if (nt->OptionalHeader.Magic != IMAGE_NT_OPTIONAL_HDR64_MAGIC) return false;
+        if (nt->Signature != IMAGE_NT_SIGNATURE) { DebugLog("[loader] NT 签名校验失败"); return false; }
+        if (nt->OptionalHeader.Magic != IMAGE_NT_OPTIONAL_HDR64_MAGIC) { DebugLog("[loader] 非 PE32+ (Magic 校验失败)"); return false; }
 
         const IMAGE_OPTIONAL_HEADER64& opt = nt->OptionalHeader;
         uint64_t preferredBase = opt.ImageBase;
@@ -100,14 +102,16 @@ public:
         std::vector<unsigned char> work(sizeOfImage);
         for (uint32_t i = 0; i < pageCount; i++) {
             if (!cipher->decryptPage(payload + i * pageSize, i,
-                    work.data() + i * pageSize, pageSize))
+                    work.data() + i * pageSize, pageSize)) {
+                DebugLog("[loader] 解密工作区页 i=%u 失败", i);
                 return false;
+            }
         }
         void* workBase = work.data();
 
         bool relocated = (reinterpret_cast<uint64_t>(workBase) != preferredBase);
-        if (relocated && !ManualPeLoader::ApplyRelocations(workBase, preferredBase, opt)) return false;
-        if (!ManualPeLoader::FixImports(workBase, opt)) return false;
+        if (relocated && !ManualPeLoader::ApplyRelocations(workBase, preferredBase, opt)) { DebugLog("[loader] 应用重定位失败"); return false; }
+        if (!ManualPeLoader::FixImports(workBase, opt)) { DebugLog("[loader] 修复导入表失败"); return false; }
         ManualPeLoader::FixDelayImports(workBase, opt);
         if (opt.DataDirectory[IMAGE_DIRECTORY_ENTRY_TLS].VirtualAddress)
             ManualPeLoader::RunTlsCallbacks(workBase, opt);
@@ -139,7 +143,7 @@ public:
                 PVOID base = nullptr; SIZE_T sz = sizeOfImage;
                 NTSTATUS st = Sys::AllocateVirtualMemory(GetCurrentProcess(), &base, 0,
                     &sz, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
-                if (!NT_SUCCESS(st) || !base) return false;
+                if (!NT_SUCCESS(st) || !base) { DebugLog("[loader] 连续回退分配失败 st=0x%08X", (unsigned)st); return false; }
                 imageBase = base;                    // 连续回退：仍用 imageBase
                 for (uint32_t i = 0; i < pageCount; i++) pageBase[i] = base;
             }
@@ -155,7 +159,7 @@ public:
             PVOID db = nullptr; SIZE_T dsz = (SIZE_T)dataPages * pageSize;
             NTSTATUS st = Sys::AllocateVirtualMemory(GetCurrentProcess(), &db, 0,
                 &dsz, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
-            if (!NT_SUCCESS(st) || !db) return false;
+            if (!NT_SUCCESS(st) || !db) { DebugLog("[loader] 数据块分配失败 st=0x%08X", (unsigned)st); return false; }
             dataBlockBase = db;
             for (uint32_t i = 0; i < pageCount; i++) {
                 if (!pages[i].isCode) { pageBase[i] = db; db = (unsigned char*)db + pageSize; }
@@ -195,7 +199,7 @@ public:
                 pages[i].baseCrc = fnv1a32(
                     reinterpret_cast<const unsigned char*>(pageBase[i]),
                     pageSize);
-                if (!reencryptPageLocked(i)) return false;
+                if (!reencryptPageLocked(i)) { DebugLog("[loader] 重加密代码页 i=%u 失败", i); return false; }
             } else {
                 DWORD old = 0;
                 // 数据页保持可读写（非执行），不门控
@@ -220,6 +224,8 @@ public:
                                      this, 0, nullptr);
 
         outEntryRva = opt.AddressOfEntryPoint;
+        DebugLog("[loader] Load 成功: pages=%u nonContig=%d entryRva=0x%llX",
+                 pageCount, (int)nonContig, (unsigned long long)outEntryRva);
         return true;
     }
 
