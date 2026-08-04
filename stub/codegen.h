@@ -105,12 +105,25 @@ inline bool RunOnce(uint32_t* outFingerprint = nullptr)
     // 校验则对同一份生成的代码执行两次，结果应完全一致（验证执行确定性）。
     Rng rng(__rdtsc());
     uint32_t secret = (uint32_t)(rng.next() & 0xFFFFFFFF);
-    EmitFingerprint(code, rng, secret);
+    DebugLog("[stub] P3.1 alloc OK mem=%p secret=0x%08X", mem, secret);
+    uint8_t* codeEnd = EmitFingerprint(code, rng, secret);
+    DebugLog("[stub] P3.1 已生成 %u 字节动态代码", (unsigned)(codeEnd - code));
     using Fn = uint32_t(*)(const uint32_t*, size_t);
     Fn fn = reinterpret_cast<Fn>(code);
     uint32_t fp1 = 0, fp2 = 0;
-    // SEH 包裹：生成代码执行异常时优雅失败（打印日志后返回 false），
-    // 避免异常直达 TopLevelHandler 无痕终结进程、连诊断日志都没有。
+    DebugLog("[stub] P3.1 即将执行动态代码 fn=%p", (void*)fn);
+    // 执行前显式确保页可执行（防御：若分配保护未带 X 位，取指即 DEP 0xC0000005）
+    {
+        PVOID protBase = mem; SIZE_T protSize = sz;
+        DWORD oldProt = 0;
+        NTSTATUS pst = Sys::ProtectVirtualMemory(GetCurrentProcess(), &protBase, &protSize,
+                                                 PAGE_EXECUTE_READ, &oldProt);
+        DebugLog("[stub] P3.1 执行前置 EXECUTE_READ st=0x%08X old=0x%X",
+                 (unsigned)pst, (unsigned)oldProt);
+    }
+    // SEH 包裹：生成代码执行异常时优雅失败（打印日志后返回 false）。
+    // 注意：x64 下动态代码无 .pdata 展开表，其内部异常可能无法展开到本 __try，
+    //       此保护属于"尽力而为"，真正的保障是生成的机器码本身正确。
     __try {
         fp1 = fn(sample, 8);
         fp2 = fn(sample, 8);
@@ -121,6 +134,14 @@ inline bool RunOnce(uint32_t* outFingerprint = nullptr)
         SIZE_T z = 0;
         Sys::FreeVirtualMemory(GetCurrentProcess(), &mem, &z);
         return false;
+    }
+    DebugLog("[stub] P3.1 执行完成 fp1=0x%08X fp2=0x%08X", fp1, fp2);
+    // 执行完改回可写再清零（最小权限 + 清零需要写权限）
+    {
+        PVOID protBase = mem; SIZE_T protSize = sz;
+        DWORD oldProt2 = 0;
+        Sys::ProtectVirtualMemory(GetCurrentProcess(), &protBase, &protSize,
+                                  PAGE_READWRITE, &oldProt2);
     }
     memset(mem, 0xCC, 0x1000);                     // 用后清零 RWX 页
     SIZE_T z = 0;
