@@ -196,6 +196,27 @@ public:
         if (opt.DataDirectory[IMAGE_DIRECTORY_ENTRY_TLS].VirtualAddress)
             ManualPeLoader::RunTlsCallbacks(workBase, opt);
 
+        // ---- 注册异常处理/展开表（RUNTIME_FUNCTION / .pdata）----
+        // 手动映射的镜像若不注册函数表，payload 内的 C++ 异常/SEH 无法做栈展开：
+        // 任何 throw 都会因找不到展开信息而变成未处理异常（0xE06D7363），
+        // 表现为“跳 OEP 即崩、异常地址落在 KERNELBASE 派发点”。这是手动 PE
+        // 加载器让 payload 的 C++ 异常/SEH 正常工作的标准必做步骤。
+        {
+            auto& exc = opt.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXCEPTION];
+            if (exc.VirtualAddress && exc.Size) {
+                PVOID pdata = reinterpret_cast<unsigned char*>(workBase) + exc.VirtualAddress;
+                ULONG count = exc.Size / sizeof(RUNTIME_FUNCTION);
+                if (::RtlAddFunctionTable(reinterpret_cast<PRUNTIME_FUNCTION>(pdata),
+                                           count, reinterpret_cast<ULONG64>(workBase))) {
+                    DebugLog("[loader] ckpt: 已注册函数表(pdata) count=%u", count);
+                } else {
+                    DebugLog("[loader] ckpt: RtlAddFunctionTable 失败(忽略)");
+                }
+            } else {
+                DebugLog("[loader] ckpt: 无异常目录, 跳过函数表注册");
+            }
+        }
+
         imageSize = sizeOfImage;
 
         // 数据页/代码页均已落到最终物理位置（work == pageBase，无需 memcpy）。
@@ -321,11 +342,25 @@ public:
     // VEH 控制流混淆后的真实入口调用
     // 注意：经 Rip 重定向进入本函数，没有正常 call 压栈，故不可走 ret 返回，
     //       统一用 ExitProcess 收尾（与 GUI/正常退出路径一致，避免栈帧错乱）。
+    static int OepExceptFilter(EXCEPTION_POINTERS* ep)
+    {
+        auto* rec = ep->ExceptionRecord;
+        DebugLog("[oep] 捕获到异常 code=0x%08X addr=%p (若 addr 在 KERNELBASE/ntdll 之外即真实抛点)",
+                 (unsigned)rec->ExceptionCode, rec->ExceptionAddress);
+        return EXCEPTION_EXECUTE_HANDLER;
+    }
     static void OepThunk()
     {
         if (!g_instance) return;
         auto fn = reinterpret_cast<int(*)()>(g_instance->SafeRvaToVa(g_instance->pendingRva));
-        if (fn) g_oepRc = fn();
+        if (fn) {
+            __try {
+                g_oepRc = fn();
+            } __except (OepExceptFilter(GetExceptionInformation())) {
+                DebugLog("[oep] OEP 执行期间抛异常，已就地捕获（rc=-2）");
+                g_oepRc = -2;
+            }
+        }
         ExitProcess(g_oepRc);
     }
 
