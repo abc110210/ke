@@ -29,13 +29,21 @@ jobs:
           $out = ".\packed_app.exe"
           if (-not (Test-Path $out)) { throw "未找到 $out" }
           $env:PEARMOR_DEBUG = "1"   # 开启壳内调试日志
-          $p = Start-Process -FilePath $out -PassThru -Wait -RedirectStandardError "stderr.txt"
+          # 带超时运行：防止反调试/挂起导致 runner 被占几小时
+          $timeoutSec = 30
+          $p = Start-Process -FilePath $out -PassThru -RedirectStandardError "stderr.txt"
+          if (-not $p.WaitForExit($timeoutSec * 1000)) {
+            Write-Host "加壳程序 ${timeoutSec}s 内未退出，强制结束并收集日志"
+            Stop-Process -Id $p.Id -Force -ErrorAction SilentlyContinue
+            $timedOut = $true
+          }
           Write-Host "exit_code = $($p.ExitCode)"
           # 无论成败都打印诊断日志，便于定位崩溃（如 0xC0000096 特权指令）
           $tmp = $env:TEMP
           foreach ($lf in @("$tmp\pearmor_crash.log", "$tmp\pearmor_stub.log", "stderr.txt")) {
             if (Test-Path $lf) { Write-Host "==== $lf ===="; Get-Content $lf; Write-Host "============" }
           }
+          if ($timedOut) { throw "加壳程序运行超时（${timeoutSec}s），可能自挂起或死循环" }
           if ($p.ExitCode -ne 0) { throw "加壳程序退出码非 0 ($($p.ExitCode))" }
           # 样例程序成功执行会写验证文件
           if (-not (Test-Path ".\pearmor_payload_ran.txt")) { throw "样例未生成验证文件：OEP 未执行" }
