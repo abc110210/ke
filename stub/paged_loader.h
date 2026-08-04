@@ -30,6 +30,21 @@
 
 namespace pearmor {
 
+// 独立的 SEH 辅助函数：单独成函数，参数全为 POD，内部可安全用 __try/__except。
+// （MSVC 禁止在含 C++ 对象展开的函数的函数里用 __try，故 RtlInsertInvertedFunctionTable
+//  这种未文档化、可能崩溃的调用必须隔离到本函数内执行。）
+static int CallRtlInsertInvertedFunctionTable(pRtlInsertInvertedFunctionTable fn,
+                                              PVOID tableBase, ULONG sizeOfImage)
+{
+    if (!fn) return -1;
+    __try {
+        fn(tableBase, sizeOfImage, 0);
+        return 0;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return 1; // 触发了异常（已吞掉）
+    }
+}
+
 class PagedLoader {
 public:
     struct PageState {
@@ -190,14 +205,12 @@ public:
                     NtApiTable ntApis; resolveNtApis(ntApis);
                     if (ntApis.RtlInsertInvertedFunctionTable) {
                         DebugLog("[loader] ckpt: 尝试 RtlInsertInvertedFunctionTable");
-                        __try {
-                            ntApis.RtlInsertInvertedFunctionTable(
-                                reinterpret_cast<PVOID>(reinterpret_cast<uintptr_t>(tableBase) & ~(uintptr_t)0xFFFF),
-                                sizeOfImage, 0);
-                            DebugLog("[loader] ckpt: RtlInsertInvertedFunctionTable OK");
-                        } __except (EXCEPTION_EXECUTE_HANDLER) {
-                            DebugLog("[loader] ckpt: RtlInsertInvertedFunctionTable 触发异常(已吞掉)");
-                        }
+                        int r = CallRtlInsertInvertedFunctionTable(
+                            ntApis.RtlInsertInvertedFunctionTable,
+                            reinterpret_cast<PVOID>(reinterpret_cast<uintptr_t>(tableBase) & ~(uintptr_t)0xFFFF),
+                            sizeOfImage);
+                        DebugLog("[loader] ckpt: RtlInsertInvertedFunctionTable %s",
+                                 r == 0 ? "OK" : (r == 1 ? "触发异常(已吞掉)" : "未解析到"));
                     } else {
                         DebugLog("[loader] ckpt: RtlInsertInvertedFunctionTable 未解析到");
                     }
