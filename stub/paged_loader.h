@@ -57,6 +57,7 @@ public:
               const unsigned char* seed32 = nullptr) // P3.5：密钥轮换用种子
     {
         if (!payload || payloadLen == 0) return false;
+        DebugLog("[loader] ckpt: Load 进入 payloadLen=%llu", (unsigned long long)payloadLen);
         cipherData = payload;
         pageSize   = PEARMOR_PAGE_SIZE;
         pageCount  = (uint32_t)(payloadLen / pageSize);
@@ -99,7 +100,10 @@ public:
         // ---- 修复用临时连续工作区（解密 + 重定位 + 导入 都在这里完成） ----
         // 修复后才把各页拷到最终物理位置（非连续或连续），工作区随即释放，
         // 故“整镜像连续明文”只在修复期短暂存在，运行时内存为非连续碎片。
-        std::vector<unsigned char> work(sizeOfImage);
+        // 注意：work 必须能容纳全部 pageCount*pageSize 字节（解密循环按整页解密），
+        //       而 sizeOfImage 可能不是整页倍数，故按 padded 分配，避免越界写入。
+        size_t workLen = (size_t)pageCount * pageSize;
+        std::vector<unsigned char> work(workLen);
         for (uint32_t i = 0; i < pageCount; i++) {
             if (!cipher->decryptPage(payload + i * pageSize, i,
                     work.data() + i * pageSize, pageSize)) {
@@ -172,15 +176,33 @@ public:
             memcpy(dst, work.data() + i * pageSize, pageSize);
         }
 
-        // 注册异常展开表（用首个物理区域的基址，仅用于栈展开识别）
+        DebugLog("[loader] ckpt: 页已拷到物理位置, 准备注册展开表");
+        // 注意：RtlInsertInvertedFunctionTable 是未文档化的 ntdll 内部函数，签名随
+        // Windows 版本变化；对手动映射的镜像调用可能破坏进程内 LdrpInvertedFunctionTable
+        // 导致崩溃，且对“正常跑到 OEP 写文件”的 MVP 验证毫无必要。故默认关闭，
+        // 仅在显式设置 PEARMOR_ENABLE_IFT=1 时尝试，且用 SEH 兜底避免带崩进程。
         {
             void* tableBase = (nonContig && !pageRegions.empty()) ? pageRegions[0] : imageBase;
             if (tableBase) {
-                NtApiTable ntApis; resolveNtApis(ntApis);
-                if (ntApis.RtlInsertInvertedFunctionTable) {
-                    ntApis.RtlInsertInvertedFunctionTable(
-                        reinterpret_cast<PVOID>(reinterpret_cast<uintptr_t>(tableBase) & ~(uintptr_t)0xFFFF),
-                        sizeOfImage, 0);
+                char en[8] = {0};
+                GetEnvironmentVariableA("PEARMOR_ENABLE_IFT", en, sizeof(en));
+                if (en[0] == '1') {
+                    NtApiTable ntApis; resolveNtApis(ntApis);
+                    if (ntApis.RtlInsertInvertedFunctionTable) {
+                        DebugLog("[loader] ckpt: 尝试 RtlInsertInvertedFunctionTable");
+                        __try {
+                            ntApis.RtlInsertInvertedFunctionTable(
+                                reinterpret_cast<PVOID>(reinterpret_cast<uintptr_t>(tableBase) & ~(uintptr_t)0xFFFF),
+                                sizeOfImage, 0);
+                            DebugLog("[loader] ckpt: RtlInsertInvertedFunctionTable OK");
+                        } __except (EXCEPTION_EXECUTE_HANDLER) {
+                            DebugLog("[loader] ckpt: RtlInsertInvertedFunctionTable 触发异常(已吞掉)");
+                        }
+                    } else {
+                        DebugLog("[loader] ckpt: RtlInsertInvertedFunctionTable 未解析到");
+                    }
+                } else {
+                    DebugLog("[loader] ckpt: 跳过 RtlInsertInvertedFunctionTable (默认关闭)");
                 }
             }
         }
@@ -188,11 +210,16 @@ public:
         // P2.4：覆写内存 PE 头（此时数据页仍为 READWRITE，可安全写入），
         //        对抗 Scylla/ImpRec 自动脱壳。头信息在修复阶段已读取完毕，覆写无副作用。
         //        非连续模式下 PE 头位于数据块内（数据页不执行，更隐蔽）。
-        if (dataBlockBase) ManualPeLoader::CorruptHeader(dataBlockBase);
+        if (dataBlockBase) {
+            DebugLog("[loader] ckpt: 覆写内存 PE 头 (CorruptHeader)");
+            ManualPeLoader::CorruptHeader(dataBlockBase);
+        }
 
         // ---- 门控：代码页重新加密 + NOACCESS；数据页保留明文 ----
+        DebugLog("[loader] ckpt: 进入门控循环 pages=%u", pageCount);
         for (uint32_t i = 0; i < pageCount; i++) {
             if (pages[i].isCode) {
+                DebugLog("[loader] ckpt: 门控代码页 i=%u", i);
                 // 修复（重定位/导入）已完成，先记录运行期基准 CRC，再重新加密。
                 // 这样后续“解密即校验”比对的是修复后的真实代码，而非打包期
                 // 原始镜像（否则重定位差异会误触发自毁）。
@@ -200,18 +227,19 @@ public:
                     reinterpret_cast<const unsigned char*>(pageBase[i]),
                     pageSize);
                 if (!reencryptPageLocked(i)) { DebugLog("[loader] 重加密代码页 i=%u 失败", i); return false; }
+                DebugLog("[loader] ckpt: 代码页 i=%u 已重加密+NOACCESS", i);
             } else {
                 DWORD old = 0;
                 // 数据页保持可读写（非执行），不门控
                 SIZE_T sz = pageSize;
-                Sys::ProtectVirtualMemory(GetCurrentProcess(),
-                    &reinterpret_cast<PVOID>(reinterpret_cast<uintptr_t>(pageBase[i])),
-                    &sz, PAGE_READWRITE, &old);
+                PVOID p = pageBase[i];
+                Sys::ProtectVirtualMemory(GetCurrentProcess(), &p, &sz, PAGE_READWRITE, &old);
                 pages[i].decrypted = true;
             }
         }
 
         // ---- 注册 VEH（按需解密，最高优先级） ----
+        DebugLog("[loader] ckpt: 注册 VEH 前");
         g_instance = this;
         vehHandle = AddVectoredExceptionHandler(1, &PagedLoader::VehHandler);
 
@@ -219,9 +247,11 @@ public:
         dumpMon.Init();
 
         // ---- 启动监控线程（重加密 + 钩子扫描 + 自校验） ----
+        DebugLog("[loader] ckpt: 启动监控线程前");
         stopMonitor = false;
         monitorThread = CreateThread(nullptr, 0, &PagedLoader::MonitorThreadProc,
                                      this, 0, nullptr);
+        DebugLog("[loader] ckpt: 监控线程已启动 hwnd=%p", (void*)monitorThread);
 
         outEntryRva = opt.AddressOfEntryPoint;
         DebugLog("[loader] Load 成功: pages=%u nonContig=%d entryRva=0x%llX",
@@ -396,11 +426,14 @@ private:
     bool reencryptPageLocked(uint32_t i)
     {
         unsigned char* dst = reinterpret_cast<unsigned char*>(pageBase[i]);
+        DebugLog("[loader] ckpt: reencrypt i=%u 置NOACCESS前", i);
         PVOID p = dst; SIZE_T sz = pageSize; ULONG old = 0;
         Sys::ProtectVirtualMemory(GetCurrentProcess(), &p, &sz, PAGE_NOACCESS, &old);
         pages[i].decrypted = false; // 先标记加密态，避免 VEH/其它线程读到半成品
+        DebugLog("[loader] ckpt: reencrypt i=%u 加密写回前", i);
         if (!cipher->encryptPage(dst, i, dst, pageSize))
             return false;
+        DebugLog("[loader] ckpt: reencrypt i=%u 完成", i);
         return true;
     }
 
