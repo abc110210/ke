@@ -29,6 +29,7 @@ jobs:
           $out = ".\packed_app.exe"
           if (-not (Test-Path $out)) { throw "未找到 $out" }
           $env:PEARMOR_DEBUG = "1"   # 开启壳内调试日志
+          $env:PEARMOR_ALLOW_VM = "1"  # CI runner 本身是 Azure VM 且系统盘<30GB，放行 VM 检测
           # 带超时运行：防止反调试/挂起导致 runner 被占几小时
           $timeoutSec = 30
           $p = Start-Process -FilePath $out -PassThru -RedirectStandardError "stderr.txt"
