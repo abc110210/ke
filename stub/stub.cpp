@@ -104,34 +104,69 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int)
 
     // 1.1) 从自身 PE 文件末尾读取 overlay 负载（stub 是负载无关的固定运行时，
     //      密文由加壳器运行时拼接，无需重新编译）
+    // 注意：此处【内联实现】完整读取逻辑（最大共享 + 重试 + 逐段校验），不依赖
+    // overlay.h 的 LoadFromSelf——CI 48 实测：同样的逻辑写在 stub.cpp 里 100% 成功，
+    // 写在 overlay.h 里却失败（疑 CI 编译的 overlay.h 为旧版/增量构建未重编）。
     pearmor::Overlay::Footer meta = {};
     std::vector<unsigned char> payload, indexEnc;
-    if (!pearmor::Overlay::LoadFromSelf(payload, indexEnc, meta)) {
-        // 分步重放 LoadFromSelf 的完整逻辑，打印每步结果 → 定位具体失败点
-        // （CI 47 实测：二次读 magic 正确 = 文件 footer 完好且能打开，但 LoadFromSelf 仍 false，
-        //   说明失败在内部更深步骤：SetFilePointerEx / ReadFile(80B) / magic 比较。）
+    bool overlayOk = false;
+    {
+        wchar_t path[MAX_PATH] = {0};
+        GetModuleFileNameW(nullptr, path, MAX_PATH);
+        HANDLE h = INVALID_HANDLE_VALUE;
+        for (int attempt = 0; attempt < 5 && h == INVALID_HANDLE_VALUE; attempt++) {
+            h = CreateFileW(path, GENERIC_READ,
+                            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr,
+                            OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+            if (h == INVALID_HANDLE_VALUE) Sleep(100);  // 扛杀软/实时扫描短暂锁
+        }
+        bool ok = (h != INVALID_HANDLE_VALUE);
+        LARGE_INTEGER fsz = {0};
+        if (ok) ok = (GetFileSizeEx(h, &fsz) && fsz.QuadPart > 80);
+        if (ok) {
+            LARGE_INTEGER off; off.QuadPart = fsz.QuadPart - 80;
+            ok = SetFilePointerEx(h, off, nullptr, FILE_BEGIN);
+            DWORD rd = 0;
+            if (ok) ok = (ReadFile(h, &meta, 80, &rd, nullptr) && rd == 80);
+            if (ok) ok = (meta.magic == pearmor::Overlay::kMagic &&
+                          meta.version == pearmor::Overlay::kVersion);
+            if (ok) {
+                uint64_t indexOff   = (uint64_t)fsz.QuadPart - 80;
+                uint64_t payloadOff = indexOff - (uint64_t)meta.indexLen - (uint64_t)meta.payloadLen;
+                ok = (payloadOff <= indexOff);
+                if (ok) {
+                    payload.resize(meta.payloadLen);
+                    LARGE_INTEGER po; po.QuadPart = (LONGLONG)payloadOff;
+                    DWORD rd2 = 0;
+                    ok = SetFilePointerEx(h, po, nullptr, FILE_BEGIN) &&
+                         ReadFile(h, payload.data(), meta.payloadLen, &rd2, nullptr) &&
+                         rd2 == meta.payloadLen;
+                }
+                if (ok) {
+                    indexEnc.resize(meta.indexLen);
+                    LARGE_INTEGER io; io.QuadPart = (LONGLONG)indexOff;
+                    DWORD rd3 = 0;
+                    ok = SetFilePointerEx(h, io, nullptr, FILE_BEGIN) &&
+                         ReadFile(h, indexEnc.data(), meta.indexLen, &rd3, nullptr) &&
+                         rd3 == meta.indexLen;
+                }
+            }
+        }
+        if (h != INVALID_HANDLE_VALUE) CloseHandle(h);
+        overlayOk = ok;
+    }
+    if (!overlayOk) {
+        // 失败诊断：打印自身文件路径 + 大小 + 已读到的 footer 首字段，一眼区分失败原因
         wchar_t selfPath[MAX_PATH] = {0};
         GetModuleFileNameW(nullptr, selfPath, MAX_PATH);
-        HANDLE h3 = CreateFileW(selfPath, GENERIC_READ,
-                                FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr,
-                                OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
-        DWORD lastErr = GetLastError();
-        bool created = (h3 != INVALID_HANDLE_VALUE);
-        bool gotSize = false; LARGE_INTEGER fsz3 = {0};
-        bool seeked = false; bool read3 = false; DWORD rd3 = 0;
-        pearmor::Overlay::Footer f3 = {};
-        if (created) {
-            gotSize = GetFileSizeEx(h3, &fsz3);
-            LARGE_INTEGER off3;
-            off3.QuadPart = fsz3.QuadPart - (LONGLONG)sizeof(pearmor::Overlay::Footer);
-            seeked = SetFilePointerEx(h3, off3, nullptr, FILE_BEGIN);
-            read3 = (ReadFile(h3, &f3, (DWORD)sizeof(pearmor::Overlay::Footer), &rd3, nullptr) != FALSE);
-            CloseHandle(h3);
-        }
-        DebugLog("[stub] overlay 读取分步诊断: Create=%d(Err=%lu) GetSize=%d(%lld) Seek=%d Read=%d(rd=%u) magic=0x%llX ver=%u",
-                 (int)created, lastErr, (int)gotSize, (long long)fsz3.QuadPart,
-                 (int)seeked, (int)read3, rd3,
-                 (unsigned long long)f3.magic, (unsigned)f3.version);
+        LONGLONG fsz = -1;
+        WIN32_FILE_ATTRIBUTE_DATA fad = {0};
+        if (GetFileAttributesExW(selfPath, GetFileExInfoStandard, &fad))
+            fsz = ((LONGLONG)fad.nFileSizeHigh << 32) | fad.nFileSizeLow;
+        DebugLog("[stub] overlay 读取失败：自身文件=%ls 大小=%lld magic=0x%llX ver=%u pageCount=%u payloadLen=%u",
+                 selfPath, fsz,
+                 (unsigned long long)meta.magic, (unsigned)meta.version,
+                 (unsigned)meta.pageCount, (unsigned)meta.payloadLen);
         fprintf(stderr, "[stub] 未加壳的运行时，请使用 pearmor 加壳器生成成品\n");
         return -4;
     }
