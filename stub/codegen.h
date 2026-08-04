@@ -34,6 +34,11 @@ struct Rng {
 // 混合操作顺序由 rng 决定，使每次生成的机器码指令序列不同。
 static uint8_t* EmitFingerprint(uint8_t* p, Rng& rng, uint32_t secret)
 {
+    // 参数搬运（微软 x64 调用约定：rcx=data, rdx=count）：
+    // 循环体用 r8 作数据指针、r9 作元素计数，需先把 rcx/rdx 搬过来，
+    // 否则 r8/r9 是调用前的残留垃圾值（从随机地址读取 / 循环上限错乱）。
+    *p++ = 0x4C; *p++ = 0x89; *p++ = 0xC8;   // mov r8, rcx
+    *p++ = 0x4C; *p++ = 0x89; *p++ = 0xD1;   // mov r9, rdx
     // rax = secret（初始种子）
     *p++ = 0xB8; memcpy(p, &secret, 4); p += 4;
     // r10 = 0（计数器）
@@ -94,7 +99,7 @@ inline bool RunOnce(uint32_t* outFingerprint = nullptr)
         uint32_t secret = (uint32_t)(rng.next() & 0xFFFFFFFF);
         EmitFingerprint(code, rng, secret);
         using Fn = uint32_t(*)(const uint32_t*, size_t);
-        uint32_t fp = reinterpret_cast<Fn>(code)(sample, 8 * sizeof(uint32_t));
+        uint32_t fp = reinterpret_cast<Fn>(code)(sample, 8);
         memset(mem, 0xCC, 0x1000);                     // 用后清零 RWX 页
         SIZE_T z = 0;
         Sys::FreeVirtualMemory(GetCurrentProcess(), &mem, &z);
