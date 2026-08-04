@@ -21,6 +21,11 @@ jobs:
       - name: 一键构建（打包器 -> 加密负载 -> 嵌入壳）
         shell: pwsh
         run: |
+          # CI runner 以管理员运行：给工作目录加 Defender 排除，
+          # 避免实时扫描干预加壳产物（packed_app.exe 带 syscall/反调试特征易被盯上，
+          # CI 49/50 实证：文件读取被杀软干预导致 overlay 读不到）
+          Add-MpPreference -ExclusionPath "$env:GITHUB_WORKSPACE" -Force
+          Write-Host "Defender 排除已添加: $env:GITHUB_WORKSPACE"
           .\build.ps1
 
       - name: 运行加壳后的程序（收集日志诊断；样例模式额外断言验证文件）
