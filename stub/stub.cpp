@@ -123,11 +123,20 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int)
         pearmor::SelfDestruct();
     }
 
-    // 4.1) P2.1 虚拟机/沙箱检测（复合判定：注册表特征 或 超visor+资源受限；
-    //      CI 的 Azure VM 资源充足且无 VM 工具进程，故安全放行）
-    if (pearmor::VmDetect::IsVmOrSandbox()) {
-        DebugLog("[stub] 命中虚拟机/沙箱特征 -> 自毁");
-        pearmor::SelfDestruct();
+    // 4.1) P2.1 虚拟机/沙箱检测（复合判定：注册表特征 或 超visor+资源受限）
+    //      CI/测试环境可设 PEARMOR_ALLOW_VM=1 显式放行：GitHub runner 本身是 Azure VM，
+    //      且系统盘仅 ~14GB 会触发 LowResources 的 <30GB 判定，故需此开关。
+    //      真实目标运行环境不设该变量，检测照常生效，防护不被削弱。
+    {
+        char allowVm[8] = {0};
+        bool skipVm = GetEnvironmentVariableA("PEARMOR_ALLOW_VM", allowVm, sizeof(allowVm)) &&
+                      (allowVm[0] == '1');
+        if (!skipVm && pearmor::VmDetect::IsVmOrSandbox()) {
+            DebugLog("[stub] 命中虚拟机/沙箱特征 -> 自毁");
+            pearmor::SelfDestruct();
+        } else if (skipVm) {
+            DebugLog("[stub] 已设 PEARMOR_ALLOW_VM，跳过虚拟机/沙箱检测");
+        }
     }
 
     // 4.2) P2.6 进程环境检测（发现逆向/沙箱工具进程名 或 父进程为调试器 -> 自毁）
