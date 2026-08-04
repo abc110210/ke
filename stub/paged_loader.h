@@ -206,36 +206,15 @@ public:
             ManualPeLoader::RunTlsCallbacks(workBase, opt);
 
         // ---- 注册异常展开表（RUNTIME_FUNCTION / .pdata）----
-        // 手动映射的镜像其 .pdata 不会被系统自动识别，导致 payload 内（或 CRT 内）抛出的
-        // C++ 异常无法展开，表现为未捕获的 0xE06D7363 直接崩进程（CI 35 实测：崩在 payload
-        // 执行期，退出码 0xE06D7363）。真实目标多为含异常的 C++ 程序，必须支持异常展开。
-        // 自 CI 26 起入口页改为「直接 call」进入（不再对入口页门控/VEH 恢复），展开上下文与
-        // 正常 call 链一致；CI 25 的 0xC0000005 正是「VEH 缺页跳入入口」导致入口帧 RIP 不在
-        // 函数边界、展开器踩非法内存，现该前提已消除，故此处【注册】函数表是安全的。
-        // 仅连续回退模式（imageBase 有效）注册；非连续模式页分散，pdata 的 RVA 无法统一重定位，
-        // 保持跳过（PEARMOR_NONCONTIG 默认关，不影响主流路径）。
-        {
-            DWORD pdataRva = opt.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXCEPTION].VirtualAddress;
-            DWORD pdataSz  = opt.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXCEPTION].Size;
-            if (pdataRva && pdataSz && imageBase) {
-                uintptr_t ntdllBase = getLoadedModuleBase(L"ntdll.dll");
-                using pRtlAddFunctionTable = BOOLEAN(NTAPI*)(PRUNTIME_FUNCTION, DWORD, DWORD64);
-                auto* RtlAddFunctionTable =
-                    reinterpret_cast<pRtlAddFunctionTable>(peExportAddress(ntdllBase, "RtlAddFunctionTable"));
-                if (RtlAddFunctionTable) {
-                    PRUNTIME_FUNCTION tbl = reinterpret_cast<PRUNTIME_FUNCTION>(
-                        reinterpret_cast<unsigned char*>(imageBase) + pdataRva);
-                    DWORD count = (DWORD)(pdataSz / sizeof(RUNTIME_FUNCTION));
-                    BOOLEAN ok = RtlAddFunctionTable(tbl, count, (DWORD64)(uintptr_t)imageBase);
-                    DebugLog("[loader] ckpt: RtlAddFunctionTable %s (count=%u base=%p)",
-                             ok ? "OK" : "失败", count, imageBase);
-                } else {
-                    DebugLog("[loader] ckpt: RtlAddFunctionTable 未解析到(ntdll 导出缺失?)");
-                }
-            } else {
-                DebugLog("[loader] ckpt: 无 .pdata 或 imageBase 为空，跳过 RtlAddFunctionTable");
-            }
-        }
+        // 实测结论（CI 36）：注册 RtlAddFunctionTable 反而导致「C++ 异常展开死循环」，
+        // 最终以 0xC0000005 终止——因为手动映射镜像的 .pdata 不完整（本样例仅 2 条
+        // RUNTIME_FUNCTION，见下方诊断），展开器读到无效 UnwindData 后反复重抛无法收敛。
+        // 根因：payload 被手动映射后，其 .pdata 与运行时基址的对应、以及 .xdata 完整性，
+        // 在当前架构下未被正确建立。这也意味着「真实 C++ 目标」的异常展开支持尚未就绪，
+        // 需后续单独立项（正确搬运并注册 .pdata/.xdata，且要覆盖编译期生成的全部条目）。
+        // 当前 CI 验证目标是「加载+按需解密+OEP 执行」，payload 为纯 Win32 无 C++ 异常需求，
+        // 故此处【保持跳过 RtlAddFunctionTable】，避免引入展开死循环。
+        DebugLog("[loader] ckpt: 跳过 RtlAddFunctionTable 注册（避免展开死循环 0xC0000005，见 CI 36）");
 
         imageSize = sizeOfImage;
 
@@ -567,14 +546,27 @@ private:
         // 诊断钩子：C++ 异常(0xE06D7363)在展开前于 VEH 层截获并记录抛点模块，
         // 便于 CI 定位（无需依赖 .pdata 展开）。不吞异常，继续搜索让进程以该退出码终止。
         if (rec->ExceptionCode == 0xE06D7363) {
-            void* addr = rec->ExceptionAddress;
-            char mod[256] = {0};
-            HMODULE hMod = nullptr;
-            if (GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
-                                   GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
-                                   reinterpret_cast<LPCWSTR>(addr), &hMod) && hMod)
-                GetModuleFileNameA(hMod, mod, sizeof(mod));
-            DebugLog("[veh] C++ 异常未捕获 code=0xE06D7363 addr=%p module=%s", addr, mod);
+            // 从异常上下文（RaiseException 内部）手动走栈，定位【真实抛点】。
+            // ExceptionAddress 落在 KERNELBASE!RaiseException，无参考价值；
+            // 真实 throw 在其上方几帧（payload 自身代码 / payload 的 CRT）。
+            // 手动按"叶子帧"近似推进 Rsp（无 pdata 时与 RtlUnwindEx 行为一致）：
+            //   #0 = _CxxThrowException（msvcrt）→ #1 = 实际 throw 站点 → #2 = 调用者。
+            uintptr_t rsp = ep->ContextRecord->Rsp;
+            for (int d = 0; d < 12; d++) {
+                uintptr_t ret = 0;
+                __try { ret = *reinterpret_cast<volatile uintptr_t*>(rsp); }
+                __except (EXCEPTION_EXECUTE_HANDLER) { ret = 0; }
+                if (!ret || ret == (uintptr_t)-1) break;
+                char mod[256] = {0};
+                HMODULE hMod = nullptr;
+                if (GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+                                       GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                                       reinterpret_cast<LPCWSTR>(ret), &hMod) && hMod)
+                    GetModuleFileNameA(hMod, mod, sizeof(mod));
+                DebugLog("[veh]   #%d ret=%p module=%s", d, reinterpret_cast<void*>(ret), mod);
+                rsp += 8;
+            }
+            DebugLog("[veh] C++ 异常未捕获 code=0xE06D7363 (真实抛点在上方栈帧，#1 通常为 payload 自身)");
             return EXCEPTION_CONTINUE_SEARCH;
         }
         if (rec->ExceptionCode != EXCEPTION_ACCESS_VIOLATION)
