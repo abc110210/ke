@@ -313,10 +313,13 @@ public:
 
         // P2.4：覆写内存 PE 头（此时数据页仍为 READWRITE，可安全写入），
         //        对抗 Scylla/ImpRec 自动脱壳。头信息在修复阶段已读取完毕，覆写无副作用。
-        //        非连续模式下 PE 头位于数据块内（数据页不执行，更隐蔽）。
-        if (dataBlockBase) {
-            DebugLog("[loader] ckpt: 覆写内存 PE 头 (CorruptHeader)");
-            ManualPeLoader::CorruptHeader(dataBlockBase);
+        //        非连续模式：PE 头在数据块内（dataBlockBase）；连续回退模式：在 imageBase 开头。
+        //        【CI 42 后补齐】此前仅 dataBlockBase（非连续）触发，连续回退模式（当前默认）
+        //        下一直未执行 —— 改为两模式都覆写。
+        void* headerTarget = dataBlockBase ? dataBlockBase : imageBase;
+        if (headerTarget) {
+            DebugLog("[loader] ckpt: 覆写内存 PE 头 (CorruptHeader) target=%p", headerTarget);
+            ManualPeLoader::CorruptHeader(headerTarget);
         }
 
         // ---- 门控：代码页重新加密 + NOACCESS；数据页保留明文 ----
