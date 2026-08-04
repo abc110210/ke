@@ -533,22 +533,43 @@ public:
             return true;
         }
         auto* tls = reinterpret_cast<IMAGE_TLS_DIRECTORY64*>(base + dir.VirtualAddress);
+        uintptr_t aoc = static_cast<uintptr_t>(tls->AddressOfCallBacks);
         DebugLog("[loader] TLS 回调 tls=%p AddressOfCallBacks=0x%llX",
                  (void*)tls, (unsigned long long)tls->AddressOfCallBacks);
-        if (!tls->AddressOfCallBacks) return true;
-        // 【CI 55 根因】TLS 目录的 AddressOfCallBacks 是【链接时 VA】（按 preferredBase 算），
-        // 重定位表不覆盖 PE 头里的 TLS 目录 → 手动加载后必须按 delta 修正到实际基址，
-        // 否则指向 0x140000000 未映射区 → 崩溃地址超镜像（workBase+0x354BC0）。
+        if (!aoc) return true;
+        // 【CI 55/58 根因】AddressOfCallBacks 是【链接时 VA】（按 preferredBase 算），但
+        // TLS 目录结构在 .rdata 节内 → ApplyRelocations 已把它修正到 imageBase 基址
+        // （CI 58 实测值 0x234...=imageBase 形式）。不能无条件 +delta（会二次修正）。
+        // 三段判断：已修正(imageBase 区间)直接用 / 未修正(preferredBase 区间)+delta / 都超则跳过。
         uintptr_t pref  = opt.ImageBase;
         uintptr_t delta = reinterpret_cast<uintptr_t>(imageBase) - pref;
-        uint64_t* cb = reinterpret_cast<uint64_t*>(tls->AddressOfCallBacks + delta);
+        uintptr_t cbAddr = 0;
+        if (aoc >= reinterpret_cast<uintptr_t>(imageBase) &&
+            aoc < reinterpret_cast<uintptr_t>(imageBase) + opt.SizeOfImage)
+            cbAddr = aoc;                                  // 已重定位修正
+        else if (aoc >= pref && aoc < pref + opt.SizeOfImage)
+            cbAddr = aoc + delta;                          // 仍是链接时 VA
+        else {
+            DebugLog("[loader] TLS 回调跳过: AddressOfCallBacks=0x%llX 超镜像范围", (unsigned long long)aoc);
+            return true;
+        }
+        // 防御：回调数组必须 COMMIT 可读，否则跳过（CI 58：修正后 cb 指向镜像外 → 读崩）
+        MEMORY_BASIC_INFORMATION mbiCb = {};
+        if (VirtualQuery(reinterpret_cast<LPCVOID>(cbAddr), &mbiCb, sizeof(mbiCb)) == 0 ||
+            mbiCb.State != MEM_COMMIT ||
+            (mbiCb.Protect & (PAGE_READONLY | PAGE_READWRITE | PAGE_WRITECOPY |
+                              PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY)) == 0) {
+            DebugLog("[loader] TLS 回调跳过: 回调数组不可读 cb=%p", (void*)cbAddr);
+            return true;
+        }
         // 【CI 56】回调执行前临时把镜像置为可执行：门控前代码页还是 RW，
         // 执行回调代码会被 DEP/NX 拦截 → 0xC0000005（崩溃地址落在 stub 模块附近）。
         // 执行完由门控循环重新设置各页保护。
         DWORD oldProt = 0;
         VirtualProtect(imageBase, opt.SizeOfImage, PAGE_EXECUTE_READWRITE, &oldProt);
-        DebugLog("[loader] TLS 回调: 修正后cb=%p cb[0]=0x%llX",
-                 (void*)cb, (unsigned long long)(cb ? *cb : 0));
+        uint64_t* cb = reinterpret_cast<uint64_t*>(cbAddr);
+        DebugLog("[loader] TLS 回调: cb=%p cb[0]=0x%llX", (void*)cb,
+                 (unsigned long long)(cb ? *cb : 0));
         for (uint32_t i = 0; cb[i]; i++) {
             uintptr_t callAddr = static_cast<uintptr_t>(cb[i]);
             // 若回调地址仍是链接时 VA（preferredBase 区间）→ 手动 +delta 修正
