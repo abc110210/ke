@@ -54,11 +54,17 @@ jobs:
           if (-not (Test-Path ".\pearmor_payload_ran.txt")) { throw "样例未生成验证文件：OEP 未执行" }
           Get-Content ".\pearmor_payload_ran.txt"
 
-      - name: 上传工件（加壳后的 EXE + 打包器）
+      - name: 上传工件（加壳后的 EXE + 打包器 + 壳运行时）
         uses: actions/upload-artifact@v4
         with:
           name: pearmor-artifacts
+          # packed_app.exe：样例成品（验证用）
+          # pearmor-packer.exe：加壳器（对任意 exe 加壳）
+          # pearmor-stub.exe：负载无关的壳运行时模板（packer 默认同目录自动找它）
+          # 三者放同一目录后，本地运行 `pearmor-packer <任意程序.exe>` 即可一键加壳，
+          # 无需本地 MSVC。注意路径是 build/Release/（非 build/packer/Release/，曾写错导致漏传）。
           path: |
             packed_app.exe
-            build/packer/Release/pearmor-packer.exe
+            build/Release/pearmor-packer.exe
+            build/Release/pearmor-stub.exe
           if-no-files-found: error
