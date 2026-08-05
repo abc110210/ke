@@ -66,13 +66,19 @@ struct IconCtx {
     bool ok = false;
 };
 
+// 资源类型常量：RT_GROUP_ICON=14 / RT_ICON=3（显式 W 版。
+// 不能直接用宏 RT_GROUP_ICON/RT_ICON——本文件 ANSI 构建下它们展开为 LPSTR，
+// 而资源 API 用 W 版（FindResourceW/UpdateResourceW/EnumResourceNamesW）需 LPCWSTR，C2664。）
+static const LPCWSTR kRtGroupIcon = (LPCWSTR)(ULONG_PTR)14; // RT_GROUP_ICON
+static const LPCWSTR kRtIcon     = (LPCWSTR)(ULONG_PTR)3;   // RT_ICON
+
 // 枚举回调：处理第一个 RT_GROUP_ICON（主图标），把 group + 其引用的全部 RT_ICON
 // 用 UpdateResource 注入到 dst（BeginUpdateResource 后逐项写入，再 EndUpdateResource 提交）。
 // 若任何一步失败则放弃（不致命，调用方保持成品无图标即可）。
 static BOOL CALLBACK enumGroupIcon(HMODULE h, LPCWSTR /*type*/, LPWSTR name, LONG_PTR lp)
 {
     auto* ctx = reinterpret_cast<IconCtx*>(lp);
-    HRSRC grs = FindResourceW(h, name, RT_GROUP_ICON);
+    HRSRC grs = FindResourceW(h, name, kRtGroupIcon);
     HGLOBAL gh = grs ? LoadResource(h, grs) : nullptr;
     DWORD gsz = grs ? SizeofResource(h, grs) : 0;
     void* gdata = gh ? LockResource(gh) : nullptr;
@@ -87,15 +93,15 @@ static BOOL CALLBACK enumGroupIcon(HMODULE h, LPCWSTR /*type*/, LPWSTR name, LON
     HANDLE hu = BeginUpdateResourceW(ctx->dst, FALSE);
     if (!hu) return FALSE;
     bool any = false;
-    any |= (UpdateResourceW(hu, RT_GROUP_ICON, name,
+    any |= (UpdateResourceW(hu, kRtGroupIcon, name,
                             MAKELANGID(LANG_NEUTRAL, SUBLANG_NEUTRAL), gdata, gsz) != FALSE);
     for (WORD id : ids) {
-        HRSRC irs = FindResourceW(h, MAKEINTRESOURCE(id), RT_ICON);
+        HRSRC irs = FindResourceW(h, MAKEINTRESOURCEW(id), kRtIcon);
         HGLOBAL ih = irs ? LoadResource(h, irs) : nullptr;
         DWORD isz = irs ? SizeofResource(h, irs) : 0;
         void* idata = ih ? LockResource(ih) : nullptr;
         if (!idata) continue;
-        any |= (UpdateResourceW(hu, RT_ICON, MAKEINTRESOURCE(id),
+        any |= (UpdateResourceW(hu, kRtIcon, MAKEINTRESOURCEW(id),
                                 MAKELANGID(LANG_NEUTRAL, SUBLANG_NEUTRAL), idata, isz) != FALSE);
     }
     ctx->ok = (any && EndUpdateResourceW(hu, FALSE) != FALSE);
@@ -109,7 +115,7 @@ static bool copyIconFromSource(const wchar_t* srcPath, const wchar_t* dstPath)
     HMODULE h = LoadLibraryExW(srcPath, nullptr, LOAD_LIBRARY_AS_DATAFILE);
     if (!h) return false;
     IconCtx ctx{ dstPath, false };
-    EnumResourceNamesW(h, RT_GROUP_ICON, enumGroupIcon, reinterpret_cast<LONG_PTR>(&ctx));
+    EnumResourceNamesW(h, kRtGroupIcon, enumGroupIcon, reinterpret_cast<LONG_PTR>(&ctx));
     FreeLibrary(h);
     return ctx.ok;
 }
