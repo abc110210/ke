@@ -15,6 +15,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <cstdint>
 #include <string>
 #include <vector>
 #pragma comment(lib, "bcrypt.lib")
@@ -49,6 +50,109 @@ static void writeFile(const char* path, const std::vector<unsigned char>& data) 
     if (fopen_s(&f, path, "wb") != 0 || !f) die("无法写输出文件");
     if (fwrite(data.data(), 1, data.size(), f) != data.size()) die("写输出文件失败");
     fclose(f);
+}
+
+// --- ANSI/UTF-8 多字节路径 → 宽字符（资源 API 用） ---
+static std::wstring utf8ToWide(const char* s) {
+    int n = MultiByteToWideChar(CP_ACP, 0, s, -1, nullptr, 0);
+    std::wstring w(n ? n - 1 : 0, L'\0');
+    if (n) MultiByteToWideChar(CP_ACP, 0, s, -1, &w[0], n);
+    return w;
+}
+
+// --- 图标搬运上下文（EnumResourceNames 回调用） ---
+struct IconCtx {
+    const wchar_t* dst;   // 目标文件（带 overlay 的成品副本）
+    bool ok = false;
+};
+
+// 枚举回调：处理第一个 RT_GROUP_ICON（主图标），把 group + 其引用的全部 RT_ICON
+// 用 UpdateResource 注入到 dst（BeginUpdateResource 后逐项写入，再 EndUpdateResource 提交）。
+// 若任何一步失败则放弃（不致命，调用方保持成品无图标即可）。
+static BOOL CALLBACK enumGroupIcon(HMODULE h, LPCWSTR /*type*/, LPWSTR name, LONG_PTR lp)
+{
+    auto* ctx = reinterpret_cast<IconCtx*>(lp);
+    HRSRC grs = FindResourceW(h, name, RT_GROUP_ICON);
+    HGLOBAL gh = grs ? LoadResource(h, grs) : nullptr;
+    DWORD gsz = grs ? SizeofResource(h, grs) : 0;
+    void* gdata = gh ? LockResource(gh) : nullptr;
+    if (!gdata || gsz < 6) return FALSE; // 无有效 group，放弃
+
+    // 解析 group 内引用的 RT_ICON ID 列表（GRPICONDIRENTRY 14B/个，nID 在 +12）
+    std::vector<WORD> ids;
+    WORD count = *(WORD*)((BYTE*)gdata + 4);
+    for (WORD i = 0; i < count && 6 + (DWORD)i * 14 + 14 <= gsz; i++)
+        ids.push_back(*(WORD*)((BYTE*)gdata + 6 + i * 14 + 12));
+
+    HANDLE hu = BeginUpdateResourceW(ctx->dst, FALSE);
+    if (!hu) return FALSE;
+    bool any = false;
+    any |= (UpdateResourceW(hu, RT_GROUP_ICON, name,
+                            MAKELANGID(LANG_NEUTRAL, SUBLANG_NEUTRAL), gdata, gsz) != FALSE);
+    for (WORD id : ids) {
+        HRSRC irs = FindResourceW(h, MAKEINTRESOURCE(id), RT_ICON);
+        HGLOBAL ih = irs ? LoadResource(h, irs) : nullptr;
+        DWORD isz = irs ? SizeofResource(h, irs) : 0;
+        void* idata = ih ? LockResource(ih) : nullptr;
+        if (!idata) continue;
+        any |= (UpdateResourceW(hu, RT_ICON, MAKEINTRESOURCE(id),
+                                MAKELANGID(LANG_NEUTRAL, SUBLANG_NEUTRAL), idata, isz) != FALSE);
+    }
+    ctx->ok = (any && EndUpdateResourceW(hu, FALSE) != FALSE);
+    return FALSE; // 只处理第一个 group（主图标）
+}
+
+// 搬运图标：把 srcPath 的主图标注入 dstPath（dstPath 必须是可写的 PE 文件）。
+// 返回 true 表示成功注入（或源无图标返回 false，调用方可忽略）。
+static bool copyIconFromSource(const wchar_t* srcPath, const wchar_t* dstPath)
+{
+    HMODULE h = LoadLibraryExW(srcPath, nullptr, LOAD_LIBRARY_AS_DATAFILE);
+    if (!h) return false;
+    IconCtx ctx{ dstPath, false };
+    EnumResourceNamesW(h, RT_GROUP_ICON, enumGroupIcon, reinterpret_cast<LONG_PTR>(&ctx));
+    FreeLibrary(h);
+    return ctx.ok;
+}
+
+// 给成品注入原 exe 图标，且【不破坏 overlay】：
+// UpdateResource 重写 PE 文件时可能动到文件末尾附加数据（overlay=密文），不能赌系统行为。
+// 安全做法：对成品副本注入图标 → 校验副本末尾 overlay footer magic 仍在 → 在才替换成品。
+static void attachSourceIcon(const char* inPath, const char* outPath)
+{
+    std::string tmp = std::string(outPath) + ".icon.tmp";
+    if (!CopyFileA(outPath, tmp.c_str(), FALSE)) {
+        fprintf(stderr, "[packer] 警告: 图标搬运失败（无法复制副本）\n");
+        return;
+    }
+    std::wstring wSrc = utf8ToWide(inPath), wTmp = utf8ToWide(tmp.c_str());
+    bool injected = copyIconFromSource(wSrc.c_str(), wTmp.c_str());
+    if (!injected) {
+        DeleteFileA(tmp.c_str());
+        fprintf(stderr, "[packer] 图标搬运跳过（源无图标资源或注入失败）\n");
+        return;
+    }
+    // 校验副本末尾 overlay footer magic 是否保留（密文不能被 UpdateResource 吃掉）
+    FILE* f = nullptr;
+    if (fopen_s(&f, tmp.c_str(), "rb") == 0 && f) {
+        fseek(f, 0, SEEK_END);
+        long sz = ftell(f);
+        unsigned char magic[8] = {0};
+        if (sz >= (long)sizeof(pearmor::Overlay::Footer)) {
+            fseek(f, sz - (long)sizeof(pearmor::Overlay::Footer), SEEK_SET);
+            if (fread(magic, 1, 8, f) == 8) {}
+        }
+        fclose(f);
+        if (*(uint64_t*)magic == pearmor::Overlay::kMagic) {
+            // overlay 保留 → 用副本替换成品
+            if (CopyFileA(tmp.c_str(), outPath, FALSE))
+                printf("[packer] 已搬运原 exe 图标到成品（overlay 校验通过）\n");
+            else
+                fprintf(stderr, "[packer] 警告: 图标写入成功但替换成品失败\n");
+        } else {
+            fprintf(stderr, "[packer] 警告: 图标注入破坏了 overlay（密文），已放弃图标，成品保持无图标\n");
+        }
+    }
+    DeleteFileA(tmp.c_str());
 }
 
 // --- 校验 stub 是合法 PE64（负载无关的运行时） ---
@@ -256,6 +360,10 @@ int main(int argc, char** argv)
         outPath = defOut.c_str();
     }
     writeFile(outPath, out);
+
+    // 搬运原 exe 图标到成品（让加壳后的软件保留原图标，用户无感知）。
+    // 只对副本操作 + overlay magic 校验，绝不冒险动密文。
+    attachSourceIcon(inPath, outPath);
 
     printf("[packer] 完成: %s -> %s (%zu 字节密文, %u 页, 入口 RVA=0x%X, overlay 拼接)\n",
         inPath, outPath, enc.size(), pageCount, entryRva);
