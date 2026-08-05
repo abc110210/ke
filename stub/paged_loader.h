@@ -310,15 +310,12 @@ public:
         }
 
         // ---- 注册异常展开表（RUNTIME_FUNCTION / .pdata）----
-        // 实测结论（CI 36）：注册 RtlAddFunctionTable 反而导致「C++ 异常展开死循环」，
-        // 最终以 0xC0000005 终止——因为手动映射镜像的 .pdata 不完整（本样例仅 2 条
-        // RUNTIME_FUNCTION，见下方诊断），展开器读到无效 UnwindData 后反复重抛无法收敛。
-        // 根因：payload 被手动映射后，其 .pdata 与运行时基址的对应、以及 .xdata 完整性，
-        // 在当前架构下未被正确建立。这也意味着「真实 C++ 目标」的异常展开支持尚未就绪，
-        // 需后续单独立项（正确搬运并注册 .pdata/.xdata，且要覆盖编译期生成的全部条目）。
-        // 当前 CI 验证目标是「加载+按需解密+OEP 执行」，payload 为纯 Win32 无 C++ 异常需求，
-        // 故此处【保持跳过 RtlAddFunctionTable】，避免引入展开死循环。
-        DebugLog("[loader] ckpt: 跳过 RtlAddFunctionTable 注册（避免展开死循环 0xC0000005，见 CI 36）");
+        // CI 36 教训：test_payload 的 .pdata 仅 2 条且不完整，注册导致展开死循环 0xC0000005。
+        // CI 65 实测：真实 C++ 目标（Hanbot）已能跑到自己代码深处并抛 C++ 异常（0xE06D7363），
+        // 但异常无法展开 → 未捕获崩溃——必须正确搬运并注册 payload 的 .pdata 才能展开。
+        // RegisterPdata 已含逐条防御校验（Begin/End/UnwindData RVA 越界则整体不注册），
+        // 覆盖链接器生成的全部条目，对真实目标的完整 .pdata 安全。
+        ManualPeLoader::RegisterPdata(workBase, opt);
 
         imageSize = sizeOfImage;
 

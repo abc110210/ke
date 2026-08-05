@@ -227,6 +227,28 @@ static bool SafeTlsMount(uintptr_t idxAddr, uintptr_t tplAddr,
     return true;
 }
 
+// 独立 SEH 辅助：调用 ntdll RtlAddFunctionTable 注册 .pdata 展开表。
+// 参数全 POD、内部才用 __try（C2712 安全）。注册后 FunctionTable 必须保持有效
+// （直接引用 payload 内存，payload 常驻故安全）。
+static BOOLEAN SafeRtlAddFunctionTable(PRUNTIME_FUNCTION table, DWORD count, DWORD64 imageBase)
+{
+    if (!table || !count) return FALSE;
+    using PFN = BOOLEAN (NTAPI*)(PRUNTIME_FUNCTION, DWORD, DWORD64);
+    static PFN pAdd = nullptr;
+    static bool resolved = false;
+    if (!resolved) {
+        HMODULE ntdll = GetModuleHandleA("ntdll.dll");
+        if (ntdll) pAdd = reinterpret_cast<PFN>(GetProcAddress(ntdll, "RtlAddFunctionTable"));
+        resolved = true;
+    }
+    if (!pAdd) return FALSE;
+    __try {
+        return pAdd(table, count, imageBase);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return FALSE;
+    }
+}
+
 // ============================================================================
 // 手动加载目标 PE（PE32+）
 // ============================================================================
@@ -607,6 +629,39 @@ public:
             return;
         }
         DebugLog("[loader] TLS 数据: size=0x%zX index=%u data=%p", tlsSize, tlsIndex, tlsData);
+    }
+
+    // ---------- .pdata 异常展开表注册 ----------
+    // 真实 C++ 目标（Hanbot）抛 C++ 异常（0xE06D7363）时，系统展开器（RtlUnwindEx）需要
+    // RtlLookupFunctionEntry 能查到【当前 RIP 所在函数】的展开数据。手动映射的 payload
+    // 不在系统模块表，默认查不到 → 异常无法展开 → 未捕获崩溃。解法：把 payload 的
+    // .pdata（RUNTIME_FUNCTION 数组，链接器生成、完整正确）用 RtlAddFunctionTable 注册。
+    // 【CI 36 教训】此前 test_payload 的 .pdata 仅 2 条且不完整 → 注册后展开死循环 0xC0000005。
+    // 本实现对每条做防御校验（Begin/End/UnwindData 实际 RVA 必须落在 SizeOfImage 内），
+    // 任一条越界则整体不注册（保守，避免引入死循环）。
+    static void RegisterPdata(void* imageBase, const IMAGE_OPTIONAL_HEADER64& opt)
+    {
+        auto& dir = opt.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXCEPTION];
+        if (!dir.VirtualAddress || dir.Size < sizeof(IMAGE_RUNTIME_FUNCTION_ENTRY)) {
+            DebugLog("[loader] .pdata: 无异常目录，跳过");
+            return;
+        }
+        DWORD count = dir.Size / sizeof(IMAGE_RUNTIME_FUNCTION_ENTRY);
+        BYTE* base = reinterpret_cast<BYTE*>(imageBase);
+        auto* rf = reinterpret_cast<IMAGE_RUNTIME_FUNCTION_ENTRY*>(base + dir.VirtualAddress);
+        for (DWORD i = 0; i < count; i++) {
+            // UnwindData 低 2 位是标志（chain 等），实际 RVA = UnwindData & ~3
+            DWORD uwd = rf[i].UnwindData & ~3u;
+            if (rf[i].BeginAddress >= opt.SizeOfImage ||
+                rf[i].EndAddress   >  opt.SizeOfImage ||
+                uwd >= opt.SizeOfImage) {
+                DebugLog("[loader] .pdata: 条目 %u 越界(Begin=0x%X End=0x%X Unwind=0x%X)，整体跳过注册",
+                         i, (unsigned)rf[i].BeginAddress, (unsigned)rf[i].EndAddress, (unsigned)uwd);
+                return;
+            }
+        }
+        BOOLEAN ok = SafeRtlAddFunctionTable(rf, count, reinterpret_cast<DWORD64>(imageBase));
+        DebugLog("[loader] .pdata 注册: count=%u base=%p ok=%d", count, imageBase, (int)ok);
     }
 
     // ---------- TLS 回调 ----------
