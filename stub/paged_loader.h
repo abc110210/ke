@@ -355,22 +355,21 @@ public:
             }
         }
 
-        // P2.4：覆写内存 PE 头（此时数据页仍为 READWRITE，可安全写入），
-        //        对抗 Scylla/ImpRec 自动脱壳。头信息在修复阶段已读取完毕，覆写无副作用。
-        //        非连续模式：PE 头在数据块内（dataBlockBase）；连续回退模式：在 imageBase 开头。
-        //        【CI 42 后补齐】此前仅 dataBlockBase（非连续）触发，连续回退模式（当前默认）
-        //        下一直未执行 —— 改为两模式都覆写。
-        //        【CI 60 隔离诊断】真实目标（Hanbot）CRT 初始化可能读自身 PE 头（资源/TLS/节表），
-        //        覆写后读到损坏头 → 初始化失败退出 0xC0000005。设 PEARMOR_NO_CORRUPT_HEADER=1 跳过，
-        //        用于隔离「CorruptHeader 破坏运行」vs「其它运行期问题」。
+        // P2.4：覆写内存 PE 头（此时数据页仍为 READWRITE，可安全写入），对抗 Scylla/ImpRec。
+        // 非连续模式：PE 头在数据块内（dataBlockBase）；连续回退模式：在 imageBase 开头。
+        // 【CI 71 本机诊断实锤】Hanbot 的 WndProc（USER32 消息回调）在处理消息时抛 C++ 异常
+        // → 跨 USER32 回调边界 → 本机弹 0xE06D7363 框 / CI fatal 0xC000041D。头号嫌疑即
+        // CorruptHeader：真实 GUI 目标运行期常读自身 PE 头/资源（GetModuleHandle+读头），
+        // 覆写后读到损坏头 → 抛异常。且 CI 60/61 判其「无关」是被当时导入错误掩盖。
+        // 【默认关闭】真实目标优先兼容；需要抗脱壳覆写时设 PEARMOR_CORRUPT_HEADER=1 开启。
         void* headerTarget = dataBlockBase ? dataBlockBase : imageBase;
-        char noCorrupt[8] = {0};
-        GetEnvironmentVariableA("PEARMOR_NO_CORRUPT_HEADER", noCorrupt, sizeof(noCorrupt));
-        if (headerTarget && noCorrupt[0] != '1') {
+        char doCorrupt[8] = {0};
+        GetEnvironmentVariableA("PEARMOR_CORRUPT_HEADER", doCorrupt, sizeof(doCorrupt));
+        if (headerTarget && doCorrupt[0] == '1') {
             DebugLog("[loader] ckpt: 覆写内存 PE 头 (CorruptHeader) target=%p", headerTarget);
             ManualPeLoader::CorruptHeader(headerTarget);
         } else if (headerTarget) {
-            DebugLog("[loader] ckpt: 跳过 CorruptHeader（PEARMOR_NO_CORRUPT_HEADER=1，诊断用）");
+            DebugLog("[loader] ckpt: 跳过 CorruptHeader（默认关闭：真实目标读自身 PE 头/资源，见 CI 71）");
         }
 
         // ---- 门控：代码页重新加密 + NOACCESS；数据页保留明文 ----
