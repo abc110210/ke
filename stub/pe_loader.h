@@ -194,6 +194,12 @@ static inline void* resolveExportFromBase(uintptr_t moduleBase, const char* expo
         const char* nm = reinterpret_cast<const char*>(moduleBase + names[i]);
         if (strcmp(nm, exportName) == 0) {
             DWORD fnRva = funcs[ords[i]];
+            // CI 63 诊断：自研解析成功时打印关键值，便于核对是否把名字字符串 RVA 当函数 RVA
+            DebugLog("[loader] 导出解析: %s -> rva=0x%X addr=%p (exp: funcs=0x%X names=0x%X ords=0x%X numF=%u numN=%u)",
+                     exportName, fnRva, reinterpret_cast<void*>(moduleBase + fnRva),
+                     (unsigned)exp->AddressOfFunctions, (unsigned)exp->AddressOfNames,
+                     (unsigned)exp->AddressOfNameOrdinals,
+                     (unsigned)exp->NumberOfFunctions, (unsigned)exp->NumberOfNames);
             return reinterpret_cast<void*>(moduleBase + fnRva);
         }
     }
@@ -413,6 +419,10 @@ public:
 
     // 解析系统 DLL 的单个导入项（名字或序数）：优先自研解析，失败退回 GetProcAddress。
     // ordinal != 0 表示序数导入；否则 name 是导入名（ASCII）。
+    // 【CI 63 根因防御】自研解析结果必须落在【可执行页】——CI 63 实测：解析出的
+    // SetEnvironmentVariableA 地址指向 KERNEL32 .rdata 的名字字符串（0xAAF6C，内容
+    // "SetEnvironmentVariableA\0"），取指即 0xC0000005。凡不可执行的结果一律丢弃并
+    // 退回 GetProcAddress（系统解析永远返回正确可执行地址），从根上消灭此类 bug。
     static void* ResolveSystemImport(uintptr_t hMod, const char* name, DWORD ordinal)
     {
         void* fn = nullptr;
@@ -421,11 +431,27 @@ public:
             char ordBuf[16];
             snprintf(ordBuf, sizeof(ordBuf), "#%u", ordinal);
             fn = resolveExportFromBase(hMod, ordBuf);
-            if (!fn && hDll)
-                fn = reinterpret_cast<void*>(GetProcAddress(hDll, MAKEINTRESOURCEA(ordinal)));
         } else {
             fn = resolveExportFromBase(hMod, name);
-            if (!fn && hDll)
+        }
+        // 可执行性校验：COMMIT 且页保护含 EXECUTE 位才可信（防名字字符串/数据区/垃圾地址）
+        if (fn) {
+            MEMORY_BASIC_INFORMATION mbi;
+            bool exec = (VirtualQuery(fn, &mbi, sizeof(mbi)) != 0 &&
+                         mbi.State == MEM_COMMIT &&
+                         (mbi.Protect & (PAGE_EXECUTE | PAGE_EXECUTE_READ |
+                                         PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY)) != 0);
+            if (!exec) {
+                DebugLog("[loader] 导入解析异常: %s=%p 不可执行(保护=0x%X), 退回 GetProcAddress",
+                         name ? name : "#(ord)", fn,
+                         (unsigned)(VirtualQuery(fn, &mbi, sizeof(mbi)) ? mbi.Protect : 0));
+                fn = nullptr;
+            }
+        }
+        if (!fn && hDll) {
+            if (ordinal)
+                fn = reinterpret_cast<void*>(GetProcAddress(hDll, MAKEINTRESOURCEA(ordinal)));
+            else
                 fn = reinterpret_cast<void*>(GetProcAddress(hDll, name));
         }
         return fn;
