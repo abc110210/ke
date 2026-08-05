@@ -45,6 +45,36 @@ static int CallRtlInsertInvertedFunctionTable(pRtlInsertInvertedFunctionTable fn
     }
 }
 
+// 独立 SEH 辅助：安全读取任意地址的内存（越界/不可读返回 0 字节）。
+// 参数全 POD、内部才用 __try（满足 C2712 约束）。用于诊断时 dump 崩溃点指令字节、
+// 读栈顶返回地址——这些地址可能是垃圾/不可读，直接解引用会二次 AV。
+static SIZE_T SafeReadBytes(uintptr_t addr, void* dst, SIZE_T want)
+{
+    if (!addr || !dst || !want) return 0;
+    __try {
+        memcpy(dst, reinterpret_cast<const void*>(addr), want);
+        return want;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return 0;
+    }
+}
+
+// 辅助：反查地址所属模块（模块名 + 模块内偏移）。诊断日志用，定位崩溃地址归属。
+// 不用 __try：GetModuleHandleExW(FROM_ADDRESS) 本身不因地址非法而崩溃。
+static void DescribeAddr(uintptr_t addr, char* modOut, size_t modOutSz, uintptr_t* modBaseOut)
+{
+    if (modOut && modOutSz) modOut[0] = 0;
+    if (modBaseOut) *modBaseOut = 0;
+    HMODULE hMod = nullptr;
+    if (GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+                           GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                           reinterpret_cast<LPCWSTR>(addr), &hMod) && hMod) {
+        if (modBaseOut) *modBaseOut = reinterpret_cast<uintptr_t>(hMod);
+        if (modOut && modOutSz)
+            GetModuleFileNameA(hMod, modOut, (DWORD)modOutSz);
+    }
+}
+
 // 正经走栈：从异常现场（通常停在 KERNELBASE!RaiseException 内）用 RtlVirtualUnwind 逐帧展开，
 // 只展开系统/CRT 帧（它们自带 .pdata，可正常展开），停在「进入 payload 的前一帧」——
 // 该帧的返回地址即 payload 内真实 throw 调用点（call _CxxThrowException 之下一条指令）。
@@ -687,9 +717,34 @@ private:
                 // CI 61：TopLevelHandler 可能被 Hanbot 覆盖（无 crash.log）——VEH 是第一机会，
                 // 在此记录 Hanbot 自身代码的 AV（RIP=执行指令，fault=被访问的无效地址），
                 // 即使末处理器失效也能定位崩点。
-                DebugLog("[veh] AV 不在镜像内: code=0x%08X addr=%p fault=0x%llX",
+                // CI 62：addr==fault 是【取指 AV】——执行了不可执行内存。0x7FF8... 高地址
+                // 疑系统模块/堆，但没打模块名判不了归属 → 补：模块反查 + RIP 指令 dump + 栈顶返回地址。
+                uintptr_t rip = reinterpret_cast<uintptr_t>(rec->ExceptionAddress);
+                char mod[256] = {0}; uintptr_t modBase = 0;
+                DescribeAddr(rip, mod, sizeof(mod), &modBase);
+                char modFault[256] = {0}; uintptr_t fBase = 0;
+                DescribeAddr(fault, modFault, sizeof(modFault), &fBase);
+                // RIP 处指令字节 dump（判断执行了 jmp/call/普通指令；不可读则全 0）
+                unsigned char ib[16] = {0};
+                SIZE_T nRead = SafeReadBytes(rip, ib, sizeof(ib));
+                // 栈顶返回地址（谁是调用者）
+                uintptr_t rsp = ep->ContextRecord->Rsp;
+                uintptr_t stackRet = 0, stackRet2 = 0;
+                SafeReadBytes(rsp, &stackRet, sizeof(stackRet));
+                SafeReadBytes(rsp + 8, &stackRet2, sizeof(stackRet2));
+                char modRet[256] = {0}; uintptr_t retBase = 0;
+                DescribeAddr(stackRet, modRet, sizeof(modRet), &retBase);
+                DebugLog("[veh] AV 不在镜像内: code=0x%08X addr=%p (%s%s 偏移=0x%llX) fault=%p (%s%s) RIP字节=%02X%02X%02X%02X%02X%02X%02X%02X | 栈顶=%p (模块=%s) 次栈顶=%p",
                          (unsigned)rec->ExceptionCode, rec->ExceptionAddress,
-                         (unsigned long long)fault);
+                         mod[0] ? mod : "?", mod[0] ? "" : "",
+                         (unsigned long long)(modBase ? (rip - modBase) : 0),
+                         reinterpret_cast<void*>(fault),
+                         modFault[0] ? modFault : "?", modFault[0] ? "" : "",
+                         (unsigned long long)(fBase ? (fault - fBase) : 0),
+                         ib[0], ib[1], ib[2], ib[3], ib[4], ib[5], ib[6], ib[7],
+                         reinterpret_cast<void*>(stackRet),
+                         modRet[0] ? modRet : "?",
+                         reinterpret_cast<void*>(stackRet2));
                 return EXCEPTION_CONTINUE_SEARCH;
             }
             i = (uint32_t)((fault - base) / self->pageSize);
