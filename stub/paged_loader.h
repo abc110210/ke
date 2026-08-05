@@ -689,12 +689,13 @@ private:
                 pe = pb + (size_t)g_instance->pageBase.size() * g_instance->pageSize;
             }
             // CI 68 新增：异常类型诊断——MSVC C++ 异常布局 ExceptionInformation[2]=type_info*，
-            // type_info+0x10 = _m_d_name（mangled 类型名字符串指针）。直接知道抛的是什么异常
-            // （std::bad_alloc? std::system_error? 自定义类?），判断「环境失败」还是「加壳破坏」。
+            // type_info 布局：+0x00 vfptr，+0x08 _m_data(_type_info_data*)，_m_data+0x08 = m_pName。
+            // 直接知道抛的是什么异常（std::bad_alloc? std::system_error? 自定义类?）。
             if (rec->NumberParameters >= 3) {
                 uintptr_t tiPtr = static_cast<uintptr_t>(rec->ExceptionInformation[2]);
-                uintptr_t namePtr = 0;
-                if (tiPtr) SafeReadBytes(tiPtr + 0x10, &namePtr, sizeof(namePtr));
+                uintptr_t dataPtr = 0, namePtr = 0;
+                if (tiPtr) SafeReadBytes(tiPtr + 0x08, &dataPtr, sizeof(dataPtr));
+                if (dataPtr) SafeReadBytes(dataPtr + 0x08, &namePtr, sizeof(namePtr));
                 char nm[160] = {0};
                 if (namePtr) {
                     for (int k = 0; k < 159; k++) {
@@ -703,8 +704,9 @@ private:
                         nm[k] = c;
                     }
                 }
-                DebugLog("[veh] 异常类型: type_info=%p name=%s",
-                         reinterpret_cast<void*>(tiPtr), nm[0] ? nm : "(读不到)");
+                DebugLog("[veh] 异常类型: type_info=%p data=%p name=%s",
+                         reinterpret_cast<void*>(tiPtr), reinterpret_cast<void*>(dataPtr),
+                         nm[0] ? nm : "(读不到)");
             }
             LogRealThrowSite(ep, pb, pe);
             DebugLog("[veh] C++ 异常未捕获 code=0xE06D7363 (真实抛点见上方走栈，落在 payload 内即 payload 自身)");
