@@ -688,14 +688,15 @@ private:
                 pb = (uintptr_t)g_instance->pageBase[0];
                 pe = pb + (size_t)g_instance->pageBase.size() * g_instance->pageSize;
             }
-            // CI 68 新增：异常类型诊断——MSVC C++ 异常布局 ExceptionInformation[2]=type_info*，
-            // type_info 布局：+0x00 vfptr，+0x08 _m_data(_type_info_data*)，_m_data+0x08 = m_pName。
-            // 直接知道抛的是什么异常（std::bad_alloc? std::system_error? 自定义类?）。
+            // CI 68/69 异常类型诊断——MSVC type_info 布局（vcruntime 实测）：
+            //   +0x00 vfptr，+0x08 _m_data【内嵌】结构，_m_data 内 +0x08(=tiPtr+0x10) = _m_pName。
+            // 注意：_m_data 是内嵌不是指针（CI 69 按指针读 +0x08 得到垃圾 0x0006E6A0...）。
+            // 名字指针 = *(void**)(tiPtr + 0x10)。若读不到名字，打印 namePtr 值便于判断
+            // （0=字段空；链接时 VA=重定位没覆盖 RTTI 区；有效指针但不可读=页保护问题）。
             if (rec->NumberParameters >= 3) {
                 uintptr_t tiPtr = static_cast<uintptr_t>(rec->ExceptionInformation[2]);
-                uintptr_t dataPtr = 0, namePtr = 0;
-                if (tiPtr) SafeReadBytes(tiPtr + 0x08, &dataPtr, sizeof(dataPtr));
-                if (dataPtr) SafeReadBytes(dataPtr + 0x08, &namePtr, sizeof(namePtr));
+                uintptr_t namePtr = 0;
+                if (tiPtr) SafeReadBytes(tiPtr + 0x10, &namePtr, sizeof(namePtr));
                 char nm[160] = {0};
                 if (namePtr) {
                     for (int k = 0; k < 159; k++) {
@@ -704,8 +705,8 @@ private:
                         nm[k] = c;
                     }
                 }
-                DebugLog("[veh] 异常类型: type_info=%p data=%p name=%s",
-                         reinterpret_cast<void*>(tiPtr), reinterpret_cast<void*>(dataPtr),
+                DebugLog("[veh] 异常类型: type_info=%p namePtr=%p name=%s",
+                         reinterpret_cast<void*>(tiPtr), reinterpret_cast<void*>(namePtr),
                          nm[0] ? nm : "(读不到)");
             }
             LogRealThrowSite(ep, pb, pe);
