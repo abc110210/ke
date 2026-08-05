@@ -687,6 +687,27 @@ private:
             DebugLog("[veh] C++ 异常未捕获 code=0xE06D7363 (真实抛点见上方走栈，落在 payload 内即 payload 自身)");
             return EXCEPTION_CONTINUE_SEARCH;
         }
+        // CI 66：.pdata 注册（count=1102）后异常能展开，但展开过程 fatal——
+        // 0xC000041D STATUS_FATAL_USER_CALLBACK_EXCEPTION（用户回调/展开回调内致命异常）。
+        // 展开器在无 AV 的情况下直接 fatal（VEH 无按需解密日志）→ 打 ExceptionAddress +
+        // 走栈定位展开崩在哪一帧（哪一帧的 filter/handler/终止回调）。
+        if (rec->ExceptionCode == 0xC000041D) {
+            uintptr_t pb = 0, pe = 0;
+            if (g_instance && !g_instance->pageBase.empty()) {
+                pb = (uintptr_t)g_instance->pageBase[0];
+                pe = pb + (size_t)g_instance->pageBase.size() * g_instance->pageSize;
+            }
+            uintptr_t rip = reinterpret_cast<uintptr_t>(rec->ExceptionAddress);
+            char mod[256] = {0}; uintptr_t modBase = 0;
+            DescribeAddr(rip, mod, sizeof(mod), &modBase);
+            DebugLog("[veh] 展开期 fatal 0xC000041D: addr=%p (%s 偏移=0x%llX) payload区间=[%p,%p)",
+                     rec->ExceptionAddress,
+                     mod[0] ? mod : "?",
+                     (unsigned long long)(modBase ? (rip - modBase) : 0),
+                     reinterpret_cast<void*>(pb), reinterpret_cast<void*>(pe));
+            LogRealThrowSite(ep, pb, pe);
+            return EXCEPTION_CONTINUE_SEARCH;
+        }
         if (rec->ExceptionCode != EXCEPTION_ACCESS_VIOLATION)
             return EXCEPTION_CONTINUE_SEARCH;
         // ExceptionInformation[1] = 引发访问的虚拟地址
