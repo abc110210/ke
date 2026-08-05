@@ -206,6 +206,27 @@ static inline void* resolveExportFromBase(uintptr_t moduleBase, const char* expo
     return nullptr;
 }
 
+// 独立 SEH 辅助：TLS 数据挂载——读 _tls_index + 拷贝模板 + 写入 TEB 槽。
+// 参数全 POD、内部才用 __try（CI 37 教训：__try 不能进类内成员函数，否则 C2712；
+// 本函数放命名空间作用域）。x64: TEB+0x58=ThreadLocalStoragePointer（指向槽数组），
+// GS:[0x30]=TEB。失败（不可读/不可写）返回 false，调用方释放 tlsData。
+static bool SafeTlsMount(uintptr_t idxAddr, uintptr_t tplAddr,
+                         void* tlsData, size_t tlsSize, DWORD* outIndex)
+{
+    DWORD tlsIndex = 0;
+    __try {
+        if (idxAddr) tlsIndex = *(volatile DWORD*)idxAddr;
+        memcpy(tlsData, reinterpret_cast<const void*>(tplAddr), tlsSize);
+        NT_TIB* tib = reinterpret_cast<NT_TIB*>(__readgsqword(0x30));
+        PVOID* tlsArr = *reinterpret_cast<PVOID**>(reinterpret_cast<BYTE*>(tib) + 0x58);
+        if (tlsArr) tlsArr[tlsIndex] = tlsData;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+    if (outIndex) *outIndex = tlsIndex;
+    return true;
+}
+
 // ============================================================================
 // 手动加载目标 PE（PE32+）
 // ============================================================================
@@ -540,6 +561,52 @@ public:
                 }
             }
         }
+    }
+
+    // ---------- TLS 数据初始化 ----------
+    // 系统 loader 对含 TLS 目录的模块必做三件事：① 分配 TLS 数据块并拷模板
+    // （StartAddressOfRawData→EndAddressOfRawData）② 挂到当前线程
+    // TEB->ThreadLocalStoragePointer[_tls_index] ③ 执行 TLS 回调。
+    // 此前只做了 ③ —— CI 64 实测 Hanbot 崩在 payload 偏移 0x14E3A
+    // （mov [rbx+rax*8+0x10],rsi 写野指针 fault=0x1A06856AD60），与「__declspec(thread)
+    // 槽指针未初始化」的编译模式（先取槽指针再写槽内偏移）高度吻合。补上 ①②。
+    // 注：SafeTlsMount（含 __try 的 SEH 辅助）定义在命名空间作用域（CI 37 教训：
+    // __try 不能进类内成员函数，会触发 C2712）。
+    static void InitTlsData(void* imageBase, const IMAGE_OPTIONAL_HEADER64& opt)
+    {
+        auto& dir = opt.DataDirectory[IMAGE_DIRECTORY_ENTRY_TLS];
+        if (!dir.VirtualAddress || !dir.Size) return;
+        BYTE* base = reinterpret_cast<BYTE*>(imageBase);
+        if (dir.VirtualAddress >= opt.SizeOfImage) return;
+        auto* tls = reinterpret_cast<IMAGE_TLS_DIRECTORY64*>(base + dir.VirtualAddress);
+        uintptr_t start = static_cast<uintptr_t>(tls->StartAddressOfRawData);
+        uintptr_t end   = static_cast<uintptr_t>(tls->EndAddressOfRawData);
+        uintptr_t idx   = static_cast<uintptr_t>(tls->AddressOfIndex);
+        if (!start || !end || end <= start) {
+            DebugLog("[loader] TLS 数据: 无模板数据，跳过");
+            return;
+        }
+        uintptr_t pref  = opt.ImageBase;
+        uintptr_t delta = reinterpret_cast<uintptr_t>(imageBase) - pref;
+        // 链接时 VA（preferredBase 区间）→ +delta；已修正（imageBase 区间）直接用
+        if (start >= pref && start < pref + opt.SizeOfImage) start += delta;
+        if (end >= pref && end < pref + opt.SizeOfImage) end += delta;
+        if (idx >= pref && idx < pref + opt.SizeOfImage) idx += delta;
+        size_t tlsSize = static_cast<size_t>(end - start);
+        if (tlsSize > 0x100000) {
+            DebugLog("[loader] TLS 数据: size=0x%zX 异常过大，跳过", tlsSize);
+            return;
+        }
+        void* tlsData = VirtualAlloc(nullptr, tlsSize, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+        if (!tlsData) { DebugLog("[loader] TLS 数据: VirtualAlloc 失败"); return; }
+        DWORD tlsIndex = 0;
+        bool ok = SafeTlsMount(idx, start, tlsData, tlsSize, &tlsIndex);
+        if (!ok) {
+            VirtualFree(tlsData, 0, MEM_RELEASE);
+            DebugLog("[loader] TLS 数据: 挂载失败，放弃");
+            return;
+        }
+        DebugLog("[loader] TLS 数据: size=0x%zX index=%u data=%p", tlsSize, tlsIndex, tlsData);
     }
 
     // ---------- TLS 回调 ----------

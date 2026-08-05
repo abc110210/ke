@@ -299,7 +299,12 @@ public:
         ManualPeLoader::FixDelayImports(workBase, opt);
         DebugLog("[loader] ckpt: FixDelayImports 完成");
         if (opt.DataDirectory[IMAGE_DIRECTORY_ENTRY_TLS].VirtualAddress) {
-            DebugLog("[loader] ckpt: payload 含 TLS 目录, 执行 TLS 回调");
+            // 系统 loader 顺序：先初始化 TLS 数据（分配+拷模板+挂 TEB 槽），再执行回调。
+            // CI 64：此前只执行回调、未初始化数据 → Hanbot 的 __declspec(thread) 槽指针是野值
+            // → 崩在 payload 偏移 0x14E3A 的写指令（mov [rbx+rax*8+0x10],rsi 写野指针）。
+            DebugLog("[loader] ckpt: payload 含 TLS 目录, 初始化 TLS 数据");
+            ManualPeLoader::InitTlsData(workBase, opt);
+            DebugLog("[loader] ckpt: 执行 TLS 回调");
             ManualPeLoader::RunTlsCallbacks(workBase, opt);
             DebugLog("[loader] ckpt: TLS 回调执行完成");
         }
@@ -734,7 +739,11 @@ private:
                 SafeReadBytes(rsp + 8, &stackRet2, sizeof(stackRet2));
                 char modRet[256] = {0}; uintptr_t retBase = 0;
                 DescribeAddr(stackRet, modRet, sizeof(modRet), &retBase);
-                DebugLog("[veh] AV 不在镜像内: code=0x%08X addr=%p (%s%s 偏移=0x%llX) fault=%p (%s%s) RIP字节=%02X%02X%02X%02X%02X%02X%02X%02X | 栈顶=%p (模块=%s) 次栈顶=%p",
+                // CI 64：新形态——addr 在 payload 镜像内（手动映射，模块表查不到故 "?"）、
+                // fault 在外 → Hanbot 自身代码写野指针（RIP 字节 48 89 74 C3 10=mov [rbx+rax*8+0x10],rsi）。
+                // 补关键寄存器（rax/rbx/rcx/rdx/rsi/rdi/rbp）便于追野指针来源。
+                auto* ctx = ep->ContextRecord;
+                DebugLog("[veh] AV 不在镜像内: code=0x%08X addr=%p (%s%s 偏移=0x%llX) fault=%p (%s%s) RIP字节=%02X%02X%02X%02X%02X%02X%02X%02X | rax=%p rbx=%p rcx=%p rdx=%p rsi=%p rdi=%p rbp=%p rsp=%p 栈顶=%p (模块=%s) 次栈顶=%p",
                          (unsigned)rec->ExceptionCode, rec->ExceptionAddress,
                          mod[0] ? mod : "?", mod[0] ? "" : "",
                          (unsigned long long)(modBase ? (rip - modBase) : 0),
@@ -742,6 +751,10 @@ private:
                          modFault[0] ? modFault : "?", modFault[0] ? "" : "",
                          (unsigned long long)(fBase ? (fault - fBase) : 0),
                          ib[0], ib[1], ib[2], ib[3], ib[4], ib[5], ib[6], ib[7],
+                         reinterpret_cast<void*>(ctx->Rax), reinterpret_cast<void*>(ctx->Rbx),
+                         reinterpret_cast<void*>(ctx->Rcx), reinterpret_cast<void*>(ctx->Rdx),
+                         reinterpret_cast<void*>(ctx->Rsi), reinterpret_cast<void*>(ctx->Rdi),
+                         reinterpret_cast<void*>(ctx->Rbp), reinterpret_cast<void*>(rsp),
                          reinterpret_cast<void*>(stackRet),
                          modRet[0] ? modRet : "?",
                          reinterpret_cast<void*>(stackRet2));
