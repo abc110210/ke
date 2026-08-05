@@ -1,0 +1,5 @@
+// PEArmor stub 资源文件
+// 统一图标：引用仓库根目录 app.ico（用户约定：加壳产物固定用此图标，
+// 更换图标只需用同名 app.ico 覆盖根目录文件后重新编译 stub）。
+// 相对路径基于本 .rc 所在目录（stub/），"..\app.ico" 即仓库根目录。
+IDI_PEARMOR_ICON ICON "..\\app.ico"
