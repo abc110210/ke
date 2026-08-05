@@ -19,6 +19,7 @@ set_target_properties(packer PROPERTIES
 # ---- Stub（壳本体：精简、无控制台、Release 优化） ----
 add_executable(stub
     stub/stub.cpp
+    stub/resources.rc   # 统一图标：编译期嵌入根目录 app.ico（换图标=替换 app.ico 重编 stub）
     stub/pe_loader.h
     stub/syscall.asm
     stub/syscall.h
