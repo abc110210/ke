@@ -76,11 +76,12 @@ static void DescribeAddr(uintptr_t addr, char* modOut, size_t modOutSz, uintptr_
 }
 
 // 正经走栈：从异常现场（通常停在 KERNELBASE!RaiseException 内）用 RtlVirtualUnwind 逐帧展开，
-// 只展开系统/CRT 帧（它们自带 .pdata，可正常展开），停在「进入 payload 的前一帧」——
-// 该帧的返回地址即 payload 内真实 throw 调用点（call _CxxThrowException 之下一条指令）。
-// 不依赖 payload 注册 .pdata（CI 36 教训：不完整 pdata 会引发展开死循环）。
-// 用途：CI 诊断"为何一进 OEP 就抛 0xE06D7363"，精确定位 throw 站点模块。
-// pb/pe 为 payload 基址区间（由 VehHandler 计算传入，避免本函数依赖 PagedLoader 完整类型）。
+// 打印完整调用链。CI 67 前 payload 无 .pdata，展开到第一个 payload 帧即停（定位 throw 站点）；
+// CI 66 起 .pdata 已注册（RtlAddFunctionTable count=1102），RtlVirtualUnwind 能展开 payload
+// 帧 → 改为【继续展开全部 payload 帧】，打出 throw → 调用者 → ... → OepThunk 的完整链路，
+// 用于判断 throw 来自 Hanbot 哪个业务函数（环境失败 vs 加壳破坏）。
+// 无 .pdata 的帧（如纯汇编）用叶子近似（ret=*Rsp; Rsp+=8）继续，最多 16 帧。
+// pb/pe 为 payload 基址区间（由 VehHandler 计算传入）。
 static void LogRealThrowSite(EXCEPTION_POINTERS* ep, uintptr_t pb, uintptr_t pe)
 {
     using PFN_Lookup = PRUNTIME_FUNCTION (NTAPI*)(ULONG64, PULONG64, PVOID);
@@ -111,14 +112,19 @@ static void LogRealThrowSite(EXCEPTION_POINTERS* ep, uintptr_t pb, uintptr_t pe)
     ctx.R15 = ep->ContextRecord->R15;
 
     DebugLog("[veh] === 正经走栈定位真实 throw 站点（从 RaiseException 现场向上展开）===");
-    if (pb) DebugLog("[veh] payload 基址区间=[%p, %p) （#N 落在此区间即 payload 自身抛）", (void*)pb, (void*)pe);
+    if (pb) DebugLog("[veh] payload 基址区间=[%p, %p) （#N 落在此区间即 payload 自身）", (void*)pb, (void*)pe);
     for (int d = 0; d < 16; d++) {
         ULONG64 imgBase = 0;
         PRUNTIME_FUNCTION fe = pLookup(ctx.Rip, &imgBase, nullptr);
         if (!fe) {
-            DebugLog("[veh]   #%d rip=%p 无 .pdata（payload/未知帧边界）—— 上方一帧即真实 throw 调用点",
-                     d, (void*)ctx.Rip);
-            break;
+            // 无展开数据帧（纯汇编/无栈帧）：叶子近似 ret=*Rsp; Rsp+=8 继续
+            uintptr_t ret = 0;
+            SafeReadBytes(static_cast<uintptr_t>(ctx.Rsp), &ret, sizeof(ret));
+            DebugLog("[veh]   #%d rip=%p 无 .pdata（叶子近似）", d, (void*)ctx.Rip);
+            if (!ret || ret == (uintptr_t)-1) break;
+            ctx.Rip = ret;
+            ctx.Rsp += 8;
+            continue;
         }
         ULONG64 establisher = 0;
         PVOID  handlerData = nullptr;
@@ -132,8 +138,7 @@ static void LogRealThrowSite(EXCEPTION_POINTERS* ep, uintptr_t pb, uintptr_t pe)
             GetModuleFileNameA(hMod, mod, sizeof(mod));
         bool inPayload = (ctx.Rip >= pb && ctx.Rip < pe);
         DebugLog("[veh]   #%d rip=%p module=%s%s",
-                 d, (void*)ctx.Rip, mod, inPayload ? "  <<< 落在 payload 内(真实 throw 站点)" : "");
-        if (inPayload) break;
+                 d, (void*)ctx.Rip, mod, inPayload ? "  <<< payload" : "");
     }
 }
 
@@ -682,6 +687,24 @@ private:
             if (g_instance && !g_instance->pageBase.empty()) {
                 pb = (uintptr_t)g_instance->pageBase[0];
                 pe = pb + (size_t)g_instance->pageBase.size() * g_instance->pageSize;
+            }
+            // CI 68 新增：异常类型诊断——MSVC C++ 异常布局 ExceptionInformation[2]=type_info*，
+            // type_info+0x10 = _m_d_name（mangled 类型名字符串指针）。直接知道抛的是什么异常
+            // （std::bad_alloc? std::system_error? 自定义类?），判断「环境失败」还是「加壳破坏」。
+            if (rec->NumberParameters >= 3) {
+                uintptr_t tiPtr = static_cast<uintptr_t>(rec->ExceptionInformation[2]);
+                uintptr_t namePtr = 0;
+                if (tiPtr) SafeReadBytes(tiPtr + 0x10, &namePtr, sizeof(namePtr));
+                char nm[160] = {0};
+                if (namePtr) {
+                    for (int k = 0; k < 159; k++) {
+                        char c = 0;
+                        if (!SafeReadBytes(namePtr + k, &c, 1) || !c) break;
+                        nm[k] = c;
+                    }
+                }
+                DebugLog("[veh] 异常类型: type_info=%p name=%s",
+                         reinterpret_cast<void*>(tiPtr), nm[0] ? nm : "(读不到)");
             }
             LogRealThrowSite(ep, pb, pe);
             DebugLog("[veh] C++ 异常未捕获 code=0xE06D7363 (真实抛点见上方走栈，落在 payload 内即 payload 自身)");
