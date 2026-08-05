@@ -51,9 +51,8 @@ jobs:
           Write-Host "overlay Footer 校验通过（密文已拼接），产物大小: $((Get-Item $out).Length) 字节"
           $env:PEARMOR_DEBUG = "1"   # 开启壳内调试日志
           $env:PEARMOR_ALLOW_VM = "1"  # CI runner 本身是 Azure VM 且系统盘<30GB，放行 VM 检测
-          # CI 60 隔离诊断：跳过 CorruptHeader，验证「Hanbot 初始化失败是否因 PE 头被覆写」
-          # （真实目标 CRT 初始化可能读自身 PE 头）。确认后恢复。
-          $env:PEARMOR_NO_CORRUPT_HEADER = "1"
+          # CI 61/62 已验证 CorruptHeader 与崩溃无关（跳过/不跳过日志逐字节一致），恢复完整保护。
+          # $env:PEARMOR_NO_CORRUPT_HEADER = "1"  # 隔离诊断用，已移除
           # 带超时运行：防止反调试/挂起导致 runner 被占几小时
           $timeoutSec = 30
           $p = Start-Process -FilePath $out -PassThru -RedirectStandardError "stderr.txt"
