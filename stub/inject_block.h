@@ -26,10 +26,143 @@ namespace InjectBlock {
 struct Hook {
     void*   addr = nullptr;                  // ntdll 导出函数入口
     unsigned char patched[14] = {0};         // 我们写入的跳转（14 字节）
-    unsigned char orig[14] = {0};            // 原始指令（恢复/校验用）
+    unsigned char orig[32] = {0};            // 原始指令（完整指令边界，≥14 字节）
     void*   trampoline = nullptr;            // 跳回原函数体的执行桩
     bool    active = false;
 };
+
+// 单条 x64 指令长度（含前缀+opcode+modrm+sib+disp+imm）；失败返回 0。
+// CI 84：hook 前必须找到【完整指令边界】——syscall 包装头 16 字节 =
+// mov r10,rcx(3)+mov eax,imm(5)+test [0x7FFE0308],1(8)，固定 14 字节 patch
+// 会把 test 指令从中间切断 → trampoline 执行到残指令 → 解码错乱 AV。
+static int OneInstLen(const unsigned char* p, int limit)
+{
+    int i = 0;
+    // 前缀（66/67/64/65/F0/F2/F3/段覆盖 2E..3E/REX 40..4F，可重复）
+    while (i < limit) {
+        unsigned char b = p[i];
+        if (b == 0x66 || b == 0x67 || b == 0xF0 || b == 0xF2 || b == 0xF3 ||
+            b == 0x64 || b == 0x65 || (b >= 0x2E && b <= 0x3E) || (b >= 0x40 && b <= 0x4F))
+            { i++; continue; }
+        break;
+    }
+    if (i >= limit) return 0;
+    unsigned char op = p[i];
+    int start = i;
+    bool rexW = false;
+    for (int k = 0; k < i; k++) if ((p[k] & 0xF8) == 0x48) rexW = true; // REX.W
+    bool twoByte = (op == 0x0F);
+    i++;
+    if (twoByte) {
+        if (i >= limit) return 0;
+        op = p[i]; i++;
+        // 两字节无 modrm：syscall/sysret/sysenter/sysexit/invd/wbinvd/ud2/emms/rdtsc 等
+        if (op == 0x05 || op == 0x07 || op == 0x34 || op == 0x35 ||
+            (op >= 0x08 && op <= 0x0F) || op == 0x31 || op == 0x32 || op == 0x77)
+            return i - start;
+        if (op >= 0x80 && op <= 0x8F)          // jcc rel32
+            return i + 4 - start;
+        // 两字节带 modrm + imm8：0F BA /C2 /C4 /C5 /C6 /A4 /AC
+        if (op == 0xBA || op == 0xC2 || op == 0xC4 || op == 0xC5 || op == 0xC6 ||
+            op == 0xA4 || op == 0xAC) {
+            if (i >= limit) return 0;
+            unsigned char modrm = p[i];
+            i++;
+            unsigned mod = modrm >> 6;
+            if (mod != 3) {
+                unsigned rm = modrm & 7;
+                if (rm == 4) { if (i >= limit) return 0; unsigned char sib = p[i]; i++;
+                               if (mod == 0 && (sib & 7) == 5) i += 4; }
+                else if (mod == 0 && rm == 5) i += 4;
+                if (mod == 1) i += 1;
+                else if (mod == 2) i += 4;
+            }
+            return i + 1 - start;
+        }
+        // 其余两字节：默认带 modrm（落入下方）
+    } else {
+        // ---- 单字节无 modrm / 特殊 ----
+        if ((op >= 0x50 && op <= 0x5F) ||        // push/pop
+            op == 0x90 || op == 0x9B || op == 0x98 || op == 0x99 || op == 0x9C ||
+            op == 0x9D || op == 0x9E || op == 0x9F || op == 0xC3 || op == 0xC9 ||
+            op == 0xCB || op == 0xCC || op == 0xCE || op == 0xCF ||
+            op == 0xF8 || op == 0xF9 || op == 0xFA || op == 0xFB || op == 0xFC || op == 0xFD ||
+            (op >= 0xAA && op <= 0xAF))         // stos/lods/scas/movs/cmps
+            return i - start;
+        if ((op >= 0x70 && op <= 0x7F) || op == 0xEB || op == 0xE3)  // jcc/jmp/jrcxz rel8
+            return i + 1 - start;
+        if (op == 0xE8 || op == 0xE9)            // call/jmp rel32
+            return i + 4 - start;
+        if (op == 0x9A || op == 0xEA)            // call/jmp far
+            return i + 12 - start;
+        if (op == 0xA8) return i + 2 - start;    // test al, imm8
+        if (op == 0xA9) return i + 5 - start;    // test eax/rax, imm32
+        if (op == 0xC2 || op == 0xCA) return i + 2 - start;  // ret imm16
+        if (op == 0xC8) return i + 3 - start;    // enter imm16, imm8
+        if (op == 0x68) return i + 4 - start;    // push imm32
+        if (op == 0x6A) return i + 1 - start;    // push imm8
+        if (op == 0xA0 || op == 0xA1 || op == 0xA2 || op == 0xA3)  // mov moffs
+            return i + 8 - start;
+        if (op >= 0xB8 && op <= 0xBF)            // mov r64, imm64（REX.W）/ mov r32, imm32
+            return i + (rexW ? 8 : 4) - start;
+        if (op == 0xB0 || op == 0xB1)            // mov al/cl, imm8
+            return i + 1 - start;
+        if (op == 0xE4 || op == 0xE5 || op == 0xE6 || op == 0xE7)  // in/out imm8
+            return i + 1 - start;
+        // 带 modrm 的（含 imm 判断），落入下方
+    }
+    // ---- modrm 解析 ----
+    if (i >= limit) return 0;
+    unsigned char modrm = p[i];
+    i++;
+    unsigned mod = modrm >> 6;
+    unsigned rm = modrm & 7;
+    unsigned reg = (modrm >> 3) & 7;
+    if (mod != 3) {
+        if (rm == 4) {                           // SIB
+            if (i >= limit) return 0;
+            unsigned char sib = p[i]; i++;
+            if (mod == 0 && (sib & 7) == 5) i += 4;   // disp32
+        } else if (mod == 0 && rm == 5) {
+            i += 4;                              // rip-rel disp32
+        }
+        if (mod == 1) i += 1;                    // disp8
+        else if (mod == 2) i += 4;               // disp32
+    }
+    // ---- imm（按 opcode）----
+    if (!twoByte) {
+        switch (op) {
+        case 0x80: case 0x82: case 0x83: case 0xC0: case 0xC1:
+            return i + 1 - start;                // imm8
+        case 0x81: case 0xC7:
+            return i + 4 - start;                // imm32（64 位下符号扩展）
+        case 0x69: return i + 4 - start;         // imul r,r/m,imm32
+        case 0x6B: return i + 1 - start;         // imul r,r/m,imm8
+        case 0xF6: case 0xF7:                    // /0=TEST 带 imm；其余无
+            if (reg == 0) return i + (op == 0xF6 ? 1 : 4) - start;
+            return i - start;
+        case 0xD0: case 0xD1: case 0xD2: case 0xD3:
+            return i - start;                    // 移位（无 imm；imm8 版本是 C0/C1）
+        default:
+            return i - start;
+        }
+    }
+    return i - start;
+}
+
+// 从 p 开始逐条解码，返回累计到 >= limit 的【完整指令序列】长度。
+// 失败返回 0。上限 24 字节防失控。
+static int X64InstLen(const unsigned char* p, int limit)
+{
+    int total = 0;
+    while (total < limit) {
+        int one = OneInstLen(p + total, 16);   // 单条最多 16 字节（x64 最长 15+前缀，够）
+        if (one <= 0) return 0;
+        total += one;
+        if (total > 24) return 0;              // 保护：找不到边界
+    }
+    return total;
+}
 
 static Hook g_hooks[3];
 static DWORD g_selfPid = 0;
@@ -74,24 +207,40 @@ static void BuildJmp(void* from, void* to, unsigned char out[14])
 
 // 安装单个钩子：patch 跳到对应 shim（shim 内调 InjectShouldBlock 决策，
 // 放行时尾跳 trampoline），trampoline 地址写入全局槽供 shim 使用。
+// CI 84：hook 前先解码【完整指令边界】len（≥14）——syscall 包装头 16 字节含
+// test [0x7FFE0308],1(8B) 指令，固定 14 字节 patch 会从中间截断 → trampoline
+// 复制 len 字节完整指令、跳回 addr+len（addr+14..len 段被 patch 覆盖无碍，
+// trampoline 不经过该段）。解码失败则放弃 hook 该函数（返回 false）。
 static bool PatchOne(Hook& h, const char* name, void* shimAddr, void** trampSlot)
 {
     h.addr = peExportAddress(getLoadedModuleBase(L"ntdll.dll"), name);
     if (!h.addr) return false;
-    memcpy(h.orig, h.addr, 14);
+    // 完整指令边界：至少 14 字节（patch 覆盖量），最多 20 字节内找边界
+    int len = 0;
+    for (int trial = 14; trial <= 20; trial++) {
+        len = X64InstLen(reinterpret_cast<const unsigned char*>(h.addr), trial);
+        if (len >= 14 && len <= 20) break;
+        len = 0;
+    }
+    if (len < 14) {
+        DebugLog("[loader] inject hook 解码指令边界失败: %s", name);
+        return false;
+    }
+    memcpy(h.orig, h.addr, len);
     BuildJmp(h.addr, shimAddr, h.patched);
 
-    // 分配 trampoline（原指令 + 跳回原函数体 patch 之后）
+    // 分配 trampoline（len 字节完整原指令 + 跳回原函数体 patch 之后 addr+len）
     void* mem = nullptr; SIZE_T sz = 0x1000;
     if (!NT_SUCCESS(Sys::AllocateVirtualMemory(GetCurrentProcess(), &mem, 0, &sz,
             MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE)))
         return false;
     unsigned char* p = reinterpret_cast<unsigned char*>(mem);
-    memcpy(p, h.orig, 14);                 // 原指令
-    // jmp [rip+0] : FF 25 00 00 00 00 + 8 字节地址（回跳到 addr+14）
-    p[14] = 0xFF; p[15] = 0x25; p[16] = 0x00; p[17] = 0x00; p[18] = 0x00; p[19] = 0x00;
-    void* resume = (unsigned char*)h.addr + 14;
-    memcpy(p + 20, &resume, 8);
+    memcpy(p, h.orig, len);                    // 完整原指令（≥14 字节）
+    // jmp [rip+0] : FF 25 00 00 00 00 + 8 字节地址（回跳到 addr+len）
+    p[len] = 0xFF; p[len+1] = 0x25;
+    p[len+2] = 0x00; p[len+3] = 0x00; p[len+4] = 0x00; p[len+5] = 0x00;
+    void* resume = (unsigned char*)h.addr + len;
+    memcpy(p + len + 6, &resume, 8);
     h.trampoline = mem;
     *trampSlot = mem;   // 通知 shim 尾跳转目标（CI 83）
 
