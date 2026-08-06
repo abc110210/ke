@@ -35,9 +35,11 @@ static Hook g_hooks[3];
 static DWORD g_selfPid = 0;
 
 // 取某进程句柄对应的 PID（用原生 NtQueryInformationProcess，绕过 Win32 钩子）
+// 注意：此函数会在 hook 决策路径（shim -> InjectShouldBlock）里被调用，
+// 必须零依赖 kernel32/user32（GetCurrentProcess 等价伪句柄 (HANDLE)-1，直接比较）。
 static DWORD PidOfHandle(HANDLE hProc)
 {
-    if (!hProc || hProc == GetCurrentProcess()) return g_selfPid;
+    if (!hProc || hProc == (HANDLE)-1) return g_selfPid;
     ULONG pid = 0;
     // ProcessBasicInformation(0) 的 UniqueProcessId 在返回结构偏移 8
     struct { ULONG ExitStatus; ULONG_PTR Peb; ULONG_PTR UniqueProcessId; ULONG_PTR Inherited; } info;
@@ -47,53 +49,38 @@ static DWORD PidOfHandle(HANDLE hProc)
     return pid;
 }
 
-// 统一访问策略：返回 true 表示放行，false 表示拦截。
-static bool AllowCall(ULONG ssn, void* a1, void* a2, void* a3, void* a4)
+// 统一访问策略（C 决策函数，被 hook_shim.asm 的 shim 调用）。
+//   which: 0=NtMapViewOfSection 1=NtCreateThreadEx 2=NtOpenProcess
+//   arg:   0/1 -> ProcessHandle 句柄值；2 -> PCLIENT_ID 指针
+// 返回 1 = 拦截，0 = 放行。
+// 注意：必须【可重入、无副作用、不调用任何经过 hook 的 API】——
+// shim 是在 ntdll 入口被跳转进来的，任何线程都可能随时进入。
+extern "C" __declspec(noinline) inline int InjectShouldBlock(int which, void* arg)
 {
-    const Sys::Ssn& s = Sys::ssn();
-    if (ssn == s.NtOpenProcess) {
-        // a4 = CLIENT_ID*（含 UniqueProcess）。外部指定本进程 PID 且非自身伪句柄 -> 拦截。
-        if (a4 && g_selfPid) {
-            DWORD target = (DWORD)(uintptr_t)*(const ULONG_PTR*)a4; // ClientId.UniqueProcess
-            if (target == g_selfPid) return false;   // 阻断外部打开本进程
+    if (!g_selfPid) return 0;
+    if (which == 2) {
+        // NtOpenProcess：arg = CLIENT_ID*，UniqueProcess == 本进程 -> 拦截
+        if (arg) {
+            ULONG_PTR pid = *(const ULONG_PTR*)arg;
+            if (pid == g_selfPid) return 1;
         }
-        return true;
+        return 0;
     }
-    if (ssn == s.NtCreateThreadEx) {
-        // a4 = ProcessHandle（远程线程目标进程）。目标为其它进程 -> 拦截。
-        HANDLE hProc = (HANDLE)a4;
-        if (hProc && hProc != GetCurrentProcess() && PidOfHandle(hProc) != g_selfPid)
-            return false;
-        return true;
-    }
-    if (ssn == s.NtMapViewOfSection) {
-        // a2 = ProcessHandle（映射目标进程）。映射到其它进程 -> 拦截（远程 DLL 注入）。
-        HANDLE hProc = (HANDLE)a2;
-        if (hProc && hProc != GetCurrentProcess() && PidOfHandle(hProc) != g_selfPid)
-            return false;
-        return true;
-    }
-    return true;
+    // which 0/1：arg = ProcessHandle。目标为其它进程 -> 拦截。
+    // 伪句柄 (HANDLE)-1 恒等于当前进程（GetCurrentProcess），直接比较。
+    HANDLE hProc = (HANDLE)arg;
+    if (hProc && hProc != (HANDLE)-1 && PidOfHandle(hProc) != g_selfPid)
+        return 1;
+    return 0;
 }
 
-// 全局 handler：RCX=SSN，其余参数按微软 x64 约定落在 rdx/r8/r9/[rsp+0x28..]
-extern "C" NTSTATUS NTAPI InjectHandler(ULONG ssn, void* a1, void* a2,
-                                        void* a3, void* a4, void* a5, void* a6)
-{
-    (void)a1; (void)a5; (void)a6;
-    if (!AllowCall(ssn, a1, a2, a3, a4))
-        return (NTSTATUS)0xC0000022L; // STATUS_ACCESS_DENIED
-    // 放行：按 SSN 匹配对应 trampoline 执行原函数体
-    const Sys::Ssn& s = Sys::ssn();
-    ULONG targets[3] = { s.NtMapViewOfSection, s.NtCreateThreadEx, s.NtOpenProcess };
-    for (int i = 0; i < 3; i++) {
-        if (g_hooks[i].active && targets[i] == ssn) {
-            using Fn = NTSTATUS(NTAPI*)(ULONG, void*, void*, void*, void*, void*, void*);
-            return reinterpret_cast<Fn>(g_hooks[i].trampoline)(ssn, a1, a2, a3, a4, a5, a6);
-        }
-    }
-    return (NTSTATUS)0xC0000002L; // STATUS_NOT_IMPLEMENTED（兜底，正常不会到这）
-}
+// ---- hook_shim.asm 导出的 shim 与 trampoline 槽 ----
+extern "C" void InjectShim0(void);   // NtMapViewOfSection
+extern "C" void InjectShim1(void);   // NtCreateThreadEx
+extern "C" void InjectShim2(void);   // NtOpenProcess
+extern "C" void* gTramp0;
+extern "C" void* gTramp1;
+extern "C" void* gTramp2;
 
 // 构造 14 字节绝对跳转到 handler（FF 25 00 00 00 00 + 8 字节绝对地址）
 static void BuildJmp(void* from, void* to, unsigned char out[14])
@@ -102,12 +89,14 @@ static void BuildJmp(void* from, void* to, unsigned char out[14])
     memcpy(out + 6, &to, 8);
 }
 
-static bool PatchOne(Hook& h, const char* name, void* handler)
+// 安装单个钩子：patch 跳到对应 shim（shim 内调 InjectShouldBlock 决策，
+// 放行时尾跳 trampoline），trampoline 地址写入全局槽供 shim 使用。
+static bool PatchOne(Hook& h, const char* name, void* shimAddr, void** trampSlot)
 {
     h.addr = peExportAddress(getLoadedModuleBase(L"ntdll.dll"), name);
     if (!h.addr) return false;
     memcpy(h.orig, h.addr, 14);
-    BuildJmp(h.addr, handler, h.patched);
+    BuildJmp(h.addr, shimAddr, h.patched);
 
     // 分配 trampoline（原指令 + 跳回原函数体 patch 之后）
     void* mem = nullptr; SIZE_T sz = 0x1000;
@@ -121,6 +110,7 @@ static bool PatchOne(Hook& h, const char* name, void* handler)
     void* resume = (unsigned char*)h.addr + 14;
     memcpy(p + 20, &resume, 8);
     h.trampoline = mem;
+    *trampSlot = mem;   // 通知 shim 尾跳转目标（CI 83）
 
     // 写跳转（先把页面改可写）
     PVOID base = h.addr; SIZE_T wsz = 14; ULONG old = 0;
@@ -141,9 +131,12 @@ inline bool Install()
         OBF_STR("NtCreateThreadEx"),
         OBF_STR("NtOpenProcess")
     };
+    // shim 地址（.asm 符号）与 trampoline 槽一一对应
+    void* shims[3] = { (void*)&InjectShim0, (void*)&InjectShim1, (void*)&InjectShim2 };
+    void* slots[3] = { (void*)&gTramp0, (void*)&gTramp1, (void*)&gTramp2 };
     bool all = true;
     for (int i = 0; i < 3; i++)
-        if (!PatchOne(g_hooks[i], names[i], (void*)&InjectHandler)) all = false;
+        if (!PatchOne(g_hooks[i], names[i], shims[i], slots[i])) all = false;
     return all;
 }
 
