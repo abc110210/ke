@@ -718,9 +718,25 @@ private:
                         nm[k] = c;
                     }
                 }
-                DebugLog("[veh] 异常类型: type_info=%p namePtr=%p name=%s",
-                         reinterpret_cast<void*>(tiPtr), reinterpret_cast<void*>(namePtr),
-                         nm[0] ? nm : "(读不到)");
+                // CI 75：完整 dump 异常参数——MSVC _CxxThrowException 传 3 个参数：
+                //   [0]=throwInfo（__CxxFrameHandler 用的捕获类型表）、[1]=pExceptionObject、
+                //   [2]=type_info*。若 [0]==0 且 [2] 不可读 → 业务主动 RaiseException 模拟，
+                //   非标准 C++ throw。另 dump type_info 头部 16 字节（MSVC 布局：
+                //   +0x00 vfptr, +0x08 _m_data 内嵌, +0x10 _m_pName）。
+                DebugLog("[veh] 异常参数: n=%u [0]=%p [1]=%p [2]=%p",
+                         (unsigned)rec->NumberParameters,
+                         reinterpret_cast<void*>(rec->ExceptionInformation[0]),
+                         reinterpret_cast<void*>(rec->ExceptionInformation[1]),
+                         reinterpret_cast<void*>(rec->ExceptionInformation[2]));
+                {
+                    unsigned char tih[32] = {0};
+                    if (tiPtr) SafeReadBytes(tiPtr, tih, sizeof(tih));
+                    DebugLog("[veh] type_info 头部: %02X%02X%02X%02X %02X%02X%02X%02X %02X%02X%02X%02X %02X%02X%02X%02X | namePtr=%p name=%s",
+                             tih[0], tih[1], tih[2], tih[3], tih[4], tih[5], tih[6], tih[7],
+                             tih[8], tih[9], tih[10], tih[11], tih[12], tih[13], tih[14], tih[15],
+                             reinterpret_cast<void*>(namePtr),
+                             nm[0] ? nm : "(读不到)");
+                }
             }
             LogRealThrowSite(ep, pb, pe);
             DebugLog("[veh] C++ 异常未捕获 code=0xE06D7363 (真实抛点见上方走栈，落在 payload 内即 payload 自身)");
