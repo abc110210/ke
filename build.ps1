@@ -32,8 +32,10 @@ if ($LASTEXITCODE -ne 0) { throw "cmake configure 失败" }
 
 # ---- 阶段 1：一次编译 加壳器 + 壳运行时（样例 test_payload 存在才编译，可选） ----
 Write-Host "[2/3] 编译 加壳器 + 壳运行时 + 样例..." -ForegroundColor Cyan
-$Targets = "packer stub"
-if (Test-Path (Join-Path $Root "test\test_payload.cpp")) { $Targets += " test_payload" }
+# 注意：目标列表必须是 PowerShell 数组（@(...)），不能是空格分隔的字符串！
+# 字符串 "packer stub" 会被 cmake/MSBuild 当成单个工程名 → MSB1009: Project file does not exist
+$Targets = @("packer", "stub")
+if (Test-Path (Join-Path $Root "test\test_payload.cpp")) { $Targets += "test_payload" }
 & cmake --build $Build --config Release --target $Targets --parallel
 if ($LASTEXITCODE -ne 0) { throw "cmake build 失败" }
 
