@@ -927,6 +927,9 @@ private:
                 // RIP 处指令字节 dump（判断执行了 jmp/call/普通指令；不可读则全 0）
                 unsigned char ib[16] = {0};
                 SIZE_T nRead = SafeReadBytes(rip, ib, sizeof(ib));
+                // CI 85：RIP 前 24 字节指令 dump（定位 rbx 来源：mov rbx,[全局] / lea rbx,[rsp+xx]）
+                unsigned char pb24[24] = {0};
+                SafeReadBytes(rip > 24 ? rip - 24 : 0, pb24, sizeof(pb24));
                 // 栈顶返回地址（谁是调用者）
                 uintptr_t rsp = ep->ContextRecord->Rsp;
                 uintptr_t stackRet = 0, stackRet2 = 0;
@@ -976,6 +979,14 @@ private:
                          reinterpret_cast<void*>(stackRet),
                          modRet[0] ? modRet : "?",
                          reinterpret_cast<void*>(stackRet2));
+                // CI 85：补崩溃线程 ID + RIP 前 24 字节指令（人工反汇编确认 rbx 来源——
+                // 页 57 偏移 0x159/0x19A 的 mov eax,[rbx] / mov [rbx+rax*8+0x10],rsi，
+                // rbx 野指针需定位它来自哪条指令的哪个全局/寄存器）。
+                DebugLog("[veh] 崩溃线程 tid=%u RIP前指令=%02X%02X%02X%02X %02X%02X%02X%02X %02X%02X%02X%02X %02X%02X%02X%02X %02X%02X%02X%02X %02X%02X%02X%02X",
+                         (unsigned)GetCurrentThreadId(),
+                         pb24[0], pb24[1], pb24[2], pb24[3], pb24[4], pb24[5], pb24[6], pb24[7],
+                         pb24[8], pb24[9], pb24[10], pb24[11], pb24[12], pb24[13], pb24[14], pb24[15],
+                         pb24[16], pb24[17], pb24[18], pb24[19], pb24[20], pb24[21], pb24[22], pb24[23]);
                 return EXCEPTION_CONTINUE_SEARCH;
             }
             i = (uint32_t)((fault - base) / self->pageSize);

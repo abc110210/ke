@@ -478,6 +478,10 @@ private:
 
 public:
     // ---------- 重定位 ----------
+    // CI 85 防御：所有写入地址必须落在镜像内（base+SizeOfImage），越界条目跳过并打日志。
+    // 背景：所有组合崩在页 57(0x159/0x19A mov [rbx+rax*8+0x10],rsi 写野指针)或页 70 取指 AV，
+    // 且组合 5 时活时崩（行为漂移）→ 怀疑加载期修复（重定位/导入/TLS）越界写坏镜像内容。
+    // 组合 8（FIXED_BASE，delta=0）也崩 → 越界写内容来自「读错的重定位条目」而非 delta。
     static bool ApplyRelocations(void* imageBase, uint64_t preferredBase,
                                  const IMAGE_OPTIONAL_HEADER64& opt)
     {
@@ -485,29 +489,48 @@ public:
         if (!dir.VirtualAddress || !dir.Size) return true; // 无重定位表，容忍
         BYTE* base = reinterpret_cast<BYTE*>(imageBase);
         uint64_t delta = reinterpret_cast<uint64_t>(imageBase) - preferredBase;
+        uint64_t imgEnd = reinterpret_cast<uint64_t>(base) + opt.SizeOfImage;
+        int skipped = 0;
         DWORD off = 0;
         while (off + sizeof(IMAGE_BASE_RELOCATION) <= dir.Size) {
             auto* blk = reinterpret_cast<IMAGE_BASE_RELOCATION*>(base + dir.VirtualAddress + off);
             if (blk->SizeOfBlock == 0) break;
+            // 防御：块本身必须在镜像内
+            uint64_t blkStart = reinterpret_cast<uint64_t>(blk);
+            if (blkStart < reinterpret_cast<uint64_t>(base) ||
+                blkStart + blk->SizeOfBlock > imgEnd) {
+                DebugLog("[loader] 重定位块越界: off=0x%X size=%u (跳过整块)", off, blk->SizeOfBlock);
+                skipped++;
+                off += sizeof(IMAGE_BASE_RELOCATION); // 至少前进，防死循环
+                continue;
+            }
             DWORD n = (blk->SizeOfBlock - sizeof(IMAGE_BASE_RELOCATION)) / sizeof(WORD);
             WORD* entries = reinterpret_cast<WORD*>(
                 reinterpret_cast<BYTE*>(blk) + sizeof(IMAGE_BASE_RELOCATION));
             for (DWORD i = 0; i < n; i++) {
                 WORD type = entries[i] >> 12;
                 DWORD pOff = entries[i] & 0x0FFF;
+                uint64_t targetVa = (uint64_t)blk->VirtualAddress + pOff;
+                // 防御：写入目标必须在镜像内（sizeOfImage 范围内）
+                if (targetVa + 8 > opt.SizeOfImage) {
+                    if (skipped < 5)
+                        DebugLog("[loader] 重定位条目越界: type=%u va=0x%X pOff=0x%X (跳过)", type,
+                                 blk->VirtualAddress, pOff);
+                    skipped++;
+                    continue;
+                }
                 if (type == IMAGE_REL_BASED_DIR64) {
-                    uint64_t* p = reinterpret_cast<uint64_t*>(
-                        base + blk->VirtualAddress + pOff);
+                    uint64_t* p = reinterpret_cast<uint64_t*>(base + targetVa);
                     *p += delta;
                 } else if (type == IMAGE_REL_BASED_HIGHLOW) {
-                    uint32_t* p = reinterpret_cast<uint32_t*>(
-                        base + blk->VirtualAddress + pOff);
+                    uint32_t* p = reinterpret_cast<uint32_t*>(base + targetVa);
                     *p += static_cast<uint32_t>(delta & 0xFFFFFFFF);
                 }
                 // IMAGE_REL_BASED_ABSOLUTE(0) 忽略
             }
             off += blk->SizeOfBlock;
         }
+        if (skipped) DebugLog("[loader] 重定位跳过越界条目总数: %d", skipped);
         return true;
     }
 
