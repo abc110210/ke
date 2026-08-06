@@ -477,7 +477,7 @@ static DWORD WINAPI TlsMountWrapper(LPVOID arg)
     (void)arg;
     void* start = g_origStart;
     void* a     = g_origArg;
-    pearmor::ManualPeLoader::MountCurrentThreadTls();   // 挂当前线程的 payload TLS
+    pearmor::MountCurrentThreadTls();   // 挂当前线程的 payload TLS（命名空间自由函数）
     return (reinterpret_cast<DWORD(WINAPI*)(LPVOID)>(start))(a);
 }
 

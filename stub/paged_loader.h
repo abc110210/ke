@@ -1012,13 +1012,9 @@ private:
                 // CI 89：崩溃线程 TLS 槽检查——工作线程 TEB 里 payload TLS 槽应为
                 // g_payloadTlsData；若 null → 工作线程 TLS 未挂载实锤（业务 __declspec(thread)
                 // 变量地址 = null+偏移（this=0x20）→ 随机崩溃）。
+                // 读取逻辑在 pe_loader.h 命名空间作用域（__try 不能进类成员函数 C2712）。
                 if (g_payloadTlsIndex != 0xFFFFFFFFu) {
-                    void* got = nullptr;
-                    __try {
-                        NT_TIB* tib = reinterpret_cast<NT_TIB*>(__readgsqword(0x30));
-                        PVOID* tlsArr = *reinterpret_cast<PVOID**>(reinterpret_cast<BYTE*>(tib) + 0x58);
-                        if (tlsArr && g_payloadTlsIndex < 64) got = tlsArr[g_payloadTlsIndex];
-                    } __except (EXCEPTION_EXECUTE_HANDLER) { got = nullptr; }
+                    void* got = pearmor::PeekCurrentThreadTlsSlot();
                     DebugLog("[veh] 崩溃线程TLS: tid=%u index=%u 槽值=%p 期望=%p %s",
                              (unsigned)GetCurrentThreadId(), (unsigned)g_payloadTlsIndex,
                              got, g_payloadTlsData,

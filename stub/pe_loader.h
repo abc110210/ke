@@ -817,6 +817,22 @@ public:
         }
     }
 
+    // CI 89：读取【当前线程】的 payload TLS 槽值（VEH 崩溃诊断用）。
+    // 命名空间作用域自由函数：__try 不能进类成员函数（C2712，CI 37 教训）。
+    static void* PeekCurrentThreadTlsSlot()
+    {
+        void* got = nullptr;
+        if (g_payloadTlsIndex == 0xFFFFFFFFu) return got;
+        __try {
+            NT_TIB* tib = reinterpret_cast<NT_TIB*>(__readgsqword(0x30));
+            PVOID* tlsArr = *reinterpret_cast<PVOID**>(reinterpret_cast<BYTE*>(tib) + 0x58);
+            if (tlsArr && g_payloadTlsIndex < 64) got = tlsArr[g_payloadTlsIndex];
+        } __except (EXCEPTION_EXECUTE_HANDLER) {
+            got = nullptr;
+        }
+        return got;
+    }
+
     // ---------- .pdata 异常展开表注册 ----------
     // 真实 C++ 目标（Hanbot）抛 C++ 异常（0xE06D7363）时，系统展开器（RtlUnwindEx）需要
     // RtlLookupFunctionEntry 能查到【当前 RIP 所在函数】的展开数据。手动映射的 payload
