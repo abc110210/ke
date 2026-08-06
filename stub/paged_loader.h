@@ -393,7 +393,7 @@ public:
             if (!gatingEnabled) {
                 // 诊断模式：所有页保持明文，代码页可执行、数据页可读写
                 DWORD old = 0; SIZE_T sz = pageSize; PVOID p = pageBase[i];
-                NTSTATUS st = STATUS_SUCCESS;
+                NTSTATUS st = 0;   // STATUS_SUCCESS == 0（避免依赖 ntstatus.h）
                 if (pages[i].isCode) {
                     st = Sys::ProtectVirtualMemory(GetCurrentProcess(), &p, &sz, PAGE_EXECUTE_READ, &old);
                     pages[i].baseCrc = fnv1a32(reinterpret_cast<const unsigned char*>(pageBase[i]), pageSize);
