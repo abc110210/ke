@@ -789,6 +789,44 @@ private:
                                      objh[0], objh[1], objh[2], objh[3], objh[4], objh[5], objh[6], objh[7],
                                      objh[8], objh[9], objh[10], objh[11], objh[12], objh[13], objh[14], objh[15],
                                      objh[16], objh[17], objh[18], objh[19], objh[20], objh[21], objh[22], objh[23]);
+                            // CI 81：通过 vfptr 反查真正的 RTTI 类名——MSVC /GR 下虚表指针
+                            // 前 8 字节（vftable[-1]）即 type_info*，type_info+0x10 = 名字指针。
+                            // 异常参数[2] 的 type_info 是混淆/自定义协议（namePtr=0），
+                            // 而异常对象自身的 vftable 指向真实虚表（payload .rdata，门控
+                            // 只门控代码页故可读），反查能拿到标准 .?AVxxx@@ 类名。
+                            uintptr_t vfptr = 0;
+                            if (SafeReadBytes(objPtr, &vfptr, sizeof(vfptr)) && vfptr) {
+                                uintptr_t rttiTi = 0;
+                                if (SafeReadBytes(vfptr - sizeof(uintptr_t), &rttiTi, sizeof(rttiTi)) && rttiTi) {
+                                    uintptr_t rttiName = 0;
+                                    if (SafeReadBytes(rttiTi + 0x10, &rttiName, sizeof(rttiName)) && rttiName) {
+                                        char rn[160] = {0};
+                                        bool okName = true;
+                                        for (int k = 0; k < 159; k++) {
+                                            char c = 0;
+                                            if (!SafeReadBytes(rttiName + k, &c, 1)) { okName = false; break; }
+                                            if (!c) break;
+                                            if (c < 0x20 || c > 0x7E) { okName = false; break; }
+                                            rn[k] = c;
+                                        }
+                                        if (okName && rn[0])
+                                            DebugLog("[veh] 异常类名(vftable[-1]): %s (type_info=%p vftable=%p)",
+                                                     rn, reinterpret_cast<void*>(rttiTi),
+                                                     reinterpret_cast<void*>(vfptr));
+                                    }
+                                }
+                            }
+                            // CI 81：dump 异常对象 40 字节（QWORD 视角）——std::system_error
+                            // 布局 +0x00 vftable、+0x08 error_code::_Val、+0x10 category*、
+                            // +0x18 起 std::string；可据此读错误码值定位"resource unavailable try again"
+                            // 对应的系统错误。对象在堆上（payload 可执行页外），SafeReadBytes 兜底。
+                            uint64_t objq[5] = {0};
+                            if (SafeReadBytes(objPtr, objq, sizeof(objq))) {
+                                DebugLog("[veh] 异常对象[1] qword: [0]=%016llX [1]=%016llX [2]=%016llX [3]=%016llX [4]=%016llX",
+                                         (unsigned long long)objq[0], (unsigned long long)objq[1],
+                                         (unsigned long long)objq[2], (unsigned long long)objq[3],
+                                         (unsigned long long)objq[4]);
+                            }
                             // 尝试读 what() 消息：对象+8 处指针若指向可读 ASCII 则打印
                             uintptr_t msgPtr = 0;
                             if (SafeReadBytes(objPtr + 8, &msgPtr, sizeof(msgPtr)) && msgPtr &&
