@@ -320,6 +320,28 @@ public:
             }
         }
 
+        // CI 87：解密后立即全量 CRC 校验（页面此刻 = 打包明文，重定位/导入还没改）。
+        // 索引块布局：isCode(pageCount) + 每页明文 CRC(pageCount*4)（packer 写入）。
+        // 若解密正确 → 全部页 CRC 匹配 → 加载内容=打包明文，问题在运行期；
+        // 若有页不匹配 → 解密/加载缺陷实锤（哪些页、差多少）。
+        {
+            const uint32_t* crcTable = nullptr;
+            if (isCodeLen >= (uint32_t)((size_t)pageCount + (size_t)pageCount * 4))
+                crcTable = reinterpret_cast<const uint32_t*>(isCode + pageCount);
+            int bad = 0;
+            for (uint32_t i = 0; i < pageCount && crcTable; i++) {
+                uint32_t actual = fnv1a32(reinterpret_cast<const unsigned char*>(pageBase[i]), pageSize);
+                if (actual != crcTable[i]) {
+                    if (bad < 8)
+                        DebugLog("[loader] 解密CRC不一致 i=%u 期望=0x%08X 实际=0x%08X isCode=%d",
+                                 i, crcTable[i], actual, (int)pages[i].isCode);
+                    bad++;
+                }
+            }
+            if (crcTable) DebugLog("[loader] 解密CRC校验: 共 %u 页, 不一致 %d 页", pageCount, bad);
+            else DebugLog("[loader] 解密CRC校验: 旧产物无 CRC 表，跳过");
+        }
+
         bool relocated = (reinterpret_cast<uint64_t>(workBase) != preferredBase);
         DebugLog("[loader] ckpt: 准备 ApplyRelocations (workBase=%p preferredBase=0x%llX relocated=%d)",
                  workBase, (unsigned long long)preferredBase, (int)relocated);

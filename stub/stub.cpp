@@ -373,7 +373,7 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int)
     pearmor::PagedLoader loader;
     const wchar_t* origName = (meta.origFileName[0] != 0) ? meta.origFileName : nullptr;
     if (!loader.Load(payload.data(), payloadLen,
-                     innerKey, idxPlain.data(), pageCount, entryRva,
+                     innerKey, idxPlain.data(), (uint32_t)idxPlain.size(), pageCount, entryRva,
                      seed32, origName)) {
         DebugLog("[stub] 分页加载失败");
         fprintf(stderr, "[stub] 分页加载失败\n");
