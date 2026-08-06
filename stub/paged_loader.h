@@ -302,7 +302,7 @@ public:
         // 重定位 delta 的基准 workBase；连续模式下 workBase=镜像线性基址，
         // 非连续模式下 workBase=数据块基址（重定位按它算 delta，必须一致）。
         // 原文件名来自 overlay（packer 写入）。这样 FixImports 替换 GetModule* 时伪装即生效。
-        ManualPeLoader::ModuleFake::Init(reinterpret_cast<uintptr_t>(workBase), origFileName);
+        pearmor::ModuleFake::Init(reinterpret_cast<uintptr_t>(workBase), origFileName);
         if (!ManualPeLoader::FixImports(workBase, opt)) { DebugLog("[loader] 修复导入表失败"); return false; }
         DebugLog("[loader] ckpt: FixImports 完成");
         DebugLog("[loader] ckpt: FixImports 完成, 准备 FixDelayImports");

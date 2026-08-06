@@ -260,6 +260,74 @@ struct LoadResult {
     uint32_t err = 0;
 };
 
+// ============ 模块伪装（CI 74） ============
+// 目标程序若调用 GetModuleFileNameW(NULL)/GetModuleHandle(NULL) 获取“自身”信息，
+// 手动映射的 payload 不在 PEB 模块表，系统会返回 stub 的路径/基址 → 业务判定
+// “自身异常”（如 exe 名/版本/路径不符）→ 主动 RaiseException(0xE06D7363)。
+// 解法：在 FixImports 阶段把 payload 导入的这 4 个 API 替换为下面的伪装实现。
+//   - GetModuleFileNameW/A(NULL) -> 返回 overlay 里记录的原版文件名
+//   - GetModuleHandleW/A(NULL)   -> 返回 payload 基址（手动映射的镜像）
+// 非 NULL 参数一律转发真函数（stub 自身仍是已注册模块）。
+// 注意：必须放在命名空间作用域（ManualPeLoader 类外）——C++ 不允许类内嵌 namespace。
+namespace ModuleFake {
+    // 全局：payload 基址 + 原版文件名（Load 时设置）
+    inline uintptr_t gPayloadBase = 0;
+    inline wchar_t    gOrigName[64] = {0};
+    inline wchar_t    gFakePath[MAX_PATH] = {0}; // 原版路径（目录 + 原文件名）
+
+    // 根据 payload 基址拼出“伪装路径”：<payload 所在目录>\<原文件名>
+    // 目录取 stub 自身目录（两者同目录分发），文件名用原版名。
+    inline void Init(uintptr_t payloadBase, const wchar_t* origName)
+    {
+        gPayloadBase = payloadBase;
+        if (origName) {
+            wcsncpy(gOrigName, origName, 63);
+            gOrigName[63] = 0;
+            wchar_t self[MAX_PATH] = {0};
+            GetModuleFileNameW(nullptr, self, MAX_PATH);
+            // 去掉 stub 文件名，保留目录
+            wchar_t* slash = wcsrchr(self, L'\\');
+            if (slash) *slash = 0; else self[0] = 0;
+            swprintf(gFakePath, MAX_PATH, L"%s\\%s", self, gOrigName);
+        }
+    }
+
+    inline HMODULE WINAPI FakeGetModuleHandleW(LPCWSTR name)
+    {
+        if (!name) return reinterpret_cast<HMODULE>(gPayloadBase);
+        return GetModuleHandleW(name);
+    }
+    inline HMODULE WINAPI FakeGetModuleHandleA(LPCSTR name)
+    {
+        if (!name) return reinterpret_cast<HMODULE>(gPayloadBase);
+        return GetModuleHandleA(name);
+    }
+    inline DWORD WINAPI FakeGetModuleFileNameW(HMODULE h, LPWSTR buf, DWORD sz)
+    {
+        if (!h || h == reinterpret_cast<HMODULE>(gPayloadBase)) {
+            if (!buf || !sz) return 0;
+            if (gFakePath[0]) {
+                DWORD n = (DWORD)wcslen(gFakePath);
+                if (n >= sz) n = sz - 1;
+                memcpy(buf, gFakePath, n * sizeof(wchar_t));
+                buf[n] = 0;
+                return n;
+            }
+            // 无原文件名（旧产物）：退化为 stub 自身路径
+            return GetModuleFileNameW(nullptr, buf, sz);
+        }
+        return GetModuleFileNameW(h, buf, sz);
+    }
+    inline DWORD WINAPI FakeGetModuleFileNameA(HMODULE h, LPSTR buf, DWORD sz)
+    {
+        wchar_t tmp[MAX_PATH] = {0};
+        DWORD n = FakeGetModuleFileNameW(h, tmp, MAX_PATH);
+        if (!n) return 0;
+        DWORD k = WideCharToMultiByte(CP_ACP, 0, tmp, (int)n, buf, (int)sz, nullptr, nullptr);
+        return k;
+    }
+} // namespace ModuleFake
+
 class ManualPeLoader {
 public:
     ManualPeLoader() = default;
@@ -444,73 +512,6 @@ public:
     }
 
     // ---------- 导入修复 ----------
-
-    // ============ 模块伪装（CI 74） ============
-    // 目标程序若调用 GetModuleFileNameW(NULL)/GetModuleHandle(NULL) 获取“自身”信息，
-    // 手动映射的 payload 不在 PEB 模块表，系统会返回 stub 的路径/基址 → 业务判定
-    // “自身异常”（如 exe 名/版本/路径不符）→ 主动 RaiseException(0xE06D7363)。
-    // 解法：在 FixImports 阶段把 payload 导入的这 4 个 API 替换为下面的伪装实现。
-    //   - GetModuleFileNameW/A(NULL) -> 返回 overlay 里记录的原版文件名
-    //   - GetModuleHandleW/A(NULL)   -> 返回 payload 基址（手动映射的镜像）
-    // 非 NULL 参数一律转发真函数（stub 自身仍是已注册模块）。
-    namespace ModuleFake {
-        // 全局：payload 基址 + 原版文件名（Load 时设置）
-        inline uintptr_t gPayloadBase = 0;
-        inline wchar_t    gOrigName[64] = {0};
-        inline wchar_t    gFakePath[MAX_PATH] = {0}; // 原版路径（目录 + 原文件名）
-
-        // 根据 payload 基址拼出“伪装路径”：<payload 所在目录>\<原文件名>
-        // 目录取 stub 自身目录（两者同目录分发），文件名用原版名。
-        inline void Init(uintptr_t payloadBase, const wchar_t* origName)
-        {
-            gPayloadBase = payloadBase;
-            if (origName) {
-                wcsncpy(gOrigName, origName, 63);
-                gOrigName[63] = 0;
-                wchar_t self[MAX_PATH] = {0};
-                GetModuleFileNameW(nullptr, self, MAX_PATH);
-                // 去掉 stub 文件名，保留目录
-                wchar_t* slash = wcsrchr(self, L'\\');
-                if (slash) *slash = 0; else self[0] = 0;
-                swprintf(gFakePath, MAX_PATH, L"%s\\%s", self, gOrigName);
-            }
-        }
-
-        inline HMODULE WINAPI FakeGetModuleHandleW(LPCWSTR name)
-        {
-            if (!name) return reinterpret_cast<HMODULE>(gPayloadBase);
-            return GetModuleHandleW(name);
-        }
-        inline HMODULE WINAPI FakeGetModuleHandleA(LPCSTR name)
-        {
-            if (!name) return reinterpret_cast<HMODULE>(gPayloadBase);
-            return GetModuleHandleA(name);
-        }
-        inline DWORD WINAPI FakeGetModuleFileNameW(HMODULE h, LPWSTR buf, DWORD sz)
-        {
-            if (!h || h == reinterpret_cast<HMODULE>(gPayloadBase)) {
-                if (!buf || !sz) return 0;
-                if (gFakePath[0]) {
-                    DWORD n = (DWORD)wcslen(gFakePath);
-                    if (n >= sz) n = sz - 1;
-                    memcpy(buf, gFakePath, n * sizeof(wchar_t));
-                    buf[n] = 0;
-                    return n;
-                }
-                // 无原文件名（旧产物）：退化为 stub 自身路径
-                return GetModuleFileNameW(nullptr, buf, sz);
-            }
-            return GetModuleFileNameW(h, buf, sz);
-        }
-        inline DWORD WINAPI FakeGetModuleFileNameA(HMODULE h, LPSTR buf, DWORD sz)
-        {
-            wchar_t tmp[MAX_PATH] = {0};
-            DWORD n = FakeGetModuleFileNameW(h, tmp, MAX_PATH);
-            if (!n) return 0;
-            DWORD k = WideCharToMultiByte(CP_ACP, 0, tmp, (int)n, buf, (int)sz, nullptr, nullptr);
-            return k;
-        }
-    } // namespace ModuleFake
 
     // 解析系统 DLL 模块基址：优先 PEB/自研映射（绕过钩子），失败退回系统 API。
     // 注意：LoadLibraryA 只用于【系统依赖 DLL】（kernel32/user32/gdi32 等），
