@@ -83,7 +83,11 @@ private:
     {
         // 调试状态探测用最轻量、不触发自身钩子的 API
         const uint64_t KEY_ROTATE_MS = 60000;   // P3.5：密钥每 60s 轮换一次
-        uint64_t lastRotate = 0;
+        // 【CI 73 根因】lastRotate 必须初始化为“当前时间”，不能是 0！
+        // GetTickCount64() 返回系统开机以来的毫秒数（通常几千万），若 lastRotate=0，
+        // 第一次循环（启动 250ms 内）就满足 now-0>60000 → 立刻 RotateKey → 密钥轮换后
+        // 页面里还是旧密钥密文 → VEH 用新密钥解密 → CRC 失败 → 误自毁 0xC0000001。
+        uint64_t lastRotate = GetTickCount64();
 
         while (!stop_.load(std::memory_order_relaxed)) {
             Sleep(250);

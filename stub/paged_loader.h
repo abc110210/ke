@@ -393,11 +393,18 @@ public:
             if (!gatingEnabled) {
                 // 诊断模式：所有页保持明文，代码页可执行、数据页可读写
                 DWORD old = 0; SIZE_T sz = pageSize; PVOID p = pageBase[i];
+                NTSTATUS st = STATUS_SUCCESS;
                 if (pages[i].isCode) {
-                    Sys::ProtectVirtualMemory(GetCurrentProcess(), &p, &sz, PAGE_EXECUTE_READ, &old);
+                    st = Sys::ProtectVirtualMemory(GetCurrentProcess(), &p, &sz, PAGE_EXECUTE_READ, &old);
                     pages[i].baseCrc = fnv1a32(reinterpret_cast<const unsigned char*>(pageBase[i]), pageSize);
                 } else {
-                    Sys::ProtectVirtualMemory(GetCurrentProcess(), &p, &sz, PAGE_READWRITE, &old);
+                    st = Sys::ProtectVirtualMemory(GetCurrentProcess(), &p, &sz, PAGE_READWRITE, &old);
+                }
+                // CI 73：必须检查保护设置结果——若失败（如页未提交/对齐问题），页面保持
+                // 初始 PAGE_READWRITE → 执行代码页时取指 AV（组合 2 页 57 症状），且无日志极难定位。
+                if (!NT_SUCCESS(st)) {
+                    DebugLog("[loader] all_off 保护设置失败 i=%u isCode=%d base=%p st=0x%08X",
+                             i, (int)pages[i].isCode, pageBase[i], (unsigned)st);
                 }
                 pages[i].decrypted = true;
                 continue;
@@ -786,6 +793,29 @@ private:
                 // fault 在外 → Hanbot 自身代码写野指针（RIP 字节 48 89 74 C3 10=mov [rbx+rax*8+0x10],rsi）。
                 // 补关键寄存器（rax/rbx/rcx/rdx/rsi/rdi/rbp）便于追野指针来源。
                 auto* ctx = ep->ContextRecord;
+                // CI 73：取指 AV（fault=-1）时定位 RIP 所在页的 isCode/保护状态——
+                // 若 isCode=1 但页不可执行 => all_off 分支保护设置失败；若 isCode=0 =>
+                // 业务代码跳进了数据页（IAT/重定位错）。VirtualQuery 拿实际保护。
+                {
+                    uintptr_t rip2 = reinterpret_cast<uintptr_t>(rec->ExceptionAddress);
+                    int pgIsCode = -1; DWORD pgProt = 0; uintptr_t pgBase2 = 0;
+                    if (self && !self->pageBase.empty()) {
+                        uintptr_t b0 = reinterpret_cast<uintptr_t>(self->pageBase[0]);
+                        uintptr_t off = rip2 - b0;
+                        if (rip2 >= b0 && off < (size_t)self->pageCount * self->pageSize) {
+                            uint32_t pi = (uint32_t)(off / self->pageSize);
+                            if (pi < self->pageCount) {
+                                pgIsCode = self->pages[pi].isCode ? 1 : 0;
+                                pgBase2 = reinterpret_cast<uintptr_t>(self->pageBase[pi]);
+                                MEMORY_BASIC_INFORMATION mbi;
+                                if (VirtualQuery(reinterpret_cast<LPCVOID>(rip2), &mbi, sizeof(mbi)))
+                                    pgProt = mbi.Protect;
+                            }
+                        }
+                    }
+                    DebugLog("[veh] 取指AV页面诊断: RIP页 isCode=%d 页基址=%p 实际保护=0x%X (期望代码页=EXECUTE_READ 0x20)",
+                             pgIsCode, reinterpret_cast<void*>(pgBase2), (unsigned)pgProt);
+                }
                 DebugLog("[veh] AV 不在镜像内: code=0x%08X addr=%p (%s%s 偏移=0x%llX) fault=%p (%s%s) RIP字节=%02X%02X%02X%02X%02X%02X%02X%02X | rax=%p rbx=%p rcx=%p rdx=%p rsi=%p rdi=%p rbp=%p rsp=%p 栈顶=%p (模块=%s) 次栈顶=%p",
                          (unsigned)rec->ExceptionCode, rec->ExceptionAddress,
                          mod[0] ? mod : "?", mod[0] ? "" : "",
