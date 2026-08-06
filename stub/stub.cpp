@@ -477,9 +477,11 @@ static DWORD WINAPI TlsMountWrapper(LPVOID arg)
     (void)arg;
     void* start = g_origStart;
     void* a     = g_origArg;
-    // CI 89/91：挂当前线程的 payload TLS（TlsAlloc 分配的 index，TlsSetValue 配套）
-    if (g_payloadTlsIndex != 0xFFFFFFFFu && g_payloadTlsData)
-        TlsSetValue(static_cast<DWORD>(g_payloadTlsIndex), g_payloadTlsData);
+    // CI 89/91：挂当前线程的 payload TLS。直接调命名空间自由函数
+    // MountCurrentThreadTls()——内部已是 TlsSetValue 实现（TlsAlloc 唯一 index），
+    // 且带 null 检查 + __try 保护；比在文件作用域裸用 g_payloadTlsIndex 更稳
+    // （裸用会 C2065，那些变量在 pearmor 命名空间内）。
+    pearmor::MountCurrentThreadTls();
     return (reinterpret_cast<DWORD(WINAPI*)(LPVOID)>(start))(a);
 }
 
