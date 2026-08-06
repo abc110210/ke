@@ -429,3 +429,31 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int)
     loader.Release();
     return rc;
 }
+
+// ============================================================================
+// P3.4 注入拦截决策函数实现（CI 83）
+// 定义在 .cpp 而非头文件：extern "C" inline 只产生弱 COMDAT 符号，
+// 汇编 obj（hook_shim.asm）引用时链接失败（LNK2019），强符号才能被解析。
+// 决策路径要求【可重入、无副作用、零 kernel32/user32 依赖】——
+// shim 是在 ntdll 入口被跳转进来的，任何线程都可能随时进入；
+// PidOfHandle 走原生 NtQueryInformationProcess syscall，不触发被钩函数。
+// ============================================================================
+extern "C" __declspec(noinline) int InjectShouldBlock(int which, void* arg)
+{
+    using namespace pearmor::InjectBlock;
+    if (!g_selfPid) return 0;
+    if (which == 2) {
+        // NtOpenProcess：arg = CLIENT_ID*，UniqueProcess == 本进程 -> 拦截
+        if (arg) {
+            ULONG_PTR pid = *(const ULONG_PTR*)arg;
+            if (pid == g_selfPid) return 1;
+        }
+        return 0;
+    }
+    // which 0/1：arg = ProcessHandle。目标为其它进程 -> 拦截。
+    // 伪句柄 (HANDLE)-1 恒等于当前进程（GetCurrentProcess），直接比较。
+    HANDLE hProc = (HANDLE)arg;
+    if (hProc && hProc != (HANDLE)-1 && PidOfHandle(hProc) != g_selfPid)
+        return 1;
+    return 0;
+}

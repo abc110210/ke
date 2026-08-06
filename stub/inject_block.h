@@ -53,26 +53,9 @@ static DWORD PidOfHandle(HANDLE hProc)
 //   which: 0=NtMapViewOfSection 1=NtCreateThreadEx 2=NtOpenProcess
 //   arg:   0/1 -> ProcessHandle 句柄值；2 -> PCLIENT_ID 指针
 // 返回 1 = 拦截，0 = 放行。
-// 注意：必须【可重入、无副作用、不调用任何经过 hook 的 API】——
-// shim 是在 ntdll 入口被跳转进来的，任何线程都可能随时进入。
-extern "C" __declspec(noinline) inline int InjectShouldBlock(int which, void* arg)
-{
-    if (!g_selfPid) return 0;
-    if (which == 2) {
-        // NtOpenProcess：arg = CLIENT_ID*，UniqueProcess == 本进程 -> 拦截
-        if (arg) {
-            ULONG_PTR pid = *(const ULONG_PTR*)arg;
-            if (pid == g_selfPid) return 1;
-        }
-        return 0;
-    }
-    // which 0/1：arg = ProcessHandle。目标为其它进程 -> 拦截。
-    // 伪句柄 (HANDLE)-1 恒等于当前进程（GetCurrentProcess），直接比较。
-    HANDLE hProc = (HANDLE)arg;
-    if (hProc && hProc != (HANDLE)-1 && PidOfHandle(hProc) != g_selfPid)
-        return 1;
-    return 0;
-}
+// 实现定义在 stub.cpp（CI 83：extern "C" inline 只生成弱 COMDAT 符号，
+// 汇编 obj 引用解析失败 LNK2019，必须移到 .cpp 产生强符号）。
+extern "C" int InjectShouldBlock(int which, void* arg);
 
 // ---- hook_shim.asm 导出的 shim 与 trampoline 槽 ----
 extern "C" void InjectShim0(void);   // NtMapViewOfSection

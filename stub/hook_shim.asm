@@ -110,7 +110,9 @@ block2:
 InjectShim2 ENDP
 
 ; ---------------- 全局 trampoline 指针（Install 时写入） ----------------
+; 注意：MASM 数据符号默认 PRIVATE（不导出），必须 PUBLIC 供 C++ 链接。
 .data
+PUBLIC gTramp0, gTramp1, gTramp2
 gTramp0 QWORD 0
 gTramp1 QWORD 0
 gTramp2 QWORD 0
