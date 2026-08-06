@@ -143,16 +143,17 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int)
             LARGE_INTEGER fsz = {0};
             dSize = (GetFileSizeEx(h, &fsz) != 0);
             dSizeVal = fsz.QuadPart;
-            bool ok = dSize && fsz.QuadPart > 80;
+            constexpr uint64_t kFooterSz = sizeof(pearmor::Overlay::Footer); // CI 74 起含 origFileName
+            bool ok = dSize && fsz.QuadPart > (LONGLONG)kFooterSz;
             if (ok) {
-                LARGE_INTEGER off; off.QuadPart = fsz.QuadPart - 80;
+                LARGE_INTEGER off; off.QuadPart = fsz.QuadPart - (LONGLONG)kFooterSz;
                 dSeek = SetFilePointerEx(h, off, nullptr, FILE_BEGIN) != 0;
                 ok = dSeek;
                 DWORD rd = 0;
-                if (ok) ok = (ReadFile(h, &meta, 80, &rd, nullptr) != 0);
+                if (ok) ok = (ReadFile(h, &meta, (DWORD)kFooterSz, &rd, nullptr) != 0);
                 dFooterRd = rd;
                 dFooterMagic = meta.magic;
-                if (ok) ok = (rd == 80 && meta.magic == pearmor::Overlay::kMagic &&
+                if (ok) ok = (rd == kFooterSz && meta.magic == pearmor::Overlay::kMagic &&
                               meta.version == pearmor::Overlay::kVersion);
                 if (ok) {
                     auto readAll = [&](uint64_t fileOff, void* buf, uint32_t len) -> bool {
@@ -170,11 +171,11 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int)
                         }
                         return true;
                     };
-                    // 布局：stub | payload(payloadLen) | index(indexLen) | footer(80)
-                    // index 偏移 = 文件末尾 - 80 - indexLen；payload 偏移 = index 偏移 - payloadLen。
+                    // 布局：stub | payload(payloadLen) | index(indexLen) | footer(kFooterSz)
+                    // index 偏移 = 文件末尾 - kFooterSz - indexLen；payload 偏移 = index 偏移 - payloadLen。
                     // 【CI 53 实证】此前 indexOff 少了 -indexLen（写成 fsz-80=footer 位置），
                     // 从 footer 处读 indexLen 字节 → 超文件末尾 → 读不满 → Index=0。
-                    uint64_t indexOff   = (uint64_t)fsz.QuadPart - 80 - (uint64_t)meta.indexLen;
+                    uint64_t indexOff   = (uint64_t)fsz.QuadPart - kFooterSz - (uint64_t)meta.indexLen;
                     uint64_t payloadOff = indexOff - (uint64_t)meta.payloadLen;
                     ok = (payloadOff <= indexOff);
                     if (ok) {
@@ -219,7 +220,8 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int)
             if (GetFileAttributesExW(path, GetFileExInfoStandard, &fad))
                 fileSize.QuadPart = ((LONGLONG)fad.nFileSizeHigh << 32) | fad.nFileSizeLow;
             uint64_t overlayTotal = (uint64_t)fileSize.QuadPart - fileDataEnd;
-            if (ovMem && overlayTotal >= 80) {
+            constexpr uint64_t kFooterSz = sizeof(pearmor::Overlay::Footer);
+            if (ovMem && overlayTotal >= kFooterSz) {
                 // VirtualQuery 逐页预检：overlay 区域必须全部 COMMIT 且可读，否则放弃
                 bool memReadable = true;
                 MEMORY_BASIC_INFORMATION mbi;
@@ -234,12 +236,12 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int)
                 }
                 dMemPrecheck = memReadable;
                 if (memReadable) {
-                    uint8_t* footerPtr = reinterpret_cast<uint8_t*>(ovMem) + overlayTotal - 80;
-                    memcpy(&meta, footerPtr, 80);
+                    uint8_t* footerPtr = reinterpret_cast<uint8_t*>(ovMem) + overlayTotal - kFooterSz;
+                    memcpy(&meta, footerPtr, (size_t)kFooterSz);
                     dMemMagic = meta.magic;
                     if (meta.magic == pearmor::Overlay::kMagic &&
                         meta.version == pearmor::Overlay::kVersion) {
-                        uint64_t need = (uint64_t)meta.payloadLen + (uint64_t)meta.indexLen + 80;
+                        uint64_t need = (uint64_t)meta.payloadLen + (uint64_t)meta.indexLen + sizeof(pearmor::Overlay::Footer);
                         if (need <= overlayTotal) {
                             try {
                                 payload.resize(meta.payloadLen);
@@ -367,10 +369,12 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int)
     }
 
     // 6) 分页加载加密目标（解密 + 修复导入/重定位 + 门控代码页 + 覆写 PE 头）
+    //    CI 74：把原版文件名（overlay footer）传给 loader 做模块伪装。
     pearmor::PagedLoader loader;
+    const wchar_t* origName = (meta.origFileName[0] != 0) ? meta.origFileName : nullptr;
     if (!loader.Load(payload.data(), payloadLen,
                      innerKey, idxPlain.data(), pageCount, entryRva,
-                     seed32)) {
+                     seed32, origName)) {
         DebugLog("[stub] 分页加载失败");
         fprintf(stderr, "[stub] 分页加载失败\n");
         return -2;

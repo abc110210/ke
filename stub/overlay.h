@@ -24,7 +24,7 @@ namespace pearmor {
 namespace Overlay {
 
 constexpr uint64_t kMagic   = 0x564F524F4D524145ULL; // "PEARMOROV"（小端）
-constexpr uint32_t kVersion = 1;
+constexpr uint32_t kVersion = 2;   // v2：Footer 增加 origFileName（CI 74 模块伪装）
 
 #pragma pack(push, 1)
 struct Footer {
@@ -37,10 +37,14 @@ struct Footer {
     uint8_t  seed[32];       // 随机种子（KDF 唯一输入）
     uint32_t entryRva;       // 目标入口 RVA
     uint32_t payloadCrc;     // 密文整体 CRC（防篡改，可选校验）
-    uint32_t reserved[3];    // 预留（凑整 80 字节）
+    // CI 74：模块伪装——原版 exe 文件名（宽字符，含扩展名，不含路径）。
+    // stub 用它把 GetModuleFileNameW/A 的返回值伪装成原版文件名，
+    // 让目标程序认为自己是原版运行（Hanbot 若校验 exe 名/读自身路径会判定异常 → 主动抛 0xE06D7363）。
+    wchar_t  origFileName[64];  // 最长 63 个宽字符 + 结尾 NUL
+    uint32_t reserved[1];    // 预留（凑整）
 };
 #pragma pack(pop)
-static_assert(sizeof(Footer) == 80, "overlay footer must be 80 bytes");
+static_assert(sizeof(Footer) == 80 + 128 + 4, "overlay footer size mismatch");
 
 // 从自身 PE 文件末尾读取 overlay 负载。
 // 成功返回 true 并填充 payloadOut / indexOut / footer。

@@ -183,7 +183,8 @@ public:
               const unsigned char* innerKey,        // 32 字节，由 seed 经 KDF 派生
               const unsigned char* isCode, uint32_t isCodeLen, // 外层密钥解密后的块索引
               uint64_t& outEntryRva,
-              const unsigned char* seed32 = nullptr) // P3.5：密钥轮换用种子
+              const unsigned char* seed32 = nullptr, // P3.5：密钥轮换用种子
+              const wchar_t* origFileName = nullptr) // CI 74 模块伪装：原版 exe 文件名
     {
         if (!payload || payloadLen == 0) return false;
         DebugLog("[loader] ckpt: Load 进入 payloadLen=%llu", (unsigned long long)payloadLen);
@@ -296,6 +297,12 @@ public:
                  workBase, (unsigned long long)preferredBase, (int)relocated);
         if (relocated && !ManualPeLoader::ApplyRelocations(workBase, preferredBase, opt)) { DebugLog("[loader] 应用重定位失败"); return false; }
         DebugLog("[loader] ckpt: ApplyRelocations 完成, 准备 FixImports");
+        // CI 74 模块伪装：FixImports 前初始化——payload 基址 = workBase（重定位基准。
+        // 业务用 GetModuleHandle(NULL)+RVA 访问自身数据时，期望的“模块基址”就是
+        // 重定位 delta 的基准 workBase；连续模式下 workBase=镜像线性基址，
+        // 非连续模式下 workBase=数据块基址（重定位按它算 delta，必须一致）。
+        // 原文件名来自 overlay（packer 写入）。这样 FixImports 替换 GetModule* 时伪装即生效。
+        ManualPeLoader::ModuleFake::Init(reinterpret_cast<uintptr_t>(workBase), origFileName);
         if (!ManualPeLoader::FixImports(workBase, opt)) { DebugLog("[loader] 修复导入表失败"); return false; }
         DebugLog("[loader] ckpt: FixImports 完成");
         DebugLog("[loader] ckpt: FixImports 完成, 准备 FixDelayImports");
