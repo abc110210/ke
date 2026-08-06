@@ -22,6 +22,7 @@ add_executable(stub
     stub/resources.rc   # 统一图标：编译期嵌入根目录 app.ico（换图标=替换 app.ico 重编 stub）
     stub/pe_loader.h
     stub/syscall.asm
+    stub/hook_shim.asm  # P3.4 注入拦截 inline hook 的汇编 shim（CI 83 修复：SSN/栈参数保真）
     stub/syscall.h
     stub/crypto_page.h
     stub/paged_loader.h
