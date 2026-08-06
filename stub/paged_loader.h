@@ -732,11 +732,13 @@ private:
                 //   [2]=type_info*。若 [0]==0 且 [2] 不可读 → 业务主动 RaiseException 模拟，
                 //   非标准 C++ throw。另 dump type_info 头部 16 字节（MSVC 布局：
                 //   +0x00 vfptr, +0x08 _m_data 内嵌, +0x10 _m_pName）。
-                DebugLog("[veh] 异常参数: n=%u [0]=%p [1]=%p [2]=%p",
+                // CI 77：实测 n=4（标准 throw 是 3）→ 补 dump [3]（可能含异常对象/检测源信息）。
+                DebugLog("[veh] 异常参数: n=%u [0]=%p [1]=%p [2]=%p [3]=%p",
                          (unsigned)rec->NumberParameters,
                          reinterpret_cast<void*>(rec->ExceptionInformation[0]),
                          reinterpret_cast<void*>(rec->ExceptionInformation[1]),
-                         reinterpret_cast<void*>(rec->ExceptionInformation[2]));
+                         reinterpret_cast<void*>(rec->ExceptionInformation[2]),
+                         reinterpret_cast<void*>(rec->NumberParameters > 3 ? rec->ExceptionInformation[3] : 0));
                 {
                     unsigned char tih[32] = {0};
                     if (tiPtr) SafeReadBytes(tiPtr, tih, sizeof(tih));
@@ -749,6 +751,19 @@ private:
             }
             LogRealThrowSite(ep, pb, pe);
             DebugLog("[veh] C++ 异常未捕获 code=0xE06D7363 (真实抛点见上方走栈，落在 payload 内即 payload 自身)");
+            // CI 77：吞异常实验——PEARMOR_SWALLOW_E06D7363=1 时返回 CONTINUE_EXECUTION
+            // 而非 CONTINUE_SEARCH。若业务是「检测到异常环境→主动 RaiseException 自杀」，
+            // 吞掉后业务可能继续运行（窗口照常出现）；若业务是循环检测则立即再抛。
+            // 这是定位「业务为何判定自身异常」的关键实验，非默认行为。
+            {
+                char sw[8] = {0};
+                bool swallow = GetEnvironmentVariableA("PEARMOR_SWALLOW_E06D7363", sw, sizeof(sw)) &&
+                               (sw[0] == '1');
+                if (swallow) {
+                    DebugLog("[veh] PEARMOR_SWALLOW_E06D7363=1，吞掉该异常尝试继续执行");
+                    return EXCEPTION_CONTINUE_EXECUTION;
+                }
+            }
             return EXCEPTION_CONTINUE_SEARCH;
         }
         // CI 66：.pdata 注册（count=1102）后异常能展开，但展开过程 fatal——
