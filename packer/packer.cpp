@@ -223,12 +223,15 @@ int main(int argc, char** argv)
         pearmor::aes256::cbc_encrypt(innerKey, ivPage, img.data() + i * PAGE, PAGE, enc.data() + i * PAGE);
         crc[i] = pearmor::fnv1a32(img.data() + i * PAGE, PAGE);
     }
-    (void)crc; // 每页明文 CRC 预留（后续用于运行期解密校验）
 
-    // 外层加密：块索引(isCode) 用 outerKey 一次性 AES-CBC 加密
-    size_t idxLen = (pageCount + 15) & ~(size_t)15;
+    // 外层加密：块索引(isCode) + 每页明文 CRC 表，用 outerKey 一次性 AES-CBC 加密。
+    // CI 87：索引块扩展 = isCode(pageCount) + crc(pageCount*4)。stub 解密后
+    // 立即全量校验「解密结果 == 打包明文」，定位加载/解密缺陷（此前全部组合
+    // 随机崩溃，业务读全局/堆数据野指针，需确认加载内容本身是否正确）。
+    size_t idxLen = (pageCount + pageCount * 4 + 15) & ~(size_t)15;
     std::vector<uint8_t> idxPlain(idxLen, 0);
     memcpy(idxPlain.data(), isCode.data(), pageCount);
+    memcpy(idxPlain.data() + pageCount, crc.data(), pageCount * 4);
     std::vector<unsigned char> encIndex(idxLen, 0);
     {
         unsigned char oiv[16];
