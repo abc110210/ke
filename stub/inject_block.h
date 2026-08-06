@@ -255,9 +255,16 @@ static bool PatchOne(Hook& h, const char* name, void* shimAddr, void** trampSlot
 }
 
 // 安装全部钩子。需在 Sys::Init() 之后调用。
+// CI 85：NtMapViewOfSection hook 默认【跳过】——组合 1(全开)崩 vs 组合 5(注入关)
+// 存活的唯一差异就是 inject hook，而 MapView 被 LoadLibrary/COM 激活(CoCreateInstance
+// 延迟加载 DLL)高频调用，hook 出错影响面最大（组合 2 出现 combase.dll 内 AV）。
+// 防注入核心能力 = NtCreateThreadEx(拦远程线程) + NtOpenProcess(拦进程打开)，
+// 这两个保留；需要 MapView 拦截时设 PEARMOR_ENABLE_MAPVIEW_HOOK=1 恢复。
 inline bool Install()
 {
     g_selfPid = GetCurrentProcessId();
+    char mv[8] = {0};
+    bool mapView = GetEnvironmentVariableA("PEARMOR_ENABLE_MAPVIEW_HOOK", mv, sizeof(mv)) && mv[0] == '1';
     const char* names[3] = {
         OBF_STR("NtMapViewOfSection"),
         OBF_STR("NtCreateThreadEx"),
@@ -267,8 +274,12 @@ inline bool Install()
     void* shims[3] = { (void*)&InjectShim0, (void*)&InjectShim1, (void*)&InjectShim2 };
     void** slots[3] = { &gTramp0, &gTramp1, &gTramp2 };   // gTrampN 是 void* 变量，取址即 void**
     bool all = true;
-    for (int i = 0; i < 3; i++)
+    for (int i = 0; i < 3; i++) {
+        if (i == 0 && !mapView) continue;   // CI 85：MapView 默认跳过
         if (!PatchOne(g_hooks[i], names[i], shims[i], slots[i])) all = false;
+    }
+    DebugLog("[stub] P3.4 注入拦截：MapView=%s CreateThreadEx=%d OpenProcess=%d",
+             mapView ? "on" : "off(CI 85 默认跳过)", (int)g_hooks[1].active, (int)g_hooks[2].active);
     return all;
 }
 
