@@ -15,6 +15,7 @@
 #include <cstring>
 #include <cwchar>
 #include <vector>
+#include <memory>        // std::unique_ptr（看门狗 Guard 挂函数作用域）
 
 // 前向声明：供 codegen.h 等被包含的头文件中的内联函数（如 CodeGen::RunOnce）
 // 调用。DebugLog 的完整定义见本文件下方；此处提前声明，避免「include 顺序晚于
@@ -381,15 +382,37 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int)
     memset(outerKey, 0, sizeof(outerKey));
 
     // 6.1) P3.4 安装注入拦截 / 调试器附加阻断（在所有原生系统调用就绪后）
-    pearmor::InjectBlock::Install();
-    DebugLog("[stub] P3.4 注入拦截已安装");
+    //      诊断开关：PEARMOR_DISABLE_INJECT_BLOCK=1 跳过安装，用于隔离
+    //      "inline hook NtOpenProcess 等与业务冲突" vs "加载/解密/门控本身"。
+    {
+        char v[8] = {0};
+        bool skipInject = GetEnvironmentVariableA("PEARMOR_DISABLE_INJECT_BLOCK", v, sizeof(v)) && (v[0] == '1');
+        if (skipInject) {
+            DebugLog("[stub] PEARMOR_DISABLE_INJECT_BLOCK=1，跳过注入拦截安装");
+        } else {
+            pearmor::InjectBlock::Install();
+            DebugLog("[stub] P3.4 注入拦截已安装");
+        }
+    }
 
     // 6.2) P3.3 启动看门狗监控线程（调试探测 / 钩子完整性 / CRC / 密钥轮换）
     //      自毁回调指向 loader 的 SelfDestructNow（擦内存 + 终止）。
-    auto wdDestruct = [&loader]() { loader.SelfDestructNow(); };
-    pearmor::Watchdog::Guard watchdog(&loader, wdDestruct);
-    watchdog.Start();
-    DebugLog("[stub] P3.3 看门狗已启动");
+    //      诊断开关：PEARMOR_DISABLE_WATCHDOG=1 不启动，用于隔离
+    //      "看门狗线程/密钥轮换/重加密竞态" vs "业务代码冲突"。
+    //      注意：Guard 必须存活到函数结束（跳 OEP 后仍要监控），故用 unique_ptr 挂函数作用域。
+    std::unique_ptr<pearmor::Watchdog::Guard> watchdog;
+    {
+        char v[8] = {0};
+        bool skipWd = GetEnvironmentVariableA("PEARMOR_DISABLE_WATCHDOG", v, sizeof(v)) && (v[0] == '1');
+        if (skipWd) {
+            DebugLog("[stub] PEARMOR_DISABLE_WATCHDOG=1，跳过看门狗启动");
+        } else {
+            auto wdDestruct = [&loader]() { loader.SelfDestructNow(); };
+            watchdog = std::make_unique<pearmor::Watchdog::Guard>(&loader, wdDestruct);
+            watchdog->Start();
+            DebugLog("[stub] P3.3 看门狗已启动");
+        }
+    }
 
     // 6.3) 跳原始入口（经 VEH 控制流混淆演示一次跳转；首执行触发按需解密）
     int rc = loader.CallEntry(entryRva);
