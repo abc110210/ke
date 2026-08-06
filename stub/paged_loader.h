@@ -355,18 +355,12 @@ public:
         pearmor::ModuleFake::Init(reinterpret_cast<uintptr_t>(workBase), origFileName);
         if (!ManualPeLoader::FixImports(workBase, opt)) { DebugLog("[loader] 修复导入表失败"); return false; }
         DebugLog("[loader] ckpt: FixImports 完成");
-        // CI 94：把 payload 注册进 PEB LDR 模块表——手动映射的 payload 不在 LDR 链，
-        // 业务遍历模块表找不到自己 → 判定被加壳 → 主动 RaiseException(0xC0000005) 模拟
-        // 取指 AV 自杀（CI 93 组合 9 吞掉假 AV 存活 20s 实锤）。注册后业务能看到「原版 exe」。
-        {
-            bool ldrOk = pearmor::ModuleFake::RegisterLdrModule(
-                workBase, opt.SizeOfImage,
-                pearmor::ModuleFake::gFakePath[0] ? pearmor::ModuleFake::gFakePath : nullptr);
-            DebugLog("[loader] 模块伪装: LDR 注册 %s (payload=%p size=0x%X name=%ls)",
-                     ldrOk ? "成功" : "失败(忽略)",
-                     workBase, (unsigned)opt.SizeOfImage,
-                     pearmor::ModuleFake::gOrigName);
-        }
+        // CI 94/95 尝试过 LDR 模块表注册（让业务遍历模块表能看到 payload），但：
+        //  - 手工置零 entry → ntdll 遍历读未初始化字段崩（ntdll 0xB832）
+        //  - 复制 stub entry → 业务仍检测到异常（假 AV 回归），且组合 9 吞假 AV 也死
+        // 结论：LDR 注册弊大于利，撤掉。业务检测点不是（或不仅是）LDR 模块表；
+        // 主防线改为 CI 96 的「默认吞假 AV」——业务主动 RaiseException(0xC0000005)
+        // 模拟取指 AV 自杀时 VEH 吞掉继续执行（CI 93 组合 9 存活 20s 实证业务能跑）。
         DebugLog("[loader] ckpt: FixImports 完成, 准备 FixDelayImports");
         // CI 54 定位：崩在 FixImports 完成 与「跳过 RtlAddFunctionTable」之间，
         // 即 FixDelayImports 或 TLS 回调执行 —— 分步打日志锁定。
@@ -1037,20 +1031,23 @@ private:
                 // = 页内地址（如 ...9159），fault=-1 只可能是【业务主动 RaiseException(0xC0000005,
                 // 0, 2, {0, (ULONG_PTR)-1}) 模拟取指 AV 自杀】或 jmp/ret 到 -1。若 RIP 在镜像内
                 // → 主动自杀嫌疑极高（与 CI 77 吞 0xE06D7363 是同类行为，只是换异常码）。
-                // PEARMOR_SWALLOW_FAKE_AV=1 时吞掉继续执行——业务 RaiseException 后若无
-                // ExitProcess 会继续跑（窗口照常出现）；若紧接自杀则照常退出，可反向确认。
+                // CI 93 实证：组合 9（吞掉）存活 20s、窗口正常 → 业务抛完假 AV 后无 ExitProcess，
+                // 继续正常跑。CI 96 起【默认吞掉】作为正式防线（业务反加壳检测的最终兜底）；
+                // PEARMOR_DISABLE_FAKEAV_SWALLOW=1 可关闭（诊断对照用）。
+                // 安全性：jmp -1 的真实取指 AV 其 RIP 会变成 -1（镜像外）→ 不满足「RIP 在镜像内」
+                // → 不吞；只有主动 RaiseException 且 RIP 停在镜像内才吞，误吞概率极低。
                 {
                     uintptr_t rip3 = reinterpret_cast<uintptr_t>(rec->ExceptionAddress);
                     uintptr_t base3 = self ? reinterpret_cast<uintptr_t>(self->imageBase) : 0;
                     bool ripInImage = (base3 && rip3 >= base3 && rip3 < base3 + self->imageSize);
                     if (fault == (uintptr_t)-1 && ripInImage) {
                         char v3[8] = {0};
-                        bool swallowFake =
-                            GetEnvironmentVariableA("PEARMOR_SWALLOW_FAKE_AV", v3, sizeof(v3)) &&
+                        bool disable =
+                            GetEnvironmentVariableA("PEARMOR_DISABLE_FAKEAV_SWALLOW", v3, sizeof(v3)) &&
                             v3[0] == '1';
-                        if (swallowFake) {
-                            DebugLog("[veh] 疑似业务主动抛 AV(fault=-1) 模拟取指AV自杀，"
-                                     "PEARMOR_SWALLOW_FAKE_AV=1 吞掉继续执行");
+                        if (!disable) {
+                            DebugLog("[veh] 业务主动抛 AV(fault=-1) 模拟取指AV自杀，默认吞掉继续执行"
+                                     "（PEARMOR_DISABLE_FAKEAV_SWALLOW=1 可关）");
                             return EXCEPTION_CONTINUE_EXECUTION;
                         }
                         DebugLog("[veh] 疑似业务主动抛 AV(fault=-1, RIP 在镜像内)——"
