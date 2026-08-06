@@ -28,7 +28,7 @@ jobs:
           Write-Host "Defender 排除+实时扫描已关闭: $env:GITHUB_WORKSPACE"
           .\build.ps1
 
-      - name: 运行加壳后的程序（收集日志诊断；样例模式额外断言验证文件）
+      - name: 运行加壳后的程序（隔离实验：5 个保护组合自动对比）
         shell: pwsh
         run: |
           # 产物名带目标主名（build.ps1 输出，如 HanbotSavesUploader_packed.exe），用 glob 定位
@@ -53,26 +53,66 @@ jobs:
           $env:PEARMOR_ALLOW_VM = "1"  # CI runner 本身是 Azure VM 且系统盘<30GB，放行 VM 检测
           # CI 61/62 已验证 CorruptHeader 与崩溃无关（跳过/不跳过日志逐字节一致），恢复完整保护。
           # $env:PEARMOR_NO_CORRUPT_HEADER = "1"  # 隔离诊断用，已移除
-          # 带超时运行：防止反调试/挂起导致 runner 被占几小时
-          $timeoutSec = 30
-          $p = Start-Process -FilePath $out -PassThru -RedirectStandardError "stderr.txt"
-          if (-not $p.WaitForExit($timeoutSec * 1000)) {
-            Write-Host "加壳程序 ${timeoutSec}s 内未退出，强制结束并收集日志"
-            Stop-Process -Id $p.Id -Force -ErrorAction SilentlyContinue
-            $timedOut = $true
-          }
-          Write-Host "exit_code = $($p.ExitCode)"
-          # 无论成败都打印诊断日志，便于定位崩溃（如 0xC0000096 特权指令）
+
+          # ============================================================
+          # 隔离实验矩阵（2026-08-06）：
+          #   baseline 全开预期崩（复现问题）；all-off 纯加载模式验证"加载/解密/导入"
+          #   本身是否健康；gating/watchdog/inject 逐个单独关闭，定位冲突机制。
+          #   GUI 程序正常表现为"常驻不退出"（消息循环），崩溃为"秒退+exit code 非0
+          #   或 [veh] C++ 异常日志"。故判定：20s 超时=存活(GOOD)，提前退出=崩(BAD)。
+          # ============================================================
+          $combos = @(
+            @{ name = "1_baseline";        gating = $null;  watchdog = $null; inject = $null },
+            @{ name = "2_all_off";         gating = "1";    watchdog = "1";   inject = "1" },
+            @{ name = "3_gating_only_off"; gating = "1";    watchdog = $null; inject = $null },
+            @{ name = "4_watchdog_only_off"; gating = $null; watchdog = "1";  inject = $null },
+            @{ name = "5_inject_only_off"; gating = $null;  watchdog = $null; inject = "1" }
+          )
           $tmp = $env:TEMP
-          foreach ($lf in @("$tmp\pearmor_crash.log", "$tmp\pearmor_stub.log", "stderr.txt")) {
-            if (Test-Path $lf) { Write-Host "==== $lf ===="; Get-Content $lf; Write-Host "============" }
+          $anyGood = $false
+          foreach ($c in $combos) {
+            Write-Host "`n========== 组合 $($c.name) ==========" -ForegroundColor Cyan
+            # 清除上次 stub 日志，避免误读旧数据
+            Remove-Item "$tmp\pearmor_stub.log" -ErrorAction SilentlyContinue
+            Remove-Item "$tmp\pearmor_crash.log" -ErrorAction SilentlyContinue
+            $env:PEARMOR_DISABLE_GATING      = if ($c.gating)   { "1" } else { $null }
+            $env:PEARMOR_DISABLE_WATCHDOG    = if ($c.watchdog) { "1" } else { $null }
+            $env:PEARMOR_DISABLE_INJECT_BLOCK = if ($c.inject)  { "1" } else { $null }
+            Write-Host "env: GATING=$env:PEARMOR_DISABLE_GATING WATCHDOG=$env:PEARMOR_DISABLE_WATCHDOG INJECT=$env:PEARMOR_DISABLE_INJECT_BLOCK"
+            $timeoutSec = 20
+            $errFile = "stderr_$($c.name).txt"
+            Remove-Item $errFile -ErrorAction SilentlyContinue
+            $p = Start-Process -FilePath $out -PassThru -RedirectStandardError $errFile
+            if (-not $p.WaitForExit($timeoutSec * 1000)) {
+              Write-Host "[$($c.name)] ${timeoutSec}s 内未退出 -> 存活(疑似正常)，强制结束"
+              Stop-Process -Id $p.Id -Force -ErrorAction SilentlyContinue
+              $anyGood = $true
+            } else {
+              Write-Host "[$($c.name)] exit_code = $($p.ExitCode)"
+            }
+            foreach ($lf in @("$tmp\pearmor_stub.log", "$tmp\pearmor_crash.log", $errFile)) {
+              if (Test-Path $lf) {
+                # 只打印关键行：崩溃点 / 走栈 / Load 结果 / 保护安装日志
+                $lines = Get-Content $lf -ErrorAction SilentlyContinue
+                $key = $lines | Where-Object { $_ -match "veh|Veh|E06D7363|Load 成功|OEP|门控|看门狗|注入拦截|异常|C\+\+|重加密|fatal|0xC000041D|0xC0000005" }
+                if ($key) { Write-Host "---- $lf (关键行) ----"; $key | ForEach-Object { Write-Host $_ }; Write-Host "----------------------" }
+              }
+            }
           }
-          if ($timedOut) { throw "加壳程序运行超时（${timeoutSec}s），可能自挂起或死循环" }
+          # 恢复默认（后续步骤不受影响）
+          Remove-Item Env:PEARMOR_DISABLE_GATING -ErrorAction SilentlyContinue
+          Remove-Item Env:PEARMOR_DISABLE_WATCHDOG -ErrorAction SilentlyContinue
+          Remove-Item Env:PEARMOR_DISABLE_INJECT_BLOCK -ErrorAction SilentlyContinue
+
           # 用户目标模式（test/ 有用户放入的 exe）：加壳成功即达标，运行结果仅作诊断
           # （真实程序的退出码/行为各异，不能按样例标准断言）
           $userMode = (Get-ChildItem ".\test" -Filter *.exe -File -ErrorAction SilentlyContinue).Count -gt 0
           if ($userMode) {
-            Write-Host "用户目标模式：加壳成功即达标，运行日志见上（供诊断）"
+            if ($anyGood) {
+              Write-Host "`n>>> 隔离实验发现：存在可正常运行的组合（all_off 或部分关闭），可据此定位冲突机制"
+            } else {
+              Write-Host "`n>>> 隔离实验：所有组合均崩溃 -> 问题在加载/解密/导入重建本身，与保护机制无关"
+            }
           } else {
             # 样例模式：严格回归（样例程序成功执行会写验证文件）
             if ($p.ExitCode -ne 0) { throw "样例退出码非 0 ($($p.ExitCode))" }
