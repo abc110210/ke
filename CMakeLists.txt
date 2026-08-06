@@ -58,9 +58,11 @@ set_target_properties(stub PROPERTIES
     WIN32_EXECUTABLE TRUE
 )
 
-# ---- Test payload（CI 自检用：加壳后应写验证文件并返回 0） ----
+# ---- Test payload（可选自检样例：仅当 test/test_payload.cpp 存在才构建） ----
+# 注意：用户可能删除 test_payload.cpp、test/ 下只放真实目标 exe（如 HanbotSavesUploader.exe），
+# 此时必须跳过该 target，否则 cmake configure 因找不到源文件而失败。
 option(PEARMOR_BUILD_TEST "Build the test payload" ON)
-if(PEARMOR_BUILD_TEST)
+if(PEARMOR_BUILD_TEST AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/test_payload.cpp")
     add_executable(test_payload
         test/test_payload.cpp
     )

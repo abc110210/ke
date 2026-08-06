@@ -30,22 +30,26 @@ Write-Host "[1/3] CMake 配置..." -ForegroundColor Cyan
 & cmake -S $Root -B $Build -A x64 -DPEARMOR_BUILD_TEST=ON
 if ($LASTEXITCODE -ne 0) { throw "cmake configure 失败" }
 
-# ---- 阶段 1：一次编译 加壳器 + 壳运行时 + 样例（stub 已负载无关） ----
+# ---- 阶段 1：一次编译 加壳器 + 壳运行时（样例 test_payload 存在才编译，可选） ----
 Write-Host "[2/3] 编译 加壳器 + 壳运行时 + 样例..." -ForegroundColor Cyan
-& cmake --build $Build --config Release --target packer stub test_payload --parallel
+$Targets = "packer stub"
+if (Test-Path (Join-Path $Root "test\test_payload.cpp")) { $Targets += " test_payload" }
+& cmake --build $Build --config Release --target $Targets --parallel
 if ($LASTEXITCODE -ne 0) { throw "cmake build 失败" }
 
 # ---- 阶段 2：确定目标并加壳 ----
-# 目标优先级：显式 -Target > test/ 下用户放入的 exe > test_payload 自检样例
+# 目标优先级：显式 -Target > test/ 下用户放入的 exe > 样例 test_payload（可选，cpp 被删则跳过）
 if (-not $Target) {
     $userExe = Get-ChildItem (Join-Path $Root "test") -Filter *.exe -File -ErrorAction SilentlyContinue |
                Select-Object -First 1
     if ($userExe) {
         $Target = $userExe.FullName
         Write-Host "[3/3] 检测到用户目标: $Target（放入 test 文件夹的 exe 自动成为加壳对象）" -ForegroundColor Yellow
-    } else {
+    } elseif (Test-Path (Join-Path $Root "test\test_payload.cpp")) {
         $Target = Join-Path $Build "Release\test_payload.exe"
-        Write-Host "[3/3] test/ 下未发现用户 exe（若已放入请检查 .gitignore 是否忽略 *.exe），改用样例 test_payload" -ForegroundColor Yellow
+        Write-Host "[3/3] test/ 下未发现用户 exe，改用样例 test_payload" -ForegroundColor Yellow
+    } else {
+        throw "test/ 下未发现可加壳的 exe（且 test_payload.cpp 已删除）。请把要加壳的程序放入 test/ 文件夹后重试"
     }
 }
 if (-not (Test-Path $Target)) { throw "未找到目标程序: $Target" }
