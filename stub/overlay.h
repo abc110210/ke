@@ -44,7 +44,8 @@ struct Footer {
     uint32_t reserved[1];    // 预留（凑整）
 };
 #pragma pack(pop)
-static_assert(sizeof(Footer) == 80 + 128 + 4, "overlay footer size mismatch");
+// 原 80 字节中 reserved[3] 占 12；改为 reserved[1](4) + origFileName[64](128) → 80-12+4+128=200
+static_assert(sizeof(Footer) == 200, "overlay footer size mismatch");
 
 // 从自身 PE 文件末尾读取 overlay 负载。
 // 成功返回 true 并填充 payloadOut / indexOut / footer。
