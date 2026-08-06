@@ -376,13 +376,17 @@ namespace ModuleFake {
     }
 
     // CI 94：把 payload 注册进 PEB LDR 模块表（商业加壳器标配）。
-    // 手动映射的 payload 不在 LDR 链 → 业务遍历模块表（PEB->Ldr->InLoadOrderModuleList，
-    // 或 NtQuerySystemInformation(SystemModuleInformation)）找不到自己 → 判定「自身被
-    // 加壳/异常」→ 主动 RaiseException(0xC0000005) 模拟取指 AV 自杀（CI 93 组合 9 吞掉
-    // 假 AV 存活 20s 实锤业务自杀行为）。注册后业务视角里模块表出现「原版 exe」。
-    // 实现：分配 LDR_DATA_TABLE_ENTRY（0x200 足够 x64 布局 ~0x140），填 DllBase/
-    // SizeOfImage/FullDllName/BaseDllName，尾插三条链（InLoadOrder +0x10 / InMemoryOrder
-    // +0x20 / InInitializationOrder +0x30）。加载期单线程执行，无并发，直接操作链表。
+    // 手动映射的 payload 不在 LDR 链 → 业务遍历模块表找不到自己 → 判定「自身被加壳/异常」
+    // → 主动 RaiseException(0xC0000005) 模拟取指 AV 自杀（CI 93 组合 9 吞掉假 AV 存活 20s
+    // 实锤）。注册后业务视角里模块表出现「原版 exe」。
+    // CI 95：改为【复制 stub 自身 LDR entry】——系统 loader 建的 entry 字段完整（Flags/
+    // LoadCount/DdagNode/HashLinks 等），ntdll 遍历（GetModuleHandle/延迟加载等 API 内部）
+    // 读字段不崩。之前手工置零的 entry 在 ntdll 遍历时读未初始化字段（如 DdagNode=0、
+    // EntryPoint=0）→ 崩在 ntdll 0xB832（fault=0x38 = 以 0 为基址读 +0x38）。
+    // 实现：遍历 InLoadOrderModuleList 找 stub 自身（DllBase == GetModuleHandleW(nullptr)），
+    // VirtualAlloc 0x200 复制其完整内容，改 DllBase/SizeOfImage/FullDllName/BaseDllName
+    // （分配新 UNICODE buffer），重置三条链并尾插（复制来的链是 stub 的，必须重建）。
+    // 加载期单线程执行，无并发，直接操作链表。
     // 命名空间作用域自由函数（__try 不能进类成员函数 C2712）。
     inline bool RegisterLdrModule(void* imageBase, DWORD sizeOfImage, const wchar_t* fakePath)
     {
@@ -391,11 +395,23 @@ namespace ModuleFake {
             if (!peb) return false;
             BYTE* ldr = *reinterpret_cast<BYTE**>(peb + 0x18);
             if (!ldr) return false;
+            // 1) 找 stub 自身 entry（DllBase+0x30 == 主模块基址）
+            void* selfBase = GetModuleHandleW(nullptr);
+            BYTE* src = nullptr;
+            LIST_ENTRY* head = reinterpret_cast<LIST_ENTRY*>(ldr + 0x10);
+            for (LIST_ENTRY* p = head->Flink; p != head; p = p->Flink) {
+                BYTE* ent = reinterpret_cast<BYTE*>(p) - 0x00; // InLoadOrderLinks 在 entry 开头
+                if (*reinterpret_cast<void**>(ent + 0x30) == selfBase) { src = ent; break; }
+            }
+            if (!src) return false;
+            // 2) 复制 stub entry 完整内容
             auto* e = reinterpret_cast<unsigned char*>(
                 VirtualAlloc(nullptr, 0x200, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE));
             if (!e) return false;
-            memset(e, 0, 0x200);
-            *reinterpret_cast<void**>(e + 0x30) = imageBase;   // DllBase
+            memcpy(e, src, 0x200);
+            // 3) 改 DllBase / SizeOfImage / 名字（名字分配新 buffer，原 UNICODE_STRING 指向 stub 的
+            //    路径字符串——复制后若共用会导致 GetModuleFileName 返回 stub 路径，必须换）
+            *reinterpret_cast<void**>(e + 0x30) = imageBase;   // DllBase = payload
             *reinterpret_cast<ULONG*>(e + 0x40) = sizeOfImage; // SizeOfImage
             wchar_t* fullCopy = nullptr; wchar_t* baseCopy = nullptr;
             if (fakePath && fakePath[0]) {
@@ -419,11 +435,12 @@ namespace ModuleFake {
             };
             setUs(e + 0x48, fullCopy ? fullCopy : L"");        // FullDllName
             setUs(e + 0x58, baseCopy ? baseCopy : L"");        // BaseDllName
-            auto insertTail = [](LIST_ENTRY* head, LIST_ENTRY* entry) {
-                entry->Flink = head;
-                entry->Blink = head->Blink;
-                head->Blink->Flink = entry;
-                head->Blink = entry;
+            // 4) 重建三条链（复制来的 Flink/Blink 指向 stub 的链，必须重置为自身）+ 尾插
+            auto insertTail = [](LIST_ENTRY* h, LIST_ENTRY* entry) {
+                entry->Flink = h;
+                entry->Blink = h->Blink;
+                h->Blink->Flink = entry;
+                h->Blink = entry;
             };
             // entry 内部三链布局：+0x00 / +0x10 / +0x20
             insertTail(reinterpret_cast<LIST_ENTRY*>(ldr + 0x10),
