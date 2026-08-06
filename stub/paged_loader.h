@@ -239,12 +239,40 @@ public:
 
         {
             bool ok = true;
+            // CI 78：固定基址模式（PEARMOR_FIXED_BASE=1）——跳过非连续布局，直接连续分配
+            // 到 preferredBase（链接基址，如 0x140000000）。若成功则 relocated=false →
+            // 不应用重定位 → 镜像内容与原版完全一致 → 对抗目标程序「自校验自身镜像」。
+            // 必须放最前：固定基址与「非连续分散布局」互斥。
+            bool fixedBase = false;
+            {
+                char fb[8] = {0};
+                fixedBase = GetEnvironmentVariableA("PEARMOR_FIXED_BASE", fb, sizeof(fb)) && (fb[0] == '1');
+            }
+            if (fixedBase) {
+                PVOID base = reinterpret_cast<PVOID>(preferredBase);
+                SIZE_T sz = sizeOfImage;
+                NTSTATUS st = Sys::AllocateVirtualMemory(GetCurrentProcess(), &base, 0,
+                    &sz, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+                if (NT_SUCCESS(st) && base) {
+                    DebugLog("[loader] 固定基址模式: 分配到 preferredBase=%p sz=0x%zX",
+                             base, sizeOfImage);
+                    imageBase = base;
+                    for (uint32_t i = 0; i < pageCount; i++)
+                        pageBase[i] = (unsigned char*)base + (size_t)i * pageSize;
+                    workBase = base;
+                    nonContig = false;
+                } else {
+                    DebugLog("[loader] 固定基址分配失败 st=0x%08X（可能被 stub/系统占用），回退随机分配",
+                             (unsigned)st);
+                    fixedBase = false;
+                }
+            }
             // 1) 先尝试非连续：代码页分散分配，数据页统计数量
             uint32_t dataPages = 0;
             for (uint32_t i = 0; i < pageCount; i++) if (!pages[i].isCode) dataPages++;
             if (dataPages == 0) dataPages = 1;     // 头页通常算数据页，兜底
 
-            for (uint32_t i = 0; i < pageCount && ok; i++) {
+            for (uint32_t i = 0; i < pageCount && ok && !fixedBase; i++) {
                 if (!pages[i].isCode) continue;     // 代码页才分散
                 PVOID rgn = nullptr; SIZE_T rsz = pageSize;
                 NTSTATUS st = Sys::AllocateVirtualMemory(GetCurrentProcess(), &rgn, 0,
@@ -254,7 +282,7 @@ public:
                 pageBase[i] = rgn;
             }
             // 非连续：数据块也分配（work 复用其地址；运行期数据块不释放）
-            if (ok && NonContigEnabled()) {
+            if (ok && !fixedBase && NonContigEnabled()) {
                 SIZE_T dsz = (SIZE_T)dataPages * pageSize;
                 PVOID db = nullptr;
                 NTSTATUS st = Sys::AllocateVirtualMemory(GetCurrentProcess(), &db, 0,
@@ -269,7 +297,7 @@ public:
                 }
             }
             // 2) 回退：释放零散区域，统一连续分配（work 复用 imageBase）
-            if (!nonContig) {
+            if (!fixedBase && !nonContig) {
                 for (void* r : pageRegions) { SIZE_T z = 0; Sys::FreeVirtualMemory(GetCurrentProcess(), &r, &z); }
                 pageRegions.clear();
                 PVOID base = nullptr; SIZE_T sz = sizeOfImage;
