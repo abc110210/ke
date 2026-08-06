@@ -27,9 +27,8 @@
 .code
 
 EXTERN InjectShouldBlock:PROC
-EXTERN gTramp0:QWORD      ; NtMapViewOfSection  trampoline
-EXTERN gTramp1:QWORD      ; NtCreateThreadEx     trampoline
-EXTERN gTramp2:QWORD      ; NtOpenProcess        trampoline
+; gTramp0/1/2 在本文件 .data 段定义（见文件末尾），C++ 侧 extern "C" 引用。
+; 注意：不能同时 EXTERN + 定义（MASM A2005 符号重定义）。
 
 ; ---------------- NtMapViewOfSection ----------------
 ; RCX=SectionHandle RDX=ProcessHandle R8=BaseAddress* R9=ViewSize* ...
