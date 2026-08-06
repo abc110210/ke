@@ -39,8 +39,10 @@ jobs:
           Write-Host "加壳产物: $out"
           # 加壳成功的最直接证据：产物末尾必须带 overlay Footer（magic "PEARMOROV"）。
           # 若无 → packer 没把密文拼进去（裸 stub），运行必然报「未发现 overlay」。
+          # Footer 大小 = sizeof(Overlay::Footer)（CI 74 起含 origFileName，为 212 字节）。
+          $footerSize = 212
           $fs = [System.IO.File]::OpenRead((Resolve-Path $out))
-          $fs.Seek(-80, [System.IO.SeekOrigin]::End) | Out-Null
+          $fs.Seek(-$footerSize, [System.IO.SeekOrigin]::End) | Out-Null
           $buf = New-Object byte[] 8
           $fs.Read($buf, 0, 8) | Out-Null
           $fs.Close()
