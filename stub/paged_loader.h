@@ -1021,6 +1021,30 @@ private:
                              (got == g_payloadTlsData) ? "(已挂载)" :
                              (got ? "(槽值错!)" : "(槽为null=工作线程未挂TLS!)"));
                 }
+                // CI 93：fault=-1（取指地址为 -1）是异常中的异常——真实门控取指 AV 的 fault
+                // = 页内地址（如 ...9159），fault=-1 只可能是【业务主动 RaiseException(0xC0000005,
+                // 0, 2, {0, (ULONG_PTR)-1}) 模拟取指 AV 自杀】或 jmp/ret 到 -1。若 RIP 在镜像内
+                // → 主动自杀嫌疑极高（与 CI 77 吞 0xE06D7363 是同类行为，只是换异常码）。
+                // PEARMOR_SWALLOW_FAKE_AV=1 时吞掉继续执行——业务 RaiseException 后若无
+                // ExitProcess 会继续跑（窗口照常出现）；若紧接自杀则照常退出，可反向确认。
+                {
+                    uintptr_t rip3 = reinterpret_cast<uintptr_t>(rec->ExceptionAddress);
+                    uintptr_t base3 = self ? reinterpret_cast<uintptr_t>(self->imageBase) : 0;
+                    bool ripInImage = (base3 && rip3 >= base3 && rip3 < base3 + self->imageSize);
+                    if (fault == (uintptr_t)-1 && ripInImage) {
+                        char v3[8] = {0};
+                        bool swallowFake =
+                            GetEnvironmentVariableA("PEARMOR_SWALLOW_FAKE_AV", v3, sizeof(v3)) &&
+                            v3[0] == '1';
+                        if (swallowFake) {
+                            DebugLog("[veh] 疑似业务主动抛 AV(fault=-1) 模拟取指AV自杀，"
+                                     "PEARMOR_SWALLOW_FAKE_AV=1 吞掉继续执行");
+                            return EXCEPTION_CONTINUE_EXECUTION;
+                        }
+                        DebugLog("[veh] 疑似业务主动抛 AV(fault=-1, RIP 在镜像内)——"
+                                 "真实门控取指 AV 的 fault 应为页内地址，此形态=主动 RaiseException 模拟");
+                    }
+                }
                 return EXCEPTION_CONTINUE_SEARCH;
             }
             i = (uint32_t)((fault - base) / self->pageSize);
