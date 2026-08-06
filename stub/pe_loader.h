@@ -374,6 +374,69 @@ namespace ModuleFake {
         DWORD k = WideCharToMultiByte(CP_ACP, 0, tmp, (int)n, buf, (int)sz, nullptr, nullptr);
         return k;
     }
+
+    // CI 94：把 payload 注册进 PEB LDR 模块表（商业加壳器标配）。
+    // 手动映射的 payload 不在 LDR 链 → 业务遍历模块表（PEB->Ldr->InLoadOrderModuleList，
+    // 或 NtQuerySystemInformation(SystemModuleInformation)）找不到自己 → 判定「自身被
+    // 加壳/异常」→ 主动 RaiseException(0xC0000005) 模拟取指 AV 自杀（CI 93 组合 9 吞掉
+    // 假 AV 存活 20s 实锤业务自杀行为）。注册后业务视角里模块表出现「原版 exe」。
+    // 实现：分配 LDR_DATA_TABLE_ENTRY（0x200 足够 x64 布局 ~0x140），填 DllBase/
+    // SizeOfImage/FullDllName/BaseDllName，尾插三条链（InLoadOrder +0x10 / InMemoryOrder
+    // +0x20 / InInitializationOrder +0x30）。加载期单线程执行，无并发，直接操作链表。
+    // 命名空间作用域自由函数（__try 不能进类成员函数 C2712）。
+    inline bool RegisterLdrModule(void* imageBase, DWORD sizeOfImage, const wchar_t* fakePath)
+    {
+        __try {
+            BYTE* peb = reinterpret_cast<BYTE*>(__readgsqword(0x60));
+            if (!peb) return false;
+            BYTE* ldr = *reinterpret_cast<BYTE**>(peb + 0x18);
+            if (!ldr) return false;
+            auto* e = reinterpret_cast<unsigned char*>(
+                VirtualAlloc(nullptr, 0x200, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE));
+            if (!e) return false;
+            memset(e, 0, 0x200);
+            *reinterpret_cast<void**>(e + 0x30) = imageBase;   // DllBase
+            *reinterpret_cast<ULONG*>(e + 0x40) = sizeOfImage; // SizeOfImage
+            wchar_t* fullCopy = nullptr; wchar_t* baseCopy = nullptr;
+            if (fakePath && fakePath[0]) {
+                size_t fl = wcslen(fakePath);
+                fullCopy = reinterpret_cast<wchar_t*>(VirtualAlloc(nullptr,
+                    (fl + 1) * sizeof(wchar_t), MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE));
+                if (fullCopy) wcscpy(fullCopy, fakePath);
+                const wchar_t* slash = wcsrchr(fakePath, L'\\');
+                const wchar_t* baseName = slash ? slash + 1 : fakePath;
+                size_t bl = wcslen(baseName);
+                baseCopy = reinterpret_cast<wchar_t*>(VirtualAlloc(nullptr,
+                    (bl + 1) * sizeof(wchar_t), MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE));
+                if (baseCopy) wcscpy(baseCopy, baseName);
+            }
+            // UNICODE_STRING: +0x00 Length(USHORT) +0x02 MaximumLength(USHORT) +0x08 Buffer
+            auto setUs = [](unsigned char* p, const wchar_t* s) {
+                size_t n = s ? wcslen(s) : 0;
+                *reinterpret_cast<USHORT*>(p + 0) = (USHORT)(n * sizeof(wchar_t));
+                *reinterpret_cast<USHORT*>(p + 2) = (USHORT)(n * sizeof(wchar_t));
+                *reinterpret_cast<void**>(p + 8) = const_cast<wchar_t*>(s);
+            };
+            setUs(e + 0x48, fullCopy ? fullCopy : L"");        // FullDllName
+            setUs(e + 0x58, baseCopy ? baseCopy : L"");        // BaseDllName
+            auto insertTail = [](LIST_ENTRY* head, LIST_ENTRY* entry) {
+                entry->Flink = head;
+                entry->Blink = head->Blink;
+                head->Blink->Flink = entry;
+                head->Blink = entry;
+            };
+            // entry 内部三链布局：+0x00 / +0x10 / +0x20
+            insertTail(reinterpret_cast<LIST_ENTRY*>(ldr + 0x10),
+                       reinterpret_cast<LIST_ENTRY*>(e + 0x00));
+            insertTail(reinterpret_cast<LIST_ENTRY*>(ldr + 0x20),
+                       reinterpret_cast<LIST_ENTRY*>(e + 0x10));
+            insertTail(reinterpret_cast<LIST_ENTRY*>(ldr + 0x30),
+                       reinterpret_cast<LIST_ENTRY*>(e + 0x20));
+            return true;
+        } __except (EXCEPTION_EXECUTE_HANDLER) {
+            return false;
+        }
+    }
 } // namespace ModuleFake
 
 class ManualPeLoader {

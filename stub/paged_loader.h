@@ -355,6 +355,18 @@ public:
         pearmor::ModuleFake::Init(reinterpret_cast<uintptr_t>(workBase), origFileName);
         if (!ManualPeLoader::FixImports(workBase, opt)) { DebugLog("[loader] 修复导入表失败"); return false; }
         DebugLog("[loader] ckpt: FixImports 完成");
+        // CI 94：把 payload 注册进 PEB LDR 模块表——手动映射的 payload 不在 LDR 链，
+        // 业务遍历模块表找不到自己 → 判定被加壳 → 主动 RaiseException(0xC0000005) 模拟
+        // 取指 AV 自杀（CI 93 组合 9 吞掉假 AV 存活 20s 实锤）。注册后业务能看到「原版 exe」。
+        {
+            bool ldrOk = pearmor::ModuleFake::RegisterLdrModule(
+                workBase, opt.SizeOfImage,
+                pearmor::ModuleFake::gFakePath[0] ? pearmor::ModuleFake::gFakePath : nullptr);
+            DebugLog("[loader] 模块伪装: LDR 注册 %s (payload=%p size=0x%X name=%ls)",
+                     ldrOk ? "成功" : "失败(忽略)",
+                     workBase, (unsigned)opt.SizeOfImage,
+                     pearmor::ModuleFake::gOrigName);
+        }
         DebugLog("[loader] ckpt: FixImports 完成, 准备 FixDelayImports");
         // CI 54 定位：崩在 FixImports 完成 与「跳过 RtlAddFunctionTable」之间，
         // 即 FixDelayImports 或 TLS 回调执行 —— 分步打日志锁定。
