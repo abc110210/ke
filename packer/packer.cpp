@@ -247,6 +247,22 @@ int main(int argc, char** argv)
     memcpy(footer.seed, seed, 32);
     footer.entryRva    = entryRva;
     footer.payloadCrc  = pearmor::fnv1a32(enc.data(), enc.size());
+    // CI 74：模块伪装——取输入 exe 的文件名（不含路径），stub 用它伪装 GetModuleFileNameW。
+    // 目标程序若校验自身 exe 名/路径（反加壳常见手法）→ 加壳版文件名不同 → 业务主动抛 0xE06D7363。
+    // 注意：输入路径可能是 "dir\\App.exe"，用 '\\' 和 '/' 都切一下拿最后一段。
+    {
+        const char* base = inPath;
+        const char* p = inPath;
+        for (; *p; p++) {
+            if (*p == '\\' || *p == '/') base = p + 1;
+        }
+        // 转宽字符（文件名可能含非 ASCII，如中文）
+        size_t bl = strlen(base);
+        MultiByteToWideChar(CP_ACP, 0, base, (int)bl,
+                            footer.origFileName, 63);
+        footer.origFileName[63] = 0;
+        printf("[packer] 模块伪装: 原文件名=%ls\n", footer.origFileName);
+    }
 
     // ---- 拼接：stub + 密文 + 加密索引 + footer ----
     std::vector<unsigned char> out;
