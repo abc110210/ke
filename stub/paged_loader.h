@@ -776,6 +776,38 @@ private:
                              reinterpret_cast<void*>(namePtr),
                              nm[0] ? nm : "(读不到)");
                 }
+                // CI 79：dump 异常对象 [1]——MSVC 标准 _CxxThrowException 布局 [1]=pExceptionObject。
+                // std::exception 派生对象前 8 字节 = vfptr，+8 起可能是 what() 消息指针（MSVC 布局：
+                // exception 无虚表时 +0 是 vfptr 指向 _std_exception，消息在派生类）。先 dump 头部
+                // 32 字节 + 尝试按 char*/wchar_t* 读第 2 个 QWORD（常见 what() 消息指针位置）。
+                {
+                    uintptr_t objPtr = static_cast<uintptr_t>(rec->ExceptionInformation[1]);
+                    if (objPtr) {
+                        unsigned char objh[32] = {0};
+                        if (SafeReadBytes(objPtr, objh, sizeof(objh))) {
+                            DebugLog("[veh] 异常对象[1] 头部: %02X%02X%02X%02X %02X%02X%02X%02X %02X%02X%02X%02X %02X%02X%02X%02X %02X%02X%02X%02X %02X%02X%02X%02X",
+                                     objh[0], objh[1], objh[2], objh[3], objh[4], objh[5], objh[6], objh[7],
+                                     objh[8], objh[9], objh[10], objh[11], objh[12], objh[13], objh[14], objh[15],
+                                     objh[16], objh[17], objh[18], objh[19], objh[20], objh[21], objh[22], objh[23]);
+                            // 尝试读 what() 消息：对象+8 处指针若指向可读 ASCII 则打印
+                            uintptr_t msgPtr = 0;
+                            if (SafeReadBytes(objPtr + 8, &msgPtr, sizeof(msgPtr)) && msgPtr &&
+                                msgPtr > 0x10000 && msgPtr < 0x7FFFFFFFFFFF) {
+                                char msgbuf[200] = {0};
+                                bool printable = true;
+                                for (int k = 0; k < 199; k++) {
+                                    char c = 0;
+                                    if (!SafeReadBytes(msgPtr + k, &c, 1)) { printable = false; break; }
+                                    if (!c) break;
+                                    if (c < 0x20 && c != '\n' && c != '\r' && c != '\t') { printable = false; break; }
+                                    msgbuf[k] = c;
+                                }
+                                if (printable && msgbuf[0])
+                                    DebugLog("[veh] 异常对象 what(): %s", msgbuf);
+                            }
+                        }
+                    }
+                }
             }
             LogRealThrowSite(ep, pb, pe);
             DebugLog("[veh] C++ 异常未捕获 code=0xE06D7363 (真实抛点见上方走栈，落在 payload 内即 payload 自身)");
