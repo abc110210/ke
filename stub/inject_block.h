@@ -255,16 +255,19 @@ static bool PatchOne(Hook& h, const char* name, void* shimAddr, void** trampSlot
 }
 
 // 安装全部钩子。需在 Sys::Init() 之后调用。
-// CI 85：NtMapViewOfSection hook 默认【跳过】——组合 1(全开)崩 vs 组合 5(注入关)
-// 存活的唯一差异就是 inject hook，而 MapView 被 LoadLibrary/COM 激活(CoCreateInstance
-// 延迟加载 DLL)高频调用，hook 出错影响面最大（组合 2 出现 combase.dll 内 AV）。
-// 防注入核心能力 = NtCreateThreadEx(拦远程线程) + NtOpenProcess(拦进程打开)，
-// 这两个保留；需要 MapView 拦截时设 PEARMOR_ENABLE_MAPVIEW_HOOK=1 恢复。
+// CI 99：MapView/OpenProcess hook 恢复【默认开启】——源码审查（client/ 08-07）确认业务
+// 无反加壳检测；CI 97 曾因「WebView2 子进程被拦」默认关 OpenProcess，但 inline hook 是
+// 进程内的，WebView2 子进程的 NtOpenProcess 在子进程 ntdll 执行不经过主进程 hook——
+// 真正的问题是主进程内 OpenProcess(本进程) 被旧逻辑误拦（已修，见 stub.cpp CI 99）。
+// 全保护生效：NtMapViewOfSection(拦跨进程 DLL 映射) + NtCreateThreadEx(拦远程线程) +
+// NtOpenProcess(拦主进程反向打开其它进程)。需要关闭时：
+//   PEARMOR_DISABLE_MAPVIEW_HOOK=1 / PEARMOR_DISABLE_OPENPROCESS_HOOK=1
 inline bool Install()
 {
     g_selfPid = GetCurrentProcessId();
-    char mv[8] = {0};
-    bool mapView = GetEnvironmentVariableA("PEARMOR_ENABLE_MAPVIEW_HOOK", mv, sizeof(mv)) && mv[0] == '1';
+    char mv[8] = {0}, ov[8] = {0};
+    bool mapView = !(GetEnvironmentVariableA("PEARMOR_DISABLE_MAPVIEW_HOOK", mv, sizeof(mv)) && mv[0] == '1');
+    bool openProc = !(GetEnvironmentVariableA("PEARMOR_DISABLE_OPENPROCESS_HOOK", ov, sizeof(ov)) && ov[0] == '1');
     const char* names[3] = {
         OBF_STR("NtMapViewOfSection"),
         OBF_STR("NtCreateThreadEx"),
@@ -275,11 +278,12 @@ inline bool Install()
     void** slots[3] = { &gTramp0, &gTramp1, &gTramp2 };   // gTrampN 是 void* 变量，取址即 void**
     bool all = true;
     for (int i = 0; i < 3; i++) {
-        if (i == 0 && !mapView) continue;   // CI 85：MapView 默认跳过
+        if (i == 0 && !mapView) continue;                 // 默认开，可关
+        if (i == 2 && !openProc) continue;                // 默认开，可关
         if (!PatchOne(g_hooks[i], names[i], shims[i], slots[i])) all = false;
     }
-    DebugLog("[stub] P3.4 注入拦截：MapView=%s CreateThreadEx=%d OpenProcess=%d",
-             mapView ? "on" : "off(CI 85 默认跳过)", (int)g_hooks[1].active, (int)g_hooks[2].active);
+    DebugLog("[stub] P3.4 注入拦截：MapView=%d CreateThreadEx=%d OpenProcess=%d (CI 99 全保护默认开)",
+             (int)g_hooks[0].active, (int)g_hooks[1].active, (int)g_hooks[2].active);
     return all;
 }
 

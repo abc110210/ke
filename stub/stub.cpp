@@ -443,10 +443,17 @@ extern "C" __declspec(noinline) int InjectShouldBlock(int which, void* arg)
     using namespace pearmor::InjectBlock;
     if (!g_selfPid) return 0;
     if (which == 2) {
-        // NtOpenProcess：arg = CLIENT_ID*，UniqueProcess == 本进程 -> 拦截
+        // NtOpenProcess：arg = CLIENT_ID*（UniqueProcess）。
+        // CI 99 逻辑修正：inline hook 是【进程内】的——WebView2 子进程
+        // （msedgewebview2.exe）的 NtOpenProcess 在子进程自己的 ntdll 执行，
+        // 不经过主进程的 hook；真正受影响的是【主进程内】的调用：
+        //   - 打开【本进程】（pid==g_selfPid）：WebView2/COM 等正常需求（如
+        //     获取自身句柄）→ 【放行】。旧逻辑把它拦了 = 组合 1 从未活的原因之一！
+        //   - 打开【其它进程】：主进程被注入代码反向操作/探测其它进程 → 【拦截】。
         if (arg) {
             ULONG_PTR pid = *(const ULONG_PTR*)arg;
-            if (pid == g_selfPid) return 1;
+            if (pid == g_selfPid) return 0;   // 本进程打开自己：放行
+            return 1;                          // 打开其它进程：拦截
         }
         return 0;
     }
@@ -465,23 +472,27 @@ extern "C" __declspec(noinline) int InjectShouldBlock(int which, void* arg)
 // → 随机崩溃（多线程先后崩、时活时崩全吻合）。解法：hook_shim.asm 的 shim1 在
 // 放行 NtCreateThreadEx 前调 PrepareThreadStart，把 StartRoutine 换成 TlsMountWrapper
 // ——新线程【内部】先挂 payload TLS 槽（MountCurrentThreadTls），再调原线程函数。
+// CI 98：改为【per-thread 结构体传递】——旧版用全局 g_origStart/g_origArg + 锁，
+// 但业务 WM_CREATE 里 ConnThread+DetectThread 几乎同时创建（main.cpp 源码确认），
+// 第二个线程创建时覆盖第一个的全局值 → 新线程入口拿到错误 StartRoutine → 假 AV。
+// 现在：PrepareThreadStart 分配 ThreadWrapInfo（VirtualAlloc，无锁），写入原
+// StartRoutine/Argument，把调用者栈第 5 参换成 TlsMountWrapper、第 6 参换成 info；
+// 新线程从 arg 读 info，用完 VirtualFree。每个线程独立信息，无竞争。
+// 注意：std::thread 的 StartRoutine = CRT 内部 _Invoke（unpack 参数后调用户函数），
+// StartParameter = 打包对象；包装后原样传递，行为不变，仅先挂 TLS。
 // ============================================================================
-static void* g_origStart = nullptr;
-static void* g_origArg   = nullptr;
-static SRWLOCK g_wrapLock = SRWLOCK_INIT;
+struct ThreadWrapInfo { void* start; void* arg; };
 
-// 新线程入口包装器：挂 TLS 后调用原线程函数（原 StartRoutine/Argument 由
-// PrepareThreadStart 存入全局；创建线程短临界区内使用，竞争窗口极小）。
+// 新线程入口包装器：挂 TLS 后调用原线程函数（原 StartRoutine/Argument 在
+// PrepareThreadStart 分配的 per-thread 结构体里，用完释放）。
 static DWORD WINAPI TlsMountWrapper(LPVOID arg)
 {
-    (void)arg;
-    void* start = g_origStart;
-    void* a     = g_origArg;
-    // CI 89/91：挂当前线程的 payload TLS。直接调命名空间自由函数
-    // MountCurrentThreadTls()——内部已是 TlsSetValue 实现（TlsAlloc 唯一 index），
-    // 且带 null 检查 + __try 保护；比在文件作用域裸用 g_payloadTlsIndex 更稳
-    // （裸用会 C2065，那些变量在 pearmor 命名空间内）。
+    auto* info = reinterpret_cast<ThreadWrapInfo*>(arg);
+    void* start = info ? info->start : nullptr;
+    void* a     = info ? info->arg   : nullptr;
+    if (info) VirtualFree(info, 0, MEM_RELEASE);
     pearmor::MountCurrentThreadTls();
+    if (!start) return 0;
     return (reinterpret_cast<DWORD(WINAPI*)(LPVOID)>(start))(a);
 }
 
@@ -492,9 +503,11 @@ extern "C" __declspec(noinline) void PrepareThreadStart(void* startSlot, void* a
 {
     void* origStart = *(void**)startSlot;
     void* origArg   = *(void**)argSlot;
-    AcquireSRWLockExclusive(&g_wrapLock);
-    g_origStart = origStart;
-    g_origArg   = origArg;
-    ReleaseSRWLockExclusive(&g_wrapLock);
+    auto* info = reinterpret_cast<ThreadWrapInfo*>(
+        VirtualAlloc(nullptr, sizeof(ThreadWrapInfo), MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE));
+    if (!info) return;   // 分配失败：不包装（该线程不挂 TLS，概率极低，兜底不崩）
+    info->start = origStart;
+    info->arg   = origArg;
     *(void**)startSlot = reinterpret_cast<void*>(&TlsMountWrapper);
+    *(void**)argSlot   = info;
 }
