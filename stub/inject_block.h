@@ -133,7 +133,7 @@ inline bool Install()
     };
     // shim 地址（.asm 符号）与 trampoline 槽一一对应
     void* shims[3] = { (void*)&InjectShim0, (void*)&InjectShim1, (void*)&InjectShim2 };
-    void* slots[3] = { (void*)&gTramp0, (void*)&gTramp1, (void*)&gTramp2 };
+    void** slots[3] = { &gTramp0, &gTramp1, &gTramp2 };   // gTrampN 是 void* 变量，取址即 void**
     bool all = true;
     for (int i = 0; i < 3; i++)
         if (!PatchOne(g_hooks[i], names[i], shims[i], slots[i])) all = false;
