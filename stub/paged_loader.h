@@ -314,11 +314,20 @@ public:
             // 系统 loader 顺序：先初始化 TLS 数据（分配+拷模板+挂 TEB 槽），再执行回调。
             // CI 64：此前只执行回调、未初始化数据 → Hanbot 的 __declspec(thread) 槽指针是野值
             // → 崩在 payload 偏移 0x14E3A 的写指令（mov [rbx+rax*8+0x10],rsi 写野指针）。
-            DebugLog("[loader] ckpt: payload 含 TLS 目录, 初始化 TLS 数据");
-            ManualPeLoader::InitTlsData(workBase, opt);
-            DebugLog("[loader] ckpt: 执行 TLS 回调");
-            ManualPeLoader::RunTlsCallbacks(workBase, opt);
-            DebugLog("[loader] ckpt: TLS 回调执行完成");
+            // CI 76：诊断开关 PEARMOR_DISABLE_TLS=1 跳过 TLS 初始化+回调，隔离
+            // "TLS 数据挂载错误 → 业务读 __declspec(thread) 垃圾 → 主动 RaiseException" 假设。
+            char tlsOff[8] = {0};
+            bool skipTls = GetEnvironmentVariableA("PEARMOR_DISABLE_TLS", tlsOff, sizeof(tlsOff)) &&
+                           (tlsOff[0] == '1');
+            if (skipTls) {
+                DebugLog("[loader] PEARMOR_DISABLE_TLS=1，跳过 TLS 初始化与回调");
+            } else {
+                DebugLog("[loader] ckpt: payload 含 TLS 目录, 初始化 TLS 数据");
+                ManualPeLoader::InitTlsData(workBase, opt);
+                DebugLog("[loader] ckpt: 执行 TLS 回调");
+                ManualPeLoader::RunTlsCallbacks(workBase, opt);
+                DebugLog("[loader] ckpt: TLS 回调执行完成");
+            }
         }
 
         // ---- 注册异常展开表（RUNTIME_FUNCTION / .pdata）----
