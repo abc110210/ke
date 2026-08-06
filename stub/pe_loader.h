@@ -206,20 +206,56 @@ static inline void* resolveExportFromBase(uintptr_t moduleBase, const char* expo
     return nullptr;
 }
 
-// 独立 SEH 辅助：TLS 数据挂载——读 _tls_index + 拷贝模板 + 写入 TEB 槽。
+// CI 89：payload TLS 挂载信息（stub.cpp TU 内共享；供工作线程挂载 + VEH 崩溃诊断）。
+// static（TU 局部）：stub.cpp include 本文件，paged_loader.h 也被 stub.cpp include，同 TU 共享。
+static uintptr_t g_payloadTlsIndex = 0xFFFFFFFFu;
+static void*     g_payloadTlsData  = nullptr;
+static size_t    g_payloadTlsSize  = 0;
+
+// 独立 SEH 辅助：TLS 数据挂载——分配空闲 TLS 槽 + 拷贝模板 + 写入 TEB 槽。
 // 参数全 POD、内部才用 __try（CI 37 教训：__try 不能进类内成员函数，否则 C2712；
 // 本函数放命名空间作用域）。x64: TEB+0x58=ThreadLocalStoragePointer（指向槽数组），
 // GS:[0x30]=TEB。失败（不可读/不可写）返回 false，调用方释放 tlsData。
+// 【CI 89 修复】不能直接用 payload 的 _tls_index（链接初值 0）——进程里 stub
+// （/MT 静态 CRT）及系统 DLL 已占低号槽，payload 再写 index 0 会覆盖他人 TLS 槽 →
+// 全局/TLS 状态错乱（崩溃症状：对象 this=0x20 偏移当地址、多线程先后崩、时活时崩）。
+// 修复：扫描 TEB 槽数组找【空闲槽】分配，并把新 index 写回 payload 的 _tls_index。
+// 注意：只挂【当前线程】（主线程）；业务工作线程的 TLS 由 NtCreateThreadEx hook
+// 的包装器在【新线程内】挂载（见 inject_block.h TlsMountWrapper）。
 static bool SafeTlsMount(uintptr_t idxAddr, uintptr_t tplAddr,
                          void* tlsData, size_t tlsSize, DWORD* outIndex)
 {
     DWORD tlsIndex = 0;
     __try {
-        if (idxAddr) tlsIndex = *(volatile DWORD*)idxAddr;
         memcpy(tlsData, reinterpret_cast<const void*>(tplAddr), tlsSize);
         NT_TIB* tib = reinterpret_cast<NT_TIB*>(__readgsqword(0x30));
         PVOID* tlsArr = *reinterpret_cast<PVOID**>(reinterpret_cast<BYTE*>(tib) + 0x58);
-        if (tlsArr) tlsArr[tlsIndex] = tlsData;
+        if (!tlsArr) return false;
+        // 找空闲槽（0-63）；64 槽满则用 TlsExpansionSlots（TEB+0x1780，动态扩展）
+        DWORD slot = 0; bool found = false;
+        for (DWORD i = 0; i < 64; i++) {
+            if (tlsArr[i] == nullptr) { slot = i; found = true; break; }
+        }
+        if (found) {
+            tlsArr[slot] = tlsData;
+            tlsIndex = slot;
+        } else {
+            PVOID** exp = reinterpret_cast<PVOID**>(reinterpret_cast<BYTE*>(tib) + 0x1780);
+            PVOID* expArr = *exp;
+            if (!expArr) {
+                expArr = reinterpret_cast<PVOID*>(
+                    VirtualAlloc(nullptr, 0x2000, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE));
+                if (!expArr) return false;
+                expArr[0] = reinterpret_cast<PVOID>(uintptr_t(64)); // 起始已用槽数
+                *exp = expArr;
+            }
+            DWORD cnt = static_cast<DWORD>(reinterpret_cast<uintptr_t>(expArr[0]));
+            expArr[cnt + 1] = tlsData;      // 布局：expArr[0]=count, expArr[1..]=槽值
+            expArr[0] = reinterpret_cast<PVOID>(uintptr_t(cnt + 1));
+            tlsIndex = 64 + cnt;
+        }
+        // 写回 payload 的 _tls_index（AddressOfIndex 指向的 DWORD），业务用它查槽
+        if (idxAddr) *(volatile DWORD*)idxAddr = tlsIndex;
     } __except (EXCEPTION_EXECUTE_HANDLER) {
         return false;
     }
@@ -743,6 +779,42 @@ public:
             return;
         }
         DebugLog("[loader] TLS 数据: size=0x%zX index=%u data=%p", tlsSize, tlsIndex, tlsData);
+        // CI 89：保存 payload TLS 信息供【工作线程挂载】（NtCreateThreadEx hook 的
+        // TlsMountWrapper 在新线程内挂槽）与 VEH 崩溃诊断（确认槽值）。
+        g_payloadTlsIndex = tlsIndex;
+        g_payloadTlsData  = tlsData;
+        g_payloadTlsSize  = tlsSize;
+    }
+
+    // CI 89：当前线程挂载 payload 的 TLS 槽（主线程在 SafeTlsMount 已挂；工作线程
+    // 由 TlsMountWrapper 在【新线程内】调用）。系统 loader 不知道手动加载的 payload，
+    // 新线程的 TEB 槽数组里 payload 槽是 null → 业务 __declspec(thread) 变量地址 =
+    // null+偏移（如 this=0x20）→ 随机崩溃。此函数把槽挂到【当前调用线程】。
+    static void MountCurrentThreadTls()
+    {
+        if (!g_payloadTlsData || g_payloadTlsIndex == 0xFFFFFFFFu) return;
+        __try {
+            NT_TIB* tib = reinterpret_cast<NT_TIB*>(__readgsqword(0x30));
+            PVOID* tlsArr = *reinterpret_cast<PVOID**>(reinterpret_cast<BYTE*>(tib) + 0x58);
+            if (!tlsArr) return;
+            if (g_payloadTlsIndex < 64) {
+                tlsArr[g_payloadTlsIndex] = g_payloadTlsData;
+            } else {
+                PVOID** exp = reinterpret_cast<PVOID**>(reinterpret_cast<BYTE*>(tib) + 0x1780);
+                PVOID* expArr = *exp;
+                if (!expArr) {
+                    expArr = reinterpret_cast<PVOID*>(
+                        VirtualAlloc(nullptr, 0x2000, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE));
+                    if (!expArr) return;
+                    expArr[0] = reinterpret_cast<PVOID>(uintptr_t(64));
+                    *exp = expArr;
+                }
+                DWORD cnt = static_cast<DWORD>(reinterpret_cast<uintptr_t>(expArr[0]));
+                expArr[cnt + 1] = g_payloadTlsData;
+                expArr[0] = reinterpret_cast<PVOID>(uintptr_t(cnt + 1));
+            }
+        } __except (EXCEPTION_EXECUTE_HANDLER) {
+        }
     }
 
     // ---------- .pdata 异常展开表注册 ----------

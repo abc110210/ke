@@ -27,6 +27,7 @@
 .code
 
 EXTERN InjectShouldBlock:PROC
+EXTERN PrepareThreadStart:PROC   ; CI 89：NtCreateThreadEx 线程入口包装（工作线程 TLS 挂载）
 ; gTramp0/1/2 在本文件 .data 段定义（见文件末尾），C++ 侧 extern "C" 引用。
 ; 注意：不能同时 EXTERN + 定义（MASM A2005 符号重定义）。
 
@@ -70,6 +71,14 @@ InjectShim1 PROC
     call    InjectShouldBlock
     test    eax, eax
     jnz     block1
+    ; CI 89：包装线程入口（工作线程 TLS 挂载）——把调用者栈上的 StartRoutine（第 5 参数，
+    ; [rsp+48h+28h]）换成 TlsMountWrapper，原值/Argument 由 PrepareThreadStart 存入全局。
+    ; 新线程【内部】先挂 payload TLS 槽再调原函数，解决「工作线程 TEB 里 payload TLS 槽
+    ; 为 null → __declspec(thread) 变量地址=null+偏移(this=0x20) → 随机崩溃」。
+    ; 注意：此刻 rsp 是 sub 48h 后的，调用者栈在 rsp+48h；call 前 rsp≡0(mod 16) 对齐。
+    lea     rcx, [rsp+48h+28h]   ; &StartRoutine（调用者栈第 5 参数）
+    lea     rdx, [rsp+48h+30h]   ; &Argument（调用者栈第 6 参数）
+    call    PrepareThreadStart
     mov     rcx, [rsp+20h]
     mov     rdx, [rsp+28h]
     mov     r8,  [rsp+30h]

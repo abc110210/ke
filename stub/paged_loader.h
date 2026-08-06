@@ -1009,6 +1009,22 @@ private:
                          pb24[0], pb24[1], pb24[2], pb24[3], pb24[4], pb24[5], pb24[6], pb24[7],
                          pb24[8], pb24[9], pb24[10], pb24[11], pb24[12], pb24[13], pb24[14], pb24[15],
                          pb24[16], pb24[17], pb24[18], pb24[19], pb24[20], pb24[21], pb24[22], pb24[23]);
+                // CI 89：崩溃线程 TLS 槽检查——工作线程 TEB 里 payload TLS 槽应为
+                // g_payloadTlsData；若 null → 工作线程 TLS 未挂载实锤（业务 __declspec(thread)
+                // 变量地址 = null+偏移（this=0x20）→ 随机崩溃）。
+                if (g_payloadTlsIndex != 0xFFFFFFFFu) {
+                    void* got = nullptr;
+                    __try {
+                        NT_TIB* tib = reinterpret_cast<NT_TIB*>(__readgsqword(0x30));
+                        PVOID* tlsArr = *reinterpret_cast<PVOID**>(reinterpret_cast<BYTE*>(tib) + 0x58);
+                        if (tlsArr && g_payloadTlsIndex < 64) got = tlsArr[g_payloadTlsIndex];
+                    } __except (EXCEPTION_EXECUTE_HANDLER) { got = nullptr; }
+                    DebugLog("[veh] 崩溃线程TLS: tid=%u index=%u 槽值=%p 期望=%p %s",
+                             (unsigned)GetCurrentThreadId(), (unsigned)g_payloadTlsIndex,
+                             got, g_payloadTlsData,
+                             (got == g_payloadTlsData) ? "(已挂载)" :
+                             (got ? "(槽值错!)" : "(槽为null=工作线程未挂TLS!)"));
+                }
                 return EXCEPTION_CONTINUE_SEARCH;
             }
             i = (uint32_t)((fault - base) / self->pageSize);

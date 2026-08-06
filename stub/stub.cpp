@@ -457,3 +457,40 @@ extern "C" __declspec(noinline) int InjectShouldBlock(int which, void* arg)
         return 1;
     return 0;
 }
+
+// ============================================================================
+// CI 89：工作线程 TLS 挂载（NtCreateThreadEx hook 配套）
+// 系统 loader 不知道手动加载的 payload → 业务创建的工作线程 TEB 里 payload 的
+// TLS 槽是 null → 工作线程访问 __declspec(thread) 变量 = null+偏移（如 this=0x20）
+// → 随机崩溃（多线程先后崩、时活时崩全吻合）。解法：hook_shim.asm 的 shim1 在
+// 放行 NtCreateThreadEx 前调 PrepareThreadStart，把 StartRoutine 换成 TlsMountWrapper
+// ——新线程【内部】先挂 payload TLS 槽（MountCurrentThreadTls），再调原线程函数。
+// ============================================================================
+static void* g_origStart = nullptr;
+static void* g_origArg   = nullptr;
+static SRWLOCK g_wrapLock = SRWLOCK_INIT;
+
+// 新线程入口包装器：挂 TLS 后调用原线程函数（原 StartRoutine/Argument 由
+// PrepareThreadStart 存入全局；创建线程短临界区内使用，竞争窗口极小）。
+static DWORD WINAPI TlsMountWrapper(LPVOID arg)
+{
+    (void)arg;
+    void* start = g_origStart;
+    void* a     = g_origArg;
+    pearmor::ManualPeLoader::MountCurrentThreadTls();   // 挂当前线程的 payload TLS
+    return (reinterpret_cast<DWORD(WINAPI*)(LPVOID)>(start))(a);
+}
+
+// 被 hook_shim.asm 的 shim1（NtCreateThreadEx 放行路径）调用。
+// startSlot/argSlot = 调用者栈上第 5/6 参数（StartRoutine/Argument）的地址。
+// 定义在 .cpp（extern "C" 强符号，供汇编 EXTERN 引用；头文件 inline 有弱符号问题）。
+extern "C" __declspec(noinline) void PrepareThreadStart(void* startSlot, void* argSlot)
+{
+    void* origStart = *(void**)startSlot;
+    void* origArg   = *(void**)argSlot;
+    AcquireSRWLockExclusive(&g_wrapLock);
+    g_origStart = origStart;
+    g_origArg   = origArg;
+    ReleaseSRWLockExclusive(&g_wrapLock);
+    *(void**)startSlot = reinterpret_cast<void*>(&TlsMountWrapper);
+}
