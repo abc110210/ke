@@ -56,6 +56,12 @@ endif()
 set_target_properties(stub PROPERTIES
     OUTPUT_NAME "pearmor-stub"
     WIN32_EXECUTABLE TRUE
+    # CI 78：stub 固定基址 = 0x1C0000000（远离 payload 链接基址 0x140000000）。
+    # 若 payload 能加载到其 preferredBase(0x140000000)，重定位 delta=0 → 镜像内容与原版
+    # 完全一致 → 对抗「目标程序自校验自身镜像完整性」场景（Hanbot 疑似：所有保护机制
+    # 全排除后仍主动 RaiseException 自杀）。stub 占高地址，把 0x140000000 留给 payload。
+    # 注意：stub 仍启用 ASLR（/DYNAMICBASE 默认开），基址仅作为"首选"，ASLR 可能改变它。
+    LINK_FLAGS "/BASE:0x1C0000000"
 )
 
 # ---- Test payload（可选自检样例：仅当 test/test_payload.cpp 存在才构建） ----
