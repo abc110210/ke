@@ -102,7 +102,7 @@ jobs:
               if (Test-Path $lf) {
                 # 只打印关键行：崩溃点 / 走栈 / Load 结果 / 保护安装日志
                 $lines = Get-Content $lf -ErrorAction SilentlyContinue
-                $key = $lines | Where-Object { $_ -match "veh|Veh|E06D7363|Load 成功|OEP|门控|看门狗|注入拦截|异常|C\+\+|重加密|fatal|0xC000041D|0xC0000005" }
+                $key = $lines | Where-Object { $_ -match "veh|Veh|E06D7363|Load 成功|OEP|门控|看门狗|注入拦截|异常|C\+\+|重加密|fatal|0xC000041D|0xC0000005|CRC|解密" }
                 if ($key) { Write-Host "---- $lf (关键行) ----"; $key | ForEach-Object { Write-Host $_ }; Write-Host "----------------------" }
               }
             }
