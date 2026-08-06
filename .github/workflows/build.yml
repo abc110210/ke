@@ -70,8 +70,9 @@ jobs:
             @{ name = "4_watchdog_only_off"; gating = $null; watchdog = "1";  inject = $null; tls = $null; swallow = $null; fixedbase = $null },
             @{ name = "5_inject_only_off"; gating = $null;  watchdog = $null; inject = "1"; tls = $null; swallow = $null; fixedbase = $null },
             @{ name = "6_no_tls";          gating = $null;  watchdog = $null; inject = $null; tls = "1"; swallow = $null; fixedbase = $null },
-            @{ name = "7_swallow_e06d";    gating = $null;  watchdog = $null; inject = $null; tls = $null; swallow = "1"; fixedbase = $null },
-            @{ name = "8_fixed_base";      gating = $null;  watchdog = $null; inject = $null; tls = $null; swallow = $null; fixedbase = "1" }
+            @{ name = "7_swallow_e06d";    gating = $null;  watchdog = $null; inject = $null; tls = $null; swallow = "1"; fixedbase = $null; fakeav = $null },
+            @{ name = "8_fixed_base";      gating = $null;  watchdog = $null; inject = $null; tls = $null; swallow = $null; fixedbase = "1"; fakeav = $null },
+            @{ name = "9_swallow_fakeav";  gating = $null;  watchdog = $null; inject = $null; tls = $null; swallow = $null; fixedbase = $null; fakeav = "1" }
           )
           $tmp = $env:TEMP
           $anyGood = $false
@@ -86,7 +87,8 @@ jobs:
             $env:PEARMOR_DISABLE_TLS         = if ($c.tls)      { "1" } else { $null }
             $env:PEARMOR_SWALLOW_E06D7363    = if ($c.swallow)  { "1" } else { $null }
             $env:PEARMOR_FIXED_BASE          = if ($c.fixedbase){ "1" } else { $null }
-            Write-Host "env: GATING=$env:PEARMOR_DISABLE_GATING WATCHDOG=$env:PEARMOR_DISABLE_WATCHDOG INJECT=$env:PEARMOR_DISABLE_INJECT_BLOCK TLS=$env:PEARMOR_DISABLE_TLS SWALLOW=$env:PEARMOR_SWALLOW_E06D7363 FIXEDBASE=$env:PEARMOR_FIXED_BASE"
+            $env:PEARMOR_SWALLOW_FAKE_AV     = if ($c.fakeav)   { "1" } else { $null }
+            Write-Host "env: GATING=$env:PEARMOR_DISABLE_GATING WATCHDOG=$env:PEARMOR_DISABLE_WATCHDOG INJECT=$env:PEARMOR_DISABLE_INJECT_BLOCK TLS=$env:PEARMOR_DISABLE_TLS SWALLOW=$env:PEARMOR_SWALLOW_E06D7363 FIXEDBASE=$env:PEARMOR_FIXED_BASE FAKEAV=$env:PEARMOR_SWALLOW_FAKE_AV"
             $timeoutSec = 20
             $errFile = "stderr_$($c.name).txt"
             Remove-Item $errFile -ErrorAction SilentlyContinue
@@ -114,6 +116,7 @@ jobs:
           Remove-Item Env:PEARMOR_DISABLE_TLS -ErrorAction SilentlyContinue
           Remove-Item Env:PEARMOR_SWALLOW_E06D7363 -ErrorAction SilentlyContinue
           Remove-Item Env:PEARMOR_FIXED_BASE -ErrorAction SilentlyContinue
+          Remove-Item Env:PEARMOR_SWALLOW_FAKE_AV -ErrorAction SilentlyContinue
 
           # 用户目标模式（test/ 有用户放入的 exe）：加壳成功即达标，运行结果仅作诊断
           # （真实程序的退出码/行为各异，不能按样例标准断言）
