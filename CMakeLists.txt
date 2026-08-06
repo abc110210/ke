@@ -57,6 +57,12 @@ endif()
 set_target_properties(stub PROPERTIES
     OUTPUT_NAME "pearmor-stub"
     WIN32_EXECUTABLE TRUE
+    # CI 86：stub 用静态 CRT（/MT）——避免与 payload 的动态 CRT（/MD）双 CRT 共存冲突。
+    # 症状（CI 85 实锤）：payload 的 mainCRTStartup 会再次初始化 CRT 全局状态（__acrt_heap
+    # 等），覆盖 stub 已初始化的 → 堆/全局错乱 → 业务数据结构随机破坏（组合 2 崩
+    # VCRUNTIME140、组合 7 同一进程 3 线程全坏、组合 5 时活时崩——全部吻合）。
+    # 壳静态 CRT + 目标任意 CRT = 各自独立实例，互不干扰（标准加壳器做法）。
+    MSVC_RUNTIME_LIBRARY "MultiThreaded"
     # CI 78：stub 固定基址 = 0x1C0000000（远离 payload 链接基址 0x140000000）。
     # 若 payload 能加载到其 preferredBase(0x140000000)，重定位 delta=0 → 镜像内容与原版
     # 完全一致 → 对抗「目标程序自校验自身镜像完整性」场景（Hanbot 疑似：所有保护机制
