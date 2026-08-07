@@ -113,6 +113,13 @@ static size_t    g_plSize = 0;
 
 int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int)
 {
+    // 【CI 107 早期探针】无条件写 stderr（CI 用 -RedirectStandardError 捕获）+ 立即 flush。
+    // 目的：0xC0000409(fastfail) 绕过所有异常处理、缓冲日志不落盘，故用行缓冲 stderr 判定
+    // 「进程是否走到 wWinMain 第一行」。若下轮 stderr 有此行→崩在 overlay/之后；无此行→
+    // 崩在 CRT 启动阶段（或 CI 编译产物问题）。同时也写一条 DebugLog 便于对齐。
+    fprintf(stderr, "[stub] ENTER wWinMain\n"); fflush(stderr);
+    DebugLog("[stub] ENTER wWinMain");
+
     // 1) 顶层异常捕获
     SetUnhandledExceptionFilter(TopLevelHandler);
 

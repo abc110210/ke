@@ -108,11 +108,12 @@ static inline void* peExportAddress(uintptr_t base, const char* exportName)
     for (DWORD i = 0; i < exp->NumberOfNames; i++) {
         const char* nm = reinterpret_cast<const char*>(base + names[i]);
         if (strcmp(nm, exportName) == 0) {
-            // CI 修复：AddressOfFunctions 按【序号-基址】索引，必须减 Base。
-            // 之前直接用 funcs[ords[i]] 在 Base≠0 的 DLL（kernel32/user32/msvcp 等）上
-            // 越界读到相邻数据（常为 .rdata 指针表）→ 解析出不可执行地址 →
-            // 满屏"导入解析异常"日志。Base=0 时减 0 无副作用。
-            DWORD fnRva = (ords[i] >= exp->Base) ? funcs[ords[i] - exp->Base] : 0;
+            // 【CI 107 回退】PE 规范：AddressOfNameOrdinals[i] 存的是 unbiased ordinal，
+            // 本身就是 AddressOfFunctions 的直接下标，【不减 Base】。
+            // （只有 biased ordinal——如 "#123" 序数形式，见下方序数分支——才需 -Base。）
+            // CI106 误改成 -Base：Base=1 的 DLL（kernel32/ntdll 等几乎全部）会整体错位一个
+            // 函数 → ntdll Nt* API 全解析错位 → 加载器一调用就 fastfail（0xC0000409）秒崩。
+            DWORD fnRva = funcs[ords[i]];
             if (fnRva >= expRva && fnRva < expRva + expSz) {
                 // 转发函数（forwarder）→ 简单返回 RVA（由调用方决定）
                 return reinterpret_cast<void*>(base + fnRva);
@@ -197,8 +198,9 @@ static inline void* resolveExportFromBase(uintptr_t moduleBase, const char* expo
     for (DWORD i = 0; i < exp->NumberOfNames; i++) {
         const char* nm = reinterpret_cast<const char*>(moduleBase + names[i]);
         if (strcmp(nm, exportName) == 0) {
-            // CI 修复：AddressOfFunctions 按【序号-基址】索引，必须减 Base（见 peExportAddress 同类修复）。
-            DWORD fnRva = (ords[i] >= exp->Base) ? funcs[ords[i] - exp->Base] : 0;
+            // 【CI 107 回退】ords[i] 是 unbiased ordinal，直接作 funcs 下标，【不减 Base】。
+            // CI106 误改成 -Base 导致 IAT 整体错位（详见 peExportAddress 同处注释）。
+            DWORD fnRva = funcs[ords[i]];
             // CI 63 诊断：自研解析成功时打印关键值，便于核对是否把名字字符串 RVA 当函数 RVA
             DebugLog("[loader] 导出解析: %s -> rva=0x%X addr=%p (exp: funcs=0x%X names=0x%X ords=0x%X numF=%u numN=%u)",
                      exportName, fnRva, reinterpret_cast<void*>(moduleBase + fnRva),
