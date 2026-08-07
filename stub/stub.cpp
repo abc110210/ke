@@ -161,6 +161,34 @@ static void ProbeHeap()
     }
 }
 
+// CI 131：UCRT 堆初始化检查（独立 SEH 函数）。堆损坏调用链指向 CRT 启动期堆操作。
+// 确认 ucrtbase/vcruntime140 已加载且 malloc/free 能跑通。
+static void ProbeUcrt()
+{
+    HMODULE ucrt = GetModuleHandleA("ucrtbase.dll");
+    HMODULE vcr = GetModuleHandleA("vcruntime140.dll");
+    DebugLog("[stub] UCRT 检查: ucrtbase=%p vcruntime140=%p", (void*)ucrt, (void*)vcr);
+    if (!ucrt) return;
+    typedef void* (*PFN_malloc)(size_t);
+    typedef void  (*PFN_free)(void*);
+    auto pMalloc = reinterpret_cast<PFN_malloc>(GetProcAddress(ucrt, "malloc"));
+    auto pFree   = reinterpret_cast<PFN_free>(GetProcAddress(ucrt, "free"));
+    if (!pMalloc || !pFree) return;
+    __try {
+        void* p = pMalloc(64);
+        if (p) {
+            memset(p, 0xAA, 64);
+            pFree(p);
+            DebugLog("[stub] UCRT malloc/free 成功（UCRT 堆已初始化）");
+        } else {
+            DebugLog("[stub] UCRT malloc 返回 null（堆未初始化？）");
+        }
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        DebugLog("[stub] UCRT malloc/free 崩溃(0x%X)！（UCRT 堆未初始化）",
+                 (unsigned)GetExceptionCode());
+    }
+}
+
 // CI 127：堆损坏 VEH 捕获器（独立函数——不能用 lambda，C2713 两种异常处理共存）。
 // 在 payload CRT 启动期 ntdll 抛 STATUS_HEAP_CORRUPTION 时被调，打印 RIP/fault/栈回溯。
 static LONG WINAPI HeapCorruptionVeh(EXCEPTION_POINTERS* ep)
@@ -638,6 +666,7 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int)
     ProbeGetSystemTimeAsFileTime();
     // CI 127：堆探针 + VEH 堆损坏捕获器（抽成独立函数——wWinMain 含 C++ 对象不能 __try/lambda VEH）
     ProbeHeap();
+    ProbeUcrt();  // CI 131：UCRT 初始化检查
     {
         auto h = AddVectoredExceptionHandler(1, HeapCorruptionVeh);
         if (h) DebugLog("[stub] 已装堆损坏 VEH 捕获器（第一机会）");
