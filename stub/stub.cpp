@@ -105,6 +105,12 @@ static LONG WINAPI TopLevelHandler(EXCEPTION_POINTERS* ep)
 // ---------------------------------------------------------------------------
 // 程序入口
 // ---------------------------------------------------------------------------
+
+// CI 101：payload 镜像范围（Load 成功后设置）。PrepareThreadStart 据此判断
+// 「创建线程的调用者是否在 payload 内」——只包装业务线程，不碰系统/WebView2 线程。
+static uintptr_t g_plBase = 0;
+static size_t    g_plSize = 0;
+
 int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int)
 {
     // 1) 顶层异常捕获
@@ -384,8 +390,10 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int)
     // 只包装【业务代码创建的线程】（std::thread 等，需要 payload TLS）；WebView2/系统 DLL
     // 内部创建的线程不包装（它们的线程入口签名可能非标准 LPTHREAD_START_ROUTINE，包装会
     // 调用约定错乱 → 栈破坏 → ret 到 -1 → fault=-1 取指 AV）。
-    g_plBase = pearmor::ModuleFake::gPayloadBase;
-    g_plSize = payloadLen;
+    {
+        g_plBase = pearmor::ModuleFake::gPayloadBase;
+        g_plSize = (size_t)payloadLen;
+    }
 
     // P3.5：密钥不再长期驻留栈。加载完成后立即清零派生出的内层/外层密钥。
     memset(innerKey, 0, sizeof(innerKey));
@@ -488,11 +496,6 @@ extern "C" __declspec(noinline) int InjectShouldBlock(int which, void* arg)
 // StartParameter = 打包对象；包装后原样传递，行为不变，仅先挂 TLS。
 // ============================================================================
 struct ThreadWrapInfo { void* start; void* arg; };
-
-// CI 101：payload 镜像范围（Load 成功后设置）。PrepareThreadStart 据此判断
-// 「创建线程的调用者是否在 payload 内」——只包装业务线程，不碰系统/WebView2 线程。
-static uintptr_t g_plBase = 0;
-static size_t    g_plSize = 0;
 
 // 新线程入口包装器：挂 TLS 后调用原线程函数（原 StartRoutine/Argument 在
 // PrepareThreadStart 分配的 per-thread 结构体里，用完释放）。
