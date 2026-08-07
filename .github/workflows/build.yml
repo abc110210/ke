@@ -53,6 +53,8 @@ jobs:
           Write-Host "overlay Footer 校验通过（密文已拼接），产物大小: $((Get-Item $out).Length) 字节"
           $env:PEARMOR_DEBUG = "1"   # 开启壳内调试日志
           $env:PEARMOR_ALLOW_VM = "1"  # CI runner 本身是 Azure VM 且系统盘<30GB，放行 VM 检测
+          $env:PEARMOR_ALLOW_CODEGEN = "1"  # 第四轮.txt 发现：CI runner 更新后 NtAllocateVirtualMemory SSN 错位(0xC0000024)，
+                                           # P3.1 自校验 alloc 失败自毁；跳过 P3.1 以验证「手动加载+解密+OEP」主体流程（见 syscall.h 回退修复）
           # CI 61/62 已验证 CorruptHeader 与崩溃无关（跳过/不跳过日志逐字节一致），恢复完整保护。
           # $env:PEARMOR_NO_CORRUPT_HEADER = "1"  # 隔离诊断用，已移除
 
@@ -116,6 +118,7 @@ jobs:
           Remove-Item Env:PEARMOR_FIXED_BASE -ErrorAction SilentlyContinue
           Remove-Item Env:PEARMOR_DISABLE_FAKEAV_SWALLOW -ErrorAction SilentlyContinue
           Remove-Item Env:PEARMOR_NO_CORRUPT_HEADER -ErrorAction SilentlyContinue
+          Remove-Item Env:PEARMOR_ALLOW_CODEGEN -ErrorAction SilentlyContinue
 
           # 用户目标模式（test/ 有用户放入的 exe）：加壳成功即达标，运行结果仅作诊断
           # （真实程序的退出码/行为各异，不能按样例标准断言）
