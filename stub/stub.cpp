@@ -380,6 +380,12 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int)
         return -2;
     }
     DebugLog("[stub] 分页加载成功 OEP_RVA=0x%llX", (unsigned long long)entryRva);
+    // CI 101：记录 payload 镜像范围（供 PrepareThreadStart 判断「调用者是否在 payload 内」——
+    // 只包装【业务代码创建的线程】（std::thread 等，需要 payload TLS）；WebView2/系统 DLL
+    // 内部创建的线程不包装（它们的线程入口签名可能非标准 LPTHREAD_START_ROUTINE，包装会
+    // 调用约定错乱 → 栈破坏 → ret 到 -1 → fault=-1 取指 AV）。
+    g_plBase = pearmor::ModuleFake::gPayloadBase;
+    g_plSize = payloadLen;
 
     // P3.5：密钥不再长期驻留栈。加载完成后立即清零派生出的内层/外层密钥。
     memset(innerKey, 0, sizeof(innerKey));
@@ -483,6 +489,11 @@ extern "C" __declspec(noinline) int InjectShouldBlock(int which, void* arg)
 // ============================================================================
 struct ThreadWrapInfo { void* start; void* arg; };
 
+// CI 101：payload 镜像范围（Load 成功后设置）。PrepareThreadStart 据此判断
+// 「创建线程的调用者是否在 payload 内」——只包装业务线程，不碰系统/WebView2 线程。
+static uintptr_t g_plBase = 0;
+static size_t    g_plSize = 0;
+
 // 新线程入口包装器：挂 TLS 后调用原线程函数（原 StartRoutine/Argument 在
 // PrepareThreadStart 分配的 per-thread 结构体里，用完释放）。
 static DWORD WINAPI TlsMountWrapper(LPVOID arg)
@@ -498,9 +509,17 @@ static DWORD WINAPI TlsMountWrapper(LPVOID arg)
 
 // 被 hook_shim.asm 的 shim1（NtCreateThreadEx 放行路径）调用。
 // startSlot/argSlot = 调用者栈上第 5/6 参数（StartRoutine/Argument）的地址。
+// callerRip = 调用者返回地址（hook 进入时 [rsp]）——CI 101：只在调用者位于
+// payload 镜像内时才包装（业务 std::thread 需要 payload TLS）；WebView2/系统 DLL
+// 内部创建的线程不包装——它们的线程入口签名可能非标准 LPTHREAD_START_ROUTINE，
+// 包装会调用约定错乱 → 栈破坏 → ret 到 -1 → fault=-1 取指 AV。
 // 定义在 .cpp（extern "C" 强符号，供汇编 EXTERN 引用；头文件 inline 有弱符号问题）。
-extern "C" __declspec(noinline) void PrepareThreadStart(void* startSlot, void* argSlot)
+extern "C" __declspec(noinline) void PrepareThreadStart(void* startSlot, void* argSlot,
+                                                        void* callerRip)
 {
+    uintptr_t cr = reinterpret_cast<uintptr_t>(callerRip);
+    if (!g_plBase || cr < g_plBase || cr >= g_plBase + g_plSize)
+        return;   // 调用者不在 payload 内（系统/WebView2 线程）→ 不包装
     void* origStart = *(void**)startSlot;
     void* origArg   = *(void**)argSlot;
     auto* info = reinterpret_cast<ThreadWrapInfo*>(

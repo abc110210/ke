@@ -1016,6 +1016,18 @@ private:
                          pb24[0], pb24[1], pb24[2], pb24[3], pb24[4], pb24[5], pb24[6], pb24[7],
                          pb24[8], pb24[9], pb24[10], pb24[11], pb24[12], pb24[13], pb24[14], pb24[15],
                          pb24[16], pb24[17], pb24[18], pb24[19], pb24[20], pb24[21], pb24[22], pb24[23]);
+                // CI 101：RIP 前 64 字节完整 dump（页 9 CRT 启动 / 页 22 业务代码的反汇编定位——
+                // fault=-1 取指 AV + 主线程崩在 CRT 早期 = payload mainCRTStartup 的 TLS/初始化
+                // 交互问题，需完整指令流确认是哪个 CRT 函数）。
+                {
+                    unsigned char pb64[64] = {0};
+                    SafeReadBytes(rip > 64 ? rip - 64 : 0, pb64, sizeof(pb64));
+                    char hex[256] = {0};
+                    for (int k = 0; k < 64; k++) {
+                        sprintf(hex + k * 3, "%02X ", pb64[k]);
+                    }
+                    DebugLog("[veh] RIP前64=%s", hex);
+                }
                 // CI 89：崩溃线程 TLS 槽检查——工作线程 TEB 里 payload TLS 槽应为
                 // 非 null（CI 100 起每线程独立副本，主线程才是 g_payloadTlsData）；
                 // null → 工作线程 TLS 未挂载实锤（业务 __declspec(thread) 变量地址

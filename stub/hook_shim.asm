@@ -71,13 +71,17 @@ InjectShim1 PROC
     call    InjectShouldBlock
     test    eax, eax
     jnz     block1
-    ; CI 89：包装线程入口（工作线程 TLS 挂载）——把调用者栈上的 StartRoutine（第 5 参数，
-    ; [rsp+48h+28h]）换成 TlsMountWrapper，原值/Argument 由 PrepareThreadStart 存入全局。
-    ; 新线程【内部】先挂 payload TLS 槽再调原函数，解决「工作线程 TEB 里 payload TLS 槽
-    ; 为 null → __declspec(thread) 变量地址=null+偏移(this=0x20) → 随机崩溃」。
+    ; CI 89/98/101：包装线程入口（工作线程 TLS 挂载）——把调用者栈上的 StartRoutine（第 5 参数，
+    ; [rsp+48h+28h]）换成 TlsMountWrapper，StartParameter（第 6 参数）换成 per-thread 结构体
+    ; （含原 StartRoutine/Argument）。新线程【内部】先挂 payload TLS 槽再调原函数。
+    ; CI 101：r8 = 调用者返回地址（hook 进入时 [rsp+48h]，即 call NtCreateThreadEx 压栈的返回
+    ; 地址）——PrepareThreadStart 据此判断调用者是否在 payload 内：只在 payload 内才包装
+    ; （业务 std::thread 需要 payload TLS）；WebView2/系统 DLL 内部创建的线程不包装（它们的
+    ; 线程入口签名非标准，包装会调用约定错乱 → 栈破坏 → ret 到 -1 → fault=-1 取指 AV）。
     ; 注意：此刻 rsp 是 sub 48h 后的，调用者栈在 rsp+48h；call 前 rsp≡0(mod 16) 对齐。
     lea     rcx, [rsp+48h+28h]   ; &StartRoutine（调用者栈第 5 参数）
     lea     rdx, [rsp+48h+30h]   ; &Argument（调用者栈第 6 参数）
+    mov     r8,  [rsp+48h]        ; callerRip（调用者返回地址）
     call    PrepareThreadStart
     mov     rcx, [rsp+20h]
     mov     rdx, [rsp+28h]
