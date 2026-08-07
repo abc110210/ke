@@ -238,6 +238,47 @@ static inline void* resolveExportFromBase(uintptr_t moduleBase, const char* expo
                 }
             }
             if (!fnRva) fnRva = (idxA < exp->NumberOfFunctions) ? funcs[idxA] : 0;
+
+            // CI 124（根因修复）：forwarder 检测——funcs[idx] RVA 落在 export directory 范围内
+            // 说明是转发项（指向 "DLL.Func" 字符串），不是真实代码。第15轮实锤：kernel32!
+            // GetSystemTimeAsFileTime 是 forwarder→KERNELBASE，旧代码返回 .rdata 字符串地址
+            // → payload IAT 填错 → call 跳进 .rdata 把字符串当指令执行 → 最终崩 KERNELBASE。
+            // 修复：检测 forwarder 后解析 "DLL.Func" 串，用 GetModuleHandle+GetProcAddress 拿真实地址。
+            if (fnRva >= dir.VirtualAddress && fnRva < dir.VirtualAddress + dir.Size) {
+                const char* fwd = reinterpret_cast<const char*>(moduleBase + fnRva);
+                // 解析 "DLL.Func" 或 "DLL.#ord" 格式
+                char dllName[128] = {0};
+                const char* dot = strchr(fwd, '.');
+                if (dot && (size_t)(dot - fwd) < sizeof(dllName) - 1) {
+                    memcpy(dllName, fwd, dot - fwd);
+                    dllName[dot - fwd] = 0;
+                    // 补 .dll 后缀（forwarder 串通常省略，如 "KERNELBASE" 不含 .dll）
+                    char fullDll[148] = {0};
+                    // 如果名字里不含 '.' 扩展名则加 .dll
+                    if (!strchr(dllName, '.')) {
+                        _snprintf(fullDll, sizeof(fullDll), "%s.dll", dllName);
+                    } else {
+                        strncpy(fullDll, dllName, sizeof(fullDll) - 1);
+                    }
+                    const char* funcName = dot + 1;
+                    HMODULE hTarget = GetModuleHandleA(fullDll);
+                    void* realFn = nullptr;
+                    if (hTarget) {
+                        if (funcName[0] == '#') {
+                            realFn = reinterpret_cast<void*>(
+                                GetProcAddress(hTarget, MAKEINTRESOURCEA(
+                                    (WORD)strtoul(funcName + 1, nullptr, 10))));
+                        } else {
+                            realFn = reinterpret_cast<void*>(GetProcAddress(hTarget, funcName));
+                        }
+                    }
+                    DebugLog("[loader] 导出解析: %s -> FORWARD -> %s!%s = %p (真实地址)",
+                             exportName, fullDll, funcName, realFn);
+                    if (realFn) return realFn;
+                    // forwarder 解析失败（目标 DLL 未加载），走下面的旧路径（GetProcAddress 兜底）
+                }
+            }
+
             DebugLog("[loader] 导出解析: %s -> rva=0x%X addr=%p (exp: funcs=0x%X names=0x%X ords=0x%X numF=%u numN=%u)",
                      exportName, fnRva, reinterpret_cast<void*>(moduleBase + fnRva),
                      (unsigned)exp->AddressOfFunctions, (unsigned)exp->AddressOfNames,
