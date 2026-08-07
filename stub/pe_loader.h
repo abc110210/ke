@@ -227,23 +227,28 @@ static uintptr_t g_payloadTlsTemplate = 0;
 // 独立 SEH 辅助：TLS 数据挂载——拷贝模板 + 用系统 TlsAlloc 分配 index + TlsSetValue 挂槽。
 // 参数全 POD、内部才用 __try（CI 37 教训：__try 不能进类内成员函数，否则 C2712；
 // 本函数放命名空间作用域）。x64: TEB+0x58=ThreadLocalStoragePointer（指向槽数组）。
-// 【CI 89/91】不能直接用 payload 的 _tls_index（链接初值 0，与 stub/系统 DLL 冲突）；
-// 也不能手动扫描 TEB 槽分配（CI 91 实测：手动占的槽 7 会被系统 TlsAlloc 在其它线程
-// 复用同一槽 → 各线程槽值不同「槽值错」→ TLS 变量地址错 → 随机崩溃）。
-// 正解：系统 TlsAlloc() 分配【进程级唯一】index（位图管理，任何线程不再复用），
-// TlsSetValue 挂当前线程槽；工作线程由 TlsMountWrapper（NtCreateThreadEx hook）挂载。
+// CI 102：SafeTlsMount 修正——不调用 TlsAlloc，只用 vcruntime140.dll 已分配的 index
+// payload（/MD 动态 CRT）的 _tls_index 由 vcruntime140.dll 的 DLL_PROCESS_ATTACH 在进程
+// 启动时分配，FixImports 已将 IAT 定位到 vcruntime140.dll 内存。CRT 函数（RVA 0x9159）
+// 通过 rip-relative 读的就是这个固定 index。之前的 TlsAlloc 分配了新 index（如 4）→
+// 写回 idxAddr 覆盖 vcruntime140.dll 的 _tls_index → CRT 读旧 index、我们挂新 index
+// → 两套 index 错位 → CRT 读不到我们挂的 TLS 数据 → gs:[0x58] 数组[旧index]=null
+// → payload 代码读 thread_local 变量 = null+偏移 → 野指针崩（"dmin"/fault=-1/rsp=0）。
+// 正解：读 idxAddr 的【现有值】（vcruntime140.dll 已分配的），直接用它挂槽，不改写 index。
 static bool SafeTlsMount(uintptr_t idxAddr, uintptr_t tplAddr,
                          void* tlsData, size_t tlsSize, DWORD* outIndex)
 {
     DWORD tlsIndex = 0;
     __try {
         memcpy(tlsData, reinterpret_cast<const void*>(tplAddr), tlsSize);
-        DWORD idx = TlsAlloc();                    // 进程级唯一 index（系统位图）
-        if (idx == TLS_OUT_OF_INDEXES) return false;
-        if (!TlsSetValue(idx, tlsData)) { TlsFree(idx); return false; }
-        tlsIndex = idx;
-        // 写回 payload 的 _tls_index（AddressOfIndex 指向的 DWORD），业务用它查槽
-        if (idxAddr) *(volatile DWORD*)idxAddr = tlsIndex;
+        // 读 vcruntime140.dll 已分配的 _tls_index（FixImports 后已指向正确地址）
+        if (idxAddr) tlsIndex = *(volatile DWORD*)idxAddr;
+        if (tlsIndex == 0) {
+            // /MT 静态 CRT 回退：index=0 是 .tls 链接初值且无其他 DLL 占用，直接用
+            // （系统 loader 会在进程启动时分配 0→?，但 /MT 的 _tls_index 在 exe 自身 .rdata
+            // 非导入变量，与系统 TlsAlloc 不冲突）
+        }
+        TlsSetValue(tlsIndex, tlsData);
     } __except (EXCEPTION_EXECUTE_HANDLER) {
         return false;
     }
