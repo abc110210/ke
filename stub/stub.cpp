@@ -699,6 +699,13 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int)
                  (unsigned)ldc.VirtualAddress, (unsigned)ldc.Size, cfgSize, guardFlags,
                  cfgEnabled ? "ON(!)" : "off");
     }
+    // CI 134：跳 OEP 前用 HeapValidate 全量校验进程堆——如果堆在跳 OEP 前就已经不一致，
+    // 说明加载器（重定位/导入修复）写坏了堆；如果一致，说明堆损坏在 payload CRT 执行期。
+    {
+        HANDLE hProc = GetProcessHeap();
+        BOOL ok = HeapValidate(hProc, 0, nullptr);
+        DebugLog("[stub] HeapValidate(跳OEP前) = %d (%s)", (int)ok, ok ? "堆一致" : "堆已不一致!");
+    }
     {
         auto h = AddVectoredExceptionHandler(1, HeapCorruptionVeh);
         if (h) DebugLog("[stub] 已装堆损坏 VEH 捕获器（第一机会）");
