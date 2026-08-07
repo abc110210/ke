@@ -128,20 +128,21 @@ static inline void* peExportAddress(uintptr_t base, const char* exportName)
     for (DWORD i = 0; i < exp->NumberOfNames; i++) {
         const char* nm = reinterpret_cast<const char*>(base + names[i]);
         if (strcmp(nm, exportName) == 0) {
-            // CI 108：PE 规范 AddressOfNameOrdinals[i] 是 biased ordinal，funcs 下标应为
-            // ords[i]-Base；但部分 DLL（Base==0）或歧义下 ords[i] 即下标。两候选都试，
-            // 选【落在代码节】的那个，杜绝把数据地址当函数（消除"导入解析异常"噪音 + 保证正确）。
-            DWORD idxA = (exp->Base > 0 && ords[i] >= exp->Base) ? ords[i] - exp->Base : ords[i];
+            // CI 126（根因修复）：同 resolveExportFromBase——PE 规范 AddressOfNameOrdinals[i]
+            // 是 unbiased 0-based 下标，直接用于 funcs，不减 Base。先试 idxB=ords[i]（正确），
+            // idxA=ords[i]-Base 仅在 idxB 不在代码节时兜底。CI 108 先试 idxA 导致 Base>0 的 DLL
+            // 解析偏移一个函数（实锤：kernel32 GetSystemTimeAsFileTime→GetSystemTimeAdjustment）。
             DWORD idxB = ords[i];
+            DWORD idxA = (exp->Base > 0 && ords[i] >= exp->Base) ? ords[i] - exp->Base : ords[i];
             DWORD fnRva = 0;
-            for (DWORD idx : {idxA, idxB}) {
+            for (DWORD idx : {idxB, idxA}) {
                 if (idx < exp->NumberOfFunctions && funcs[idx] &&
                     rvaInCodeSection(base, funcs[idx])) {
                     fnRva = funcs[idx];
                     break;
                 }
             }
-            if (!fnRva) fnRva = (idxA < exp->NumberOfFunctions) ? funcs[idxA] : 0; // 兜底（转发串也返回）
+            if (!fnRva) fnRva = (idxB < exp->NumberOfFunctions) ? funcs[idxB] : 0;
             if (fnRva >= expRva && fnRva < expRva + expSz) {
                 // 转发函数（forwarder）→ 简单返回 RVA（由调用方决定）
                 return reinterpret_cast<void*>(base + fnRva);
@@ -226,18 +227,23 @@ static inline void* resolveExportFromBase(uintptr_t moduleBase, const char* expo
     for (DWORD i = 0; i < exp->NumberOfNames; i++) {
         const char* nm = reinterpret_cast<const char*>(moduleBase + names[i]);
         if (strcmp(nm, exportName) == 0) {
-            // CI 108：同 peExportAddress——两候选下标，选落在代码节的，杜绝数据地址误填。
-            DWORD idxA = (exp->Base > 0 && ords[i] >= exp->Base) ? ords[i] - exp->Base : ords[i];
-            DWORD idxB = ords[i];
+            // CI 126（根因修复）：PE 规范铁律——AddressOfNameOrdinals[i] 存的是 unbiased
+            // 0-based 下标，直接用于 AddressOfFunctions，**不减 Base**。CI 108 的"两候选择优"
+            // 先试 idxA=ords[i]-Base（偏移版），当 Base>0 时 idxA 指向相邻函数——如果相邻函数
+            // 也在 .text（rvaInCodeSection=true），就用错地址！实锤：kernel32 Base=1，
+            // GetSystemTimeAsFileTime 被解析成相邻的 GetSystemTimeAdjustment 地址 → payload 崩。
+            // 修复：优先用 idxB=ords[i]（规范正确下标），idxA 仅在 idxB 不在代码节时兜底。
+            DWORD idxB = ords[i];                    // PE 规范正确下标（优先）
+            DWORD idxA = (exp->Base > 0 && ords[i] >= exp->Base) ? ords[i] - exp->Base : ords[i];  // 偏移兜底
             DWORD fnRva = 0;
-            for (DWORD idx : {idxA, idxB}) {
+            for (DWORD idx : {idxB, idxA}) {         // 先 idxB（正确），后 idxA（兜底）
                 if (idx < exp->NumberOfFunctions && funcs[idx] &&
                     rvaInCodeSection(moduleBase, funcs[idx])) {
                     fnRva = funcs[idx];
                     break;
                 }
             }
-            if (!fnRva) fnRva = (idxA < exp->NumberOfFunctions) ? funcs[idxA] : 0;
+            if (!fnRva) fnRva = (idxB < exp->NumberOfFunctions) ? funcs[idxB] : 0;
 
             // CI 124（根因修复）：forwarder 检测——funcs[idx] RVA 落在 export directory 范围内
             // 说明是转发项（指向 "DLL.Func" 字符串），不是真实代码。第15轮实锤：kernel32!

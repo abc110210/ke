@@ -117,10 +117,26 @@ static size_t    g_plSize = 0;
 static void ProbeGetSystemTimeAsFileTime()
 {
     FILETIME ft = {0};
+    // CI 125：比较三个地址：stub IAT 入口、GetProcAddress 结果、resolveExportFromBase 解析结果。
+    // 三者应一致（都是 kernel32 或 KERNELBASE 的真实入口）。不一致则 IAT 填错。
+    void* stubEntry = reinterpret_cast<void*>(GetSystemTimeAsFileTime);  // stub 编译期链接的入口
+    HMODULE k32 = GetModuleHandleW(L"kernel32.dll");
+    void* gpaEntry = k32 ? reinterpret_cast<void*>(GetProcAddress(k32, "GetSystemTimeAsFileTime")) : nullptr;
+    DebugLog("[stub] 探针 GetSystemTimeAsFileTime 地址: stubIAT=%p kernel32GetProcAddress=%p",
+             stubEntry, gpaEntry);
+    // 直接用 payload IAT 槽里填的那个地址调（模拟 payload 的调用路径）
+    // 从 pe_loader 的 resolveExportFromBase 拿——这里用 GetProcAddress(kernel32) 近似（应相同）
     __try {
         GetSystemTimeAsFileTime(&ft);
         DebugLog("[stub] 探针 GetSystemTimeAsFileTime 成功: dwLow=%u dwHigh=%u",
                  (unsigned)ft.dwLowDateTime, (unsigned)ft.dwHighDateTime);
+        // 再用 kernel32!GetSystemTimeAsFileTime 的地址直接调（模拟 payload call IAT 槽）
+        if (gpaEntry) {
+            typedef void (WINAPI* PFN_GetSystemTimeAsFileTime)(FILETIME*);
+            ((PFN_GetSystemTimeAsFileTime)gpaEntry)(&ft);
+            DebugLog("[stub] 探针 kernel32!GSTAFT 直接调用成功: dwLow=%u dwHigh=%u",
+                     (unsigned)ft.dwLowDateTime, (unsigned)ft.dwHighDateTime);
+        }
     } __except (EXCEPTION_EXECUTE_HANDLER) {
         DebugLog("[stub] 探针 GetSystemTimeAsFileTime 崩溃(0x%X)！stub 环境已被 LDR/PEB 改写破坏",
                  (unsigned)GetExceptionCode());
