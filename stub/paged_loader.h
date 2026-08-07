@@ -75,6 +75,51 @@ static void DescribeAddr(uintptr_t addr, char* modOut, size_t modOutSz, uintptr_
     }
 }
 
+// CI 117：解析 addr 所在模块的 PE 导出表，找到「最接近且 <= addr」的导出函数名。
+// 把 KERNELBASE+0x1019B7 这类裸偏移翻译成可读的 "KERNELBASE!FuncName+0xNN"，
+// 直接定位 payload 到底调了哪个系统 API 崩（反推缺哪份 OS 状态 / 哪个句柄=-1）。
+static void ResolveExportName(uintptr_t addr, char* out, size_t outSz)
+{
+    out[0] = 0;
+    HMODULE hMod = nullptr;
+    if (!GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+                            GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                            reinterpret_cast<LPCWSTR>(addr), &hMod) || !hMod)
+        return;
+    uintptr_t base = reinterpret_cast<uintptr_t>(hMod);
+    PIMAGE_DOS_HEADER dos = reinterpret_cast<PIMAGE_DOS_HEADER>(base);
+    if (!dos || dos->e_magic != IMAGE_DOS_SIGNATURE) return;
+    PIMAGE_NT_HEADERS nt = reinterpret_cast<PIMAGE_NT_HEADERS>(base + dos->e_lfanew);
+    if (!nt || nt->Signature != IMAGE_NT_SIGNATURE) return;
+    auto& ed = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT];
+    if (!ed.VirtualAddress || !ed.Size) return;
+    PIMAGE_EXPORT_DIRECTORY exp =
+        reinterpret_cast<PIMAGE_EXPORT_DIRECTORY>(base + ed.VirtualAddress);
+    DWORD rvaAddr = (DWORD)(addr - base);
+    DWORD* fns   = reinterpret_cast<DWORD*>(base + exp->AddressOfFunctions);
+    DWORD  best  = 0;
+    DWORD  bestIdx = 0;          // 函数表索引（= 序号 - Base），供名字反查
+    bool   found = false;
+    for (DWORD i = 0; i < exp->NumberOfFunctions; i++) {
+        DWORD f = fns[i];
+        if (f <= rvaAddr && (!found || f > best)) { best = f; bestIdx = i; found = true; }
+    }
+    if (!found) { sprintf(out, " <无匹配导出>"); return; }
+    const char* name = nullptr;
+    WORD* ords  = reinterpret_cast<WORD*>(base + exp->AddressOfNameOrdinals);
+    DWORD* names = reinterpret_cast<DWORD*>(base + exp->AddressOfNames);
+    for (DWORD i = 0; i < exp->NumberOfNames; i++) {
+        if (ords[i] == (WORD)bestIdx) {
+            name = reinterpret_cast<const char*>(base + names[i]);
+            break;
+        }
+    }
+    if (name)
+        sprintf(out, " %s+0x%X", name, (unsigned)(rvaAddr - best));
+    else
+        sprintf(out, " ordinal#%u+0x%X", (unsigned)(exp->Base + bestIdx), (unsigned)(rvaAddr - best));
+}
+
 // 正经走栈：从异常现场（通常停在 KERNELBASE!RaiseException 内）用 RtlVirtualUnwind 逐帧展开，
 // 打印完整调用链。CI 67 前 payload 无 .pdata，展开到第一个 payload 帧即停（定位 throw 站点）；
 // CI 66 起 .pdata 已注册（RtlAddFunctionTable count=1102），RtlVirtualUnwind 能展开 payload
@@ -137,8 +182,16 @@ static void LogRealThrowSite(EXCEPTION_POINTERS* ep, uintptr_t pb, uintptr_t pe)
                                (LPCWSTR)ctx.Rip, &hMod) && hMod)
             GetModuleFileNameA(hMod, mod, sizeof(mod));
         bool inPayload = (ctx.Rip >= pb && ctx.Rip < pe);
+        char extra[384] = {0};
+        if (inPayload) {
+            sprintf(extra, "  <<< payload RVA=0x%llX", (unsigned long long)(ctx.Rip - pb));
+        } else {
+            char expn[256] = {0};
+            ResolveExportName(ctx.Rip, expn, sizeof(expn));
+            sprintf(extra, "%s", expn);
+        }
         DebugLog("[veh]   #%d rip=%p module=%s%s",
-                 d, (void*)ctx.Rip, mod, inPayload ? "  <<< payload" : "");
+                 d, (void*)ctx.Rip, mod, extra);
     }
 }
 
@@ -996,6 +1049,8 @@ private:
                 uintptr_t rip = reinterpret_cast<uintptr_t>(rec->ExceptionAddress);
                 char mod[256] = {0}; uintptr_t modBase = 0;
                 DescribeAddr(rip, mod, sizeof(mod), &modBase);
+                char expName[256] = {0};
+                ResolveExportName(rip, expName, sizeof(expName));
                 char modFault[256] = {0}; uintptr_t fBase = 0;
                 DescribeAddr(fault, modFault, sizeof(modFault), &fBase);
                 // RIP 处指令字节 dump（判断执行了 jmp/call/普通指令；不可读则全 0）
@@ -1038,7 +1093,7 @@ private:
                     DebugLog("[veh] 取指AV页面诊断: RIP页 isCode=%d 页基址=%p 实际保护=0x%X (期望代码页=EXECUTE_READ 0x20)",
                              pgIsCode, reinterpret_cast<void*>(pgBase2), (unsigned)pgProt);
                 }
-                DebugLog("[veh] AV 不在镜像内: code=0x%08X addr=%p (%s%s 偏移=0x%llX) fault=%p (%s%s) RIP字节=%02X%02X%02X%02X%02X%02X%02X%02X | rax=%p rbx=%p rcx=%p rdx=%p rsi=%p rdi=%p rbp=%p rsp=%p 栈顶=%p (模块=%s) 次栈顶=%p",
+                DebugLog("[veh] AV 不在镜像内: code=0x%08X addr=%p (%s%s 偏移=0x%llX) fault=%p (%s%s) RIP字节=%02X%02X%02X%02X%02X%02X%02X%02X | rax=%p rbx=%p rcx=%p rdx=%p rsi=%p rdi=%p rbp=%p rsp=%p 栈顶=%p (模块=%s) 次栈顶=%p%s",
                          (unsigned)rec->ExceptionCode, rec->ExceptionAddress,
                          mod[0] ? mod : "?", mod[0] ? "" : "",
                          (unsigned long long)(modBase ? (rip - modBase) : 0),
@@ -1050,9 +1105,9 @@ private:
                          reinterpret_cast<void*>(ctx->Rcx), reinterpret_cast<void*>(ctx->Rdx),
                          reinterpret_cast<void*>(ctx->Rsi), reinterpret_cast<void*>(ctx->Rdi),
                          reinterpret_cast<void*>(ctx->Rbp), reinterpret_cast<void*>(rsp),
-                         reinterpret_cast<void*>(stackRet),
-                         modRet[0] ? modRet : "?",
-                         reinterpret_cast<void*>(stackRet2));
+                     reinterpret_cast<void*>(stackRet),
+                     modRet[0] ? modRet : "?",
+                     reinterpret_cast<void*>(stackRet2), expName);
                 // CI 85：补崩溃线程 ID + RIP 前 24 字节指令（人工反汇编确认 rbx 来源——
                 // 页 57 偏移 0x159/0x19A 的 mov eax,[rbx] / mov [rbx+rax*8+0x10],rsi，
                 // rbx 野指针需定位它来自哪条指令的哪个全局/寄存器）。
