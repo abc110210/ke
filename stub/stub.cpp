@@ -111,6 +111,22 @@ static LONG WINAPI TopLevelHandler(EXCEPTION_POINTERS* ep)
 static uintptr_t g_plBase = 0;
 static size_t    g_plSize = 0;
 
+// CI 123：独立 SEH 辅助（不能进 wWinMain——C2712：__try 不能和 C++ 对象展开共存）。
+// 跳 OEP 前手动调 GetSystemTimeAsFileTime，判定 stub 环境（LDR 注册 + PEB 改写后）是否
+// 已被破坏。成功=环境正常（崩因在 payload 执行期）；崩=环境已被 LDR 头插污染。
+static void ProbeGetSystemTimeAsFileTime()
+{
+    FILETIME ft = {0};
+    __try {
+        GetSystemTimeAsFileTime(&ft);
+        DebugLog("[stub] 探针 GetSystemTimeAsFileTime 成功: dwLow=%u dwHigh=%u",
+                 (unsigned)ft.dwLowDateTime, (unsigned)ft.dwHighDateTime);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        DebugLog("[stub] 探针 GetSystemTimeAsFileTime 崩溃(0x%X)！stub 环境已被 LDR/PEB 改写破坏",
+                 (unsigned)GetExceptionCode());
+    }
+}
+
 int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int)
 {
     // 【CI 107 早期探针】无条件写 stderr（CI 用 -RedirectStandardError 捕获）+ 立即 flush。
@@ -494,6 +510,13 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int)
                  (void*)selfMod2, (void*)pearmor::ModuleFake::gPayloadBase,
                  (selfMod2 == (HMODULE)pearmor::ModuleFake::gPayloadBase) ? 1 : 0);
     }
+    // CI 123：跳 OEP 前手动调 GetSystemTimeAsFileTime 探针——第14轮实锤 payload RVA 0x3987a
+    // 调的就是这个 API（IAT 槽值 0x...95594FE0 == kernel32!GetSystemTimeAsFileTime），
+    // 但它在 KERNELBASE 内部崩 add [rcx-0x77],al（rcx=1）。在 stub 上下文（LDR 注册后、
+    // 跳 OEP 前）手动调一次，看能否成功：
+    //   - 成功 → stub 环境正常，崩因在 payload 执行后的状态变化
+    //   - 失败/崩 → stub 环境本身已被 LDR 头插/PEB 改写破坏
+    ProbeGetSystemTimeAsFileTime();
     // CI 121：跳 OEP 前 dump PEB 关键字段（崩溃在 KERNELBASE GetSystemTimeAdjustment
     // 内部 add [rcx-0x77],al，rcx=1 像是读 PEB/TEB 某字段拿到脏值）。对照系统正常值判断
     // 哪个字段被我们改坏/漏设。关键字段偏移（x64 PEB）：
