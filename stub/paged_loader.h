@@ -183,12 +183,12 @@ static void ResolveApiFromCaller(uintptr_t callerRip, uintptr_t base,
             int32_t disp = *reinterpret_cast<int32_t*>(buf + i + 2);
             uintptr_t iatSlot = instrAddr + 6 + (intptr_t)disp;
             DWORD rvaTarget = (DWORD)(iatSlot - base);
-            PIMAGE_DOS_HEADER dos = reinterpret_cast<PIMAGE_DOS_HEADER*>(base);
-            PIMAGE_NT_HEADERS nt = reinterpret_cast<PIMAGE_NT_HEADERS*>(base + dos->e_lfanew);
+            PIMAGE_DOS_HEADER dos = reinterpret_cast<PIMAGE_DOS_HEADER>(base);
+            PIMAGE_NT_HEADERS nt = reinterpret_cast<PIMAGE_NT_HEADERS>(base + dos->e_lfanew);
             auto& idd = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT];
             if (!idd.VirtualAddress || !idd.Size) return;
             PIMAGE_IMPORT_DESCRIPTOR desc =
-                reinterpret_cast<PIMAGE_IMPORT_DESCRIPTOR*>(base + idd.VirtualAddress);
+                reinterpret_cast<PIMAGE_IMPORT_DESCRIPTOR>(base + idd.VirtualAddress);
             for (DWORD k = 0; desc[k].OriginalFirstThunk || desc[k].FirstThunk; k++) {
                 if (!desc[k].FirstThunk) continue;
                 const char* dll = reinterpret_cast<const char*>(base + desc[k].Name);
@@ -202,7 +202,7 @@ static void ResolveApiFromCaller(uintptr_t callerRip, uintptr_t base,
                         sprintf(out, " %s!ordinal#%u", dll, (unsigned)IMAGE_ORDINAL64(intt[j]));
                     } else {
                         PIMAGE_IMPORT_BY_NAME ibn =
-                            reinterpret_cast<PIMAGE_IMPORT_BY_NAME*>(base + (DWORD)intt[j]);
+                            reinterpret_cast<PIMAGE_IMPORT_BY_NAME>(base + (DWORD)intt[j]);
                         sprintf(out, " %s!%s", dll, ibn->Name);
                     }
                     return;
