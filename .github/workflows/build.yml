@@ -63,17 +63,11 @@ jobs:
           #   GUI 程序正常表现为"常驻不退出"（消息循环），崩溃为"秒退+exit code 非0
           #   或 [veh] C++ 异常日志"。故判定：20s 超时=存活(GOOD)，提前退出=崩(BAD)。
           # ============================================================
+          # 临时精简为单组合：全关保护（all_off）跑最快的"加载/解密/导入/CRT 启动"路径，
+          # 配合 OepExceptFilter 新增的「崩溃所属节 + rbx vector 头」诊断，下一轮日志直接
+          # 指向下一轮修复方向。定位清楚后再恢复完整矩阵。
           $combos = @(
-            @{ name = "1_baseline";        gating = $null;  watchdog = $null; inject = $null; tls = $null; swallow = $null; fixedbase = $null },
-            @{ name = "2_all_off";         gating = "1";    watchdog = "1";   inject = "1"; tls = $null; swallow = $null; fixedbase = $null },
-            @{ name = "3_gating_only_off"; gating = "1";    watchdog = $null; inject = $null; tls = $null; swallow = $null; fixedbase = $null },
-            @{ name = "4_watchdog_only_off"; gating = $null; watchdog = "1";  inject = $null; tls = $null; swallow = $null; fixedbase = $null },
-            @{ name = "5_inject_only_off"; gating = $null;  watchdog = $null; inject = "1"; tls = $null; swallow = $null; fixedbase = $null },
-            @{ name = "6_no_tls";          gating = $null;  watchdog = $null; inject = $null; tls = "1"; swallow = $null; fixedbase = $null },
-            @{ name = "7_swallow_e06d";    gating = $null;  watchdog = $null; inject = $null; tls = $null; swallow = "1"; fixedbase = $null; fakeav = $null },
-            @{ name = "8_fixed_base";      gating = $null;  watchdog = $null; inject = $null; tls = $null; swallow = $null; fixedbase = "1"; fakeav = $null },
-            @{ name = "9_nofakeav";        gating = $null;  watchdog = $null; inject = $null; tls = $null; swallow = $null; fixedbase = $null; fakeav = "1"; corrupt = $null },
-            @{ name = "10_nocorrupt";     gating = $null;  watchdog = $null; inject = $null; tls = $null; swallow = $null; fixedbase = $null; fakeav = $null; corrupt = "1" }
+            @{ name = "2_all_off";         gating = "1";    watchdog = "1";   inject = "1"; tls = $null; swallow = $null; fixedbase = $null }
           )
           $tmp = $env:TEMP
           $anyGood = $false
