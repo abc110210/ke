@@ -91,26 +91,59 @@ inline void Init()
 }
 
 // ---- 各系统调用的类型化包装（参数布局与官方 Nt* 一致） ----
+// 【CI110 健壮性修复】原生 syscall 优先（绕过 Win32 钩子，保生产环境反 hook），
+// SSN 未解析(=0)或调用失败则回退 Win32 VirtualAlloc/VirtualProtect/VirtualFree。
+// 原因（第四轮.txt）：CI runner 系统更新后 getSsn 扫描 0xB8 解析到的
+// NtAllocateVirtualMemory SSN 错位 → 调用落到 NtMapViewOfSection → 返回
+// 0xC0000024(STATUS_MAP_TOO_MANY_SECTIONS) → P3.1 自校验 alloc 失败自毁、
+// 且 payload 页分配（同函数）也会失败。回退保证所有环境都能加载。
 
 inline NTSTATUS AllocateVirtualMemory(HANDLE hProc, PVOID* base, ULONG_PTR zeroBits,
                                       PSIZE_T size, ULONG type, ULONG prot)
 {
-    return NtRawSyscall(ssn().NtAllocateVirtualMemory, hProc, base,
+    if (ssn().NtAllocateVirtualMemory != 0) {
+        NTSTATUS st = NtRawSyscall(ssn().NtAllocateVirtualMemory, hProc, base,
                         (void*)zeroBits, size, (void*)(UINT_PTR)type, (void*)(UINT_PTR)prot);
+        if (NT_SUCCESS(st) && *base) return st;
+    }
+    // 回退：仅支持本进程、zeroBits=0 的情形（加载器/payload 均满足）
+    if (hProc == GetCurrentProcess() && zeroBits == 0) {
+        *base = VirtualAlloc(nullptr, *size, type, prot);
+        if (*base) return 0; // STATUS_SUCCESS
+    }
+    return (NTSTATUS)0xC0000001; // STATUS_UNSUCCESSFUL
 }
 
 // NtFreeVirtualMemory(ProcessHandle, BaseAddress*, Size*, FreeType)
 inline NTSTATUS FreeVirtualMemory(HANDLE hProc, PVOID* base, PSIZE_T size)
 {
-    return NtRawSyscall(ssn().NtFreeVirtualMemory, hProc, base, size,
+    if (ssn().NtFreeVirtualMemory != 0) {
+        NTSTATUS st = NtRawSyscall(ssn().NtFreeVirtualMemory, hProc, base, size,
                         (void*)(UINT_PTR)MEM_RELEASE, nullptr, nullptr);
+        if (NT_SUCCESS(st)) return st;
+    }
+    if (hProc == GetCurrentProcess()) {
+        if (VirtualFree(*base, 0, MEM_RELEASE)) return 0;
+    }
+    return (NTSTATUS)0xC0000001;
 }
 
 inline NTSTATUS ProtectVirtualMemory(HANDLE hProc, PVOID* base, PSIZE_T size,
                                      ULONG newProt, PULONG oldProt)
 {
-    return NtRawSyscall(ssn().NtProtectVirtualMemory, hProc, base, size,
+    if (ssn().NtProtectVirtualMemory != 0) {
+        NTSTATUS st = NtRawSyscall(ssn().NtProtectVirtualMemory, hProc, base, size,
                         (void*)(UINT_PTR)newProt, oldProt, nullptr);
+        if (NT_SUCCESS(st)) return st;
+    }
+    if (hProc == GetCurrentProcess()) {
+        DWORD op = 0;
+        if (VirtualProtect(*base, *size, newProt, &op)) {
+            if (oldProt) *oldProt = op;
+            return 0;
+        }
+    }
+    return (NTSTATUS)0xC0000001;
 }
 
 inline NTSTATUS QueryInformationProcess(HANDLE hProc, ULONG infoClass,
