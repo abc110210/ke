@@ -677,6 +677,28 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int)
         DebugLog("[stub] vcruntime140.dll 已加载");
     }
     ProbeUcrt();  // CI 131：UCRT 初始化检查
+    // CI 133：检查 payload 是否开了 /GUARD:CF（控制流防护）。
+    // payload CMakeLists.txt L211 有 /GUARD:CF + L222 /GUARD:CF——CFG 开启后，payload 的
+    // 间接调用（虚函数/函数指针）会校验目标在 CFG 位图里。手动映射不注册 CFG 位图 →
+    // 校验行为未定义 → 可能跳错地址 → 堆损坏（0xC0000374）。
+    // 检查 LOAD_CONFIG 目录的 GuardFlags（非零=CFG 开启）。
+    if (pearmor::ModuleFake::gPayloadBase) {
+        auto* dos = reinterpret_cast<IMAGE_DOS_HEADER*>(pearmor::ModuleFake::gPayloadBase);
+        auto* nt = reinterpret_cast<IMAGE_NT_HEADERS*>(pearmor::ModuleFake::gPayloadBase + dos->e_lfanew);
+        auto& ldc = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_LOAD_CONFIG];
+        DWORD guardFlags = 0, cfgSize = 0;
+        if (ldc.VirtualAddress && ldc.Size >= 0x60) {  // GuardFlags 在偏移 0x5C
+            auto* lc = reinterpret_cast<BYTE*>(pearmor::ModuleFake::gPayloadBase + ldc.VirtualAddress);
+            cfgSize = *(DWORD*)(lc + 0);            // Size 字段
+            guardFlags = *(DWORD*)(lc + 0x5C);      // GuardFlags
+        }
+        bool cfgEnabled = (guardFlags & 0x4000) != 0 ||   // IMAGE_GUARD_CF_FUNCTION_TABLE_PRESENT
+                          (guardFlags & 0x8000) != 0 ||   // IMAGE_GUARD_SECURITY_COOKIE
+                          guardFlags != 0;
+        DebugLog("[stub] payload LOAD_CONFIG: dirRVA=0x%X dirSize=%u cfgSize=%u GuardFlags=0x%X CFG=%s",
+                 (unsigned)ldc.VirtualAddress, (unsigned)ldc.Size, cfgSize, guardFlags,
+                 cfgEnabled ? "ON(!)" : "off");
+    }
     {
         auto h = AddVectoredExceptionHandler(1, HeapCorruptionVeh);
         if (h) DebugLog("[stub] 已装堆损坏 VEH 捕获器（第一机会）");
