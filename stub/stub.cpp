@@ -450,12 +450,13 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int)
                  (void*)selfMod, (void*)pearmor::ModuleFake::gPayloadBase,
                  (selfMod == (HMODULE)pearmor::ModuleFake::gPayloadBase) ? 1 : 0);
         // TEB 栈信息（x64: gs:0x30=TEB, +0x08=StackBase, +0x10=StackLimit）
-        __try {
-            BYTE* teb = reinterpret_cast<BYTE*>(__readgsqword(0x30));
-            void* stackBase  = *reinterpret_cast<void**>(teb + 0x08);
-            void* stackLimit = *reinterpret_cast<void**>(teb + 0x10);
-            DebugLog("[stub] TEB 栈: base=%p limit=%p", stackBase, stackLimit);
-        } __except (EXCEPTION_EXECUTE_HANDLER) {}
+        // 【不可】用 __try 包裹：wWinMain 含 std::vector 等需栈展开的 C++ 对象，
+        // MSVC 禁止在同一函数内混用 SEH(__try) 与 C++ 对象展开（C2712/C2713）。
+        // TEB 对当前线程恒有效、读取不会抛 SEH，故直接读即可。
+        BYTE* teb = reinterpret_cast<BYTE*>(__readgsqword(0x30));
+        void* stackBase  = *reinterpret_cast<void**>(teb + 0x08);
+        void* stackLimit = *reinterpret_cast<void**>(teb + 0x10);
+        DebugLog("[stub] TEB 栈: base=%p limit=%p", stackBase, stackLimit);
     }
     int rc = loader.CallEntry(entryRva);
     DebugLog("[stub] OEP 返回 rc=%d", rc);
