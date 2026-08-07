@@ -183,11 +183,12 @@ static LONG WINAPI HeapCorruptionVeh(EXCEPTION_POINTERS* ep)
              (void*)ep->ContextRecord->Rsp, (void*)ep->ContextRecord->Rip,
              (void*)ep->ContextRecord->Rax, (void*)ep->ContextRecord->Rbx,
              (void*)ep->ContextRecord->Rcx);
-    // 栈顶 8 个返回地址
+    // 栈顶 8 个返回地址（直接 __try 读，不依赖 SafeReadBytes——它是 paged_loader.h 的 static，
+    // 在本函数作用域不可见；HeapCorruptionVeh 是独立无 C++ 对象函数，可直接用 __try）
     uintptr_t rsp = ep->ContextRecord->Rsp;
     for (int i = 0; i < 8; i++) {
         uintptr_t v = 0;
-        if (!SafeReadBytes(rsp + i * 8, &v, sizeof(v))) break;
+        __try { v = *(uintptr_t*)(rsp + (uintptr_t)i * 8); } __except (1) { break; }
         if (!v) break;
         char m2[256] = {0}; HMODULE h2 = nullptr;
         if (GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
