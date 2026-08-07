@@ -232,6 +232,14 @@ static LONG WINAPI HeapCorruptionVeh(EXCEPTION_POINTERS* ep)
                          inPayload ? "" : "");
                 if (inPayload)
                     DebugLog("[veh-heap]        payload RVA=0x%llX", (unsigned long long)(ctx.Rip - g_plBase));
+                // CI 130：对 payload 帧 dump RIP 前 32 字节（反汇编定位它调了什么堆 API）
+                if (inPayload) {
+                    unsigned char ib[32] = {0};
+                    __try { memcpy(ib, (void*)(ctx.Rip > 32 ? ctx.Rip - 32 : 0), 32); } __except (1) {}
+                    char hex[128] = {0};
+                    for (int k = 0; k < 32; k++) sprintf(hex + k * 3, "%02X ", ib[k]);
+                    DebugLog("[veh-heap]        前32字节: %s", hex);
+                }
             }
         }
     }
