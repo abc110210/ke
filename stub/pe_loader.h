@@ -108,7 +108,11 @@ static inline void* peExportAddress(uintptr_t base, const char* exportName)
     for (DWORD i = 0; i < exp->NumberOfNames; i++) {
         const char* nm = reinterpret_cast<const char*>(base + names[i]);
         if (strcmp(nm, exportName) == 0) {
-            DWORD fnRva = funcs[ords[i]];
+            // CI 修复：AddressOfFunctions 按【序号-基址】索引，必须减 Base。
+            // 之前直接用 funcs[ords[i]] 在 Base≠0 的 DLL（kernel32/user32/msvcp 等）上
+            // 越界读到相邻数据（常为 .rdata 指针表）→ 解析出不可执行地址 →
+            // 满屏"导入解析异常"日志。Base=0 时减 0 无副作用。
+            DWORD fnRva = (ords[i] >= exp->Base) ? funcs[ords[i] - exp->Base] : 0;
             if (fnRva >= expRva && fnRva < expRva + expSz) {
                 // 转发函数（forwarder）→ 简单返回 RVA（由调用方决定）
                 return reinterpret_cast<void*>(base + fnRva);
@@ -193,7 +197,8 @@ static inline void* resolveExportFromBase(uintptr_t moduleBase, const char* expo
     for (DWORD i = 0; i < exp->NumberOfNames; i++) {
         const char* nm = reinterpret_cast<const char*>(moduleBase + names[i]);
         if (strcmp(nm, exportName) == 0) {
-            DWORD fnRva = funcs[ords[i]];
+            // CI 修复：AddressOfFunctions 按【序号-基址】索引，必须减 Base（见 peExportAddress 同类修复）。
+            DWORD fnRva = (ords[i] >= exp->Base) ? funcs[ords[i] - exp->Base] : 0;
             // CI 63 诊断：自研解析成功时打印关键值，便于核对是否把名字字符串 RVA 当函数 RVA
             DebugLog("[loader] 导出解析: %s -> rva=0x%X addr=%p (exp: funcs=0x%X names=0x%X ords=0x%X numF=%u numN=%u)",
                      exportName, fnRva, reinterpret_cast<void*>(moduleBase + fnRva),
@@ -240,9 +245,11 @@ static bool SafeTlsMount(uintptr_t idxAddr, uintptr_t tplAddr,
 {
     DWORD tlsIndex = 0;
     __try {
-        // 拷贝 PE TLS 模板（StartAddressOfRawData → EndAddressOfRawData），
-        // 含编译器初始化的 thread_local 变量值（POD→零、非POD→正确构造前哨）
-        memcpy(tlsData, reinterpret_cast<const void*>(tplAddr), tlsSize);
+        // CI 104→回退为 CI 103 正解：【零填充分配】不拷贝 TLS 模板。
+        // VirtualAlloc 分配的 tlsData 已零填充。CRT 的 mainCRTStartup 读 TlsGetValue
+        // 看到「TLS 已挂载但数据全零」→ 执行正常 TLS 初始化（拷贝模板 + 运行构造
+        // 回调 + 初始化 thread_local 对象）。若 memcpy 模板则 CRT 误判「已初始化」
+        // → 跳过构造 → thread_local 对象（如 obf::w 的 32 槽缓冲）未构造 → 解码垃圾。
         // 读 vcruntime140.dll 已分配的 _tls_index（FixImports 后已指向正确地址）
         if (idxAddr) tlsIndex = *(volatile DWORD*)idxAddr;
         TlsSetValue(tlsIndex, tlsData);
@@ -269,7 +276,8 @@ static void MountCurrentThreadTls()
         if (TlsGetValue(static_cast<DWORD>(g_payloadTlsIndex))) return;
         void* p = VirtualAlloc(nullptr, g_payloadTlsSize, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
         if (!p) return;
-        memcpy(p, reinterpret_cast<const void*>(g_payloadTlsTemplate), g_payloadTlsSize);
+        // 零填充分配（同 SafeTlsMount，CI 103 正解）：先挂零 TLS，让 CRT 在新线程内
+        // 正常初始化 thread_local 对象；不再 memcpy 模板（避免 CRT 跳过构造）。
         TlsSetValue(static_cast<DWORD>(g_payloadTlsIndex), p);
     } __except (EXCEPTION_EXECUTE_HANDLER) {
     }

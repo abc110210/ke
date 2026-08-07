@@ -576,6 +576,39 @@ public:
             GetModuleFileNameA(hMod, mod, sizeof(mod));
         DebugLog("[oep] 捕获到异常 code=0x%08X addr=%p module=%s",
                  (unsigned)rec->ExceptionCode, addr, mod);
+        // CI 诊断：崩在 payload 内时，定位所属节 + 读 rbx（vector 头/this 指针）以区分
+        // 「堆损坏（IAT 填错→new 返回垃圾）」vs「指针未初始化」。直接指向下一轮修复方向。
+        if (g_instance) {
+            uintptr_t base = reinterpret_cast<uintptr_t>(g_instance->imageBase);
+            uintptr_t off  = reinterpret_cast<uintptr_t>(addr) - base;
+            if (off < g_instance->imageSize) {
+                auto* dos = reinterpret_cast<IMAGE_DOS_HEADER*>(base);
+                auto* nt  = reinterpret_cast<IMAGE_NT_HEADERS*>(base + dos->e_lfanew);
+                auto* sec = IMAGE_FIRST_SECTION(nt);
+                const char* secName = "(未知节)";
+                for (WORD i = 0; i < nt->FileHeader.NumberOfSections; i++) {
+                    DWORD va  = sec[i].VirtualAddress;
+                    DWORD vsz = sec[i].Misc.VirtualSize ? sec[i].Misc.VirtualSize : sec[i].SizeOfRawData;
+                    if (off >= va && off < va + vsz) { secName = reinterpret_cast<const char*>(sec[i].Name); break; }
+                }
+                uintptr_t rbx = ep->ContextRecord ? ep->ContextRecord->Rbx : 0;
+                uintptr_t rax = ep->ContextRecord ? ep->ContextRecord->Rax : 0;
+                unsigned char buf[16] = {0};
+                bool readable = false;
+                MEMORY_BASIC_INFORMATION mbi;
+                if (rbx && VirtualQuery(reinterpret_cast<LPCVOID>(rbx), &mbi, sizeof(mbi)) &&
+                    mbi.State == MEM_COMMIT) {
+                    __try { memcpy(buf, reinterpret_cast<const void*>(rbx), 16); readable = true; }
+                    __except (EXCEPTION_EXECUTE_HANDLER) { readable = false; }
+                }
+                DebugLog("[oep] 崩溃在 payload 内偏移=0x%llX 节=%s rbx=0x%llX rax=0x%llX "
+                         "rbx可读=%d qword0=0x%llX qword1=0x%llX",
+                         (unsigned long long)off, secName, (unsigned long long)rbx,
+                         (unsigned long long)rax, (int)readable,
+                         readable ? *(unsigned long long*)buf : 0ULL,
+                         readable ? *(unsigned long long*)(buf + 8) : 0ULL);
+            }
+        }
         return EXCEPTION_EXECUTE_HANDLER;
     }
     static void OepThunk()
