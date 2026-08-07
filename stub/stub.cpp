@@ -666,6 +666,16 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int)
     ProbeGetSystemTimeAsFileTime();
     // CI 127：堆探针 + VEH 堆损坏捕获器（抽成独立函数——wWinMain 含 C++ 对象不能 __try/lambda VEH）
     ProbeHeap();
+    // CI 132：vcruntime140.dll 未加载（L659 vcruntime140=0）！payload 如果是 /MD 或有延迟导入
+    // vcruntime140 的函数，IAT 槽会被错填（ResolveSystemModule 找不到→延迟导入跳过→IAT=0 或错填）。
+    // 先强制加载 vcruntime140，确保它的 DllMain（C++ 异常处理初始化）执行。
+    if (!GetModuleHandleA("vcruntime140.dll")) {
+        HMODULE vcr = LoadLibraryA("vcruntime140.dll");
+        DebugLog("[stub] 强制加载 vcruntime140.dll = %p%s", (void*)vcr,
+                 vcr ? "（成功）" : "（失败！vcruntime140 不可用）");
+    } else {
+        DebugLog("[stub] vcruntime140.dll 已加载");
+    }
     ProbeUcrt();  // CI 131：UCRT 初始化检查
     {
         auto h = AddVectoredExceptionHandler(1, HeapCorruptionVeh);
