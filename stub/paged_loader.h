@@ -1017,16 +1017,17 @@ private:
                          pb24[8], pb24[9], pb24[10], pb24[11], pb24[12], pb24[13], pb24[14], pb24[15],
                          pb24[16], pb24[17], pb24[18], pb24[19], pb24[20], pb24[21], pb24[22], pb24[23]);
                 // CI 89：崩溃线程 TLS 槽检查——工作线程 TEB 里 payload TLS 槽应为
-                // g_payloadTlsData；若 null → 工作线程 TLS 未挂载实锤（业务 __declspec(thread)
-                // 变量地址 = null+偏移（this=0x20）→ 随机崩溃）。
+                // 非 null（CI 100 起每线程独立副本，主线程才是 g_payloadTlsData）；
+                // null → 工作线程 TLS 未挂载实锤（业务 __declspec(thread) 变量地址
+                // = null+偏移（this=0x20）→ 随机崩溃）。
                 // 读取逻辑在 pe_loader.h 命名空间作用域（__try 不能进类成员函数 C2712）。
                 if (g_payloadTlsIndex != 0xFFFFFFFFu) {
                     void* got = pearmor::PeekCurrentThreadTlsSlot();
-                    DebugLog("[veh] 崩溃线程TLS: tid=%u index=%u 槽值=%p 期望=%p %s",
+                    DebugLog("[veh] 崩溃线程TLS: tid=%u index=%u 槽值=%p %s",
                              (unsigned)GetCurrentThreadId(), (unsigned)g_payloadTlsIndex,
-                             got, g_payloadTlsData,
-                             (got == g_payloadTlsData) ? "(已挂载)" :
-                             (got ? "(槽值错!)" : "(槽为null=工作线程未挂TLS!)"));
+                             got,
+                             (got == g_payloadTlsData) ? "(主线程)" :
+                             (got ? "(独立副本)" : "(槽为null=工作线程未挂TLS!)"));
                 }
                 // CI 93：fault=-1（取指地址为 -1）是异常中的异常——真实门控取指 AV 的 fault
                 // = 页内地址（如 ...9159），fault=-1 只可能是【业务主动 RaiseException(0xC0000005,

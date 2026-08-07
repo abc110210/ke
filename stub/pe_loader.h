@@ -209,8 +209,13 @@ static inline void* resolveExportFromBase(uintptr_t moduleBase, const char* expo
 // CI 89：payload TLS 挂载信息（stub.cpp TU 内共享；供工作线程挂载 + VEH 崩溃诊断）。
 // static（TU 局部）：stub.cpp include 本文件，paged_loader.h 也被 stub.cpp include，同 TU 共享。
 static uintptr_t g_payloadTlsIndex = 0xFFFFFFFFu;
-static void*     g_payloadTlsData  = nullptr;
+static void*     g_payloadTlsData  = nullptr;   // 主线程的 TLS 数据块（SafeTlsMount 挂载）
 static size_t    g_payloadTlsSize  = 0;
+// CI 100：TLS 模板（每线程独立副本的来源）——系统 loader 的 TLS 是【每线程独立副本】
+// （新线程创建时从模板拷贝一份）；我们之前让所有线程共享 g_payloadTlsData → thread_local
+// 变量（如 obf::w 的 32 槽缓冲）跨线程互相覆盖 → 解码错乱 → 业务拿垃圾字符串（"ndows"）
+// → 真实 AV。TlsMountWrapper 必须为【每个新线程】从模板分配独立副本。
+static uintptr_t g_payloadTlsTemplate = 0;
 
 // 独立 SEH 辅助：TLS 数据挂载——分配空闲 TLS 槽 + 拷贝模板 + 写入 TEB 槽。
 // 参数全 POD、内部才用 __try（CI 37 教训：__try 不能进类内成员函数，否则 C2712；
@@ -252,11 +257,22 @@ static bool SafeTlsMount(uintptr_t idxAddr, uintptr_t tplAddr,
 // null+偏移（如 this=0x20）→ 随机崩溃。此函数把槽挂到【当前调用线程】。
 // 命名空间作用域自由函数（__try 不能进类成员函数，C2712，CI 37 教训）。
 // CI 91：改用系统 TlsSetValue（与 TlsAlloc 分配的 index 配套，自动处理扩展槽）。
+// CI 100：改为【每线程独立 TLS 副本】——系统 loader 的 TLS 是每线程独立副本（新线程
+// 创建时从模板拷贝）；之前所有线程共享 g_payloadTlsData → thread_local 变量（obf::w
+// 的 32 槽缓冲）跨线程互相覆盖 → 解码错乱 → 业务拿垃圾字符串 → 真实 AV（fault="ndows"）。
+// 现在：若当前线程槽已有值（主线程 SafeTlsMount 已挂）→ 不重复；否则从模板分配独立
+// 副本（VirtualAlloc + memcpy，TLS 模板含未构造的 thread_local 对象区，首次访问时
+// MSVC 的 _Init_thread_header 机制会构造它）。线程退出不释放（每线程 0x950 字节，可接受）。
 static void MountCurrentThreadTls()
 {
-    if (!g_payloadTlsData || g_payloadTlsIndex == 0xFFFFFFFFu) return;
+    if (!g_payloadTlsTemplate || g_payloadTlsIndex == 0xFFFFFFFFu || g_payloadTlsSize == 0) return;
     __try {
-        TlsSetValue(static_cast<DWORD>(g_payloadTlsIndex), g_payloadTlsData);
+        // 当前线程已有（主线程由 SafeTlsMount 挂载）→ 不重复分配
+        if (TlsGetValue(static_cast<DWORD>(g_payloadTlsIndex))) return;
+        void* p = VirtualAlloc(nullptr, g_payloadTlsSize, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+        if (!p) return;
+        memcpy(p, reinterpret_cast<const void*>(g_payloadTlsTemplate), g_payloadTlsSize);
+        TlsSetValue(static_cast<DWORD>(g_payloadTlsIndex), p);
     } __except (EXCEPTION_EXECUTE_HANDLER) {
     }
 }
@@ -876,6 +892,8 @@ public:
         g_payloadTlsIndex = tlsIndex;
         g_payloadTlsData  = tlsData;
         g_payloadTlsSize  = tlsSize;
+        // CI 100：保存 TLS 模板（每线程独立副本的来源）——修正后的 StartAddressOfRawData
+        g_payloadTlsTemplate = start;
     }
 
     // ---------- .pdata 异常展开表注册 ----------
