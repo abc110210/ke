@@ -7,6 +7,7 @@
 #pragma once
 #include <windows.h>
 #include <intrin.h>
+#include <cstring>
 
 #include "syscall.h"
 #include "guard.h"
@@ -42,14 +43,18 @@ inline bool CheckDebugObject()
 }
 
 // 4) 硬件断点：读取 DR0~DR3，任一非 0 即存在调试寄存器断点。
-//    重要：DR 寄存器只能在内核态读取，用户态必须经由 NtGetContextThread
-//    （由内核替你读），且必须先挂起自身线程；绝对不能 __readdr（那会发出
-//    mov dr 指令，ring3 下触发 STATUS_PRIVILEGED_INSTRUCTION / 0xC0000096）。
-// 临时禁用硬件断点检测：自挂起/恢复当前线程在 CI 环境导致永久挂起。
-// 后续改用更安全的方式（例如用内核对象事件或单独快照线程）再恢复。
+//    实现：NtGetContextThread 直接读**当前线程**上下文。内核允许线程读取自己的
+//    上下文（KPCR.CurrentThread==目标时无需挂起），因此**不要**挂起当前线程
+//    （SuspendThread(自己) 是死锁/永久挂起，旧版因此被迫 return false 禁用）。
+//    读取失败时保守放行（不误杀、不挂起、不崩）。
 inline bool CheckHardwareBreakpoints()
 {
-    return false;
+    CONTEXT ctx;
+    memset(&ctx, 0, sizeof(ctx));
+    ctx.ContextFlags = CONTEXT_DEBUG_REGISTERS;
+    if (!NT_SUCCESS(Sys::GetContextThread(GetCurrentThread(), &ctx)))
+        return false;   // 无法读取上下文 → 保守放行
+    return (ctx.Dr0 != 0 || ctx.Dr1 != 0 || ctx.Dr2 != 0 || ctx.Dr3 != 0);
 }
 
 // 5) 时间陷阱：固定工作量下，若耗时异常（被单步拖慢）即判定调试
