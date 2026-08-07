@@ -183,21 +183,28 @@ static LONG WINAPI HeapCorruptionVeh(EXCEPTION_POINTERS* ep)
              (void*)ep->ContextRecord->Rsp, (void*)ep->ContextRecord->Rip,
              (void*)ep->ContextRecord->Rax, (void*)ep->ContextRecord->Rbx,
              (void*)ep->ContextRecord->Rcx);
-    // 栈顶 8 个返回地址（直接 __try 读，不依赖 SafeReadBytes——它是 paged_loader.h 的 static，
-    // 在本函数作用域不可见；HeapCorruptionVeh 是独立无 C++ 对象函数，可直接用 __try）
-    uintptr_t rsp = ep->ContextRecord->Rsp;
-    for (int i = 0; i < 8; i++) {
-        uintptr_t v = 0;
-        __try { v = *(uintptr_t*)(rsp + (uintptr_t)i * 8); } __except (1) { break; }
-        if (!v) break;
-        char m2[256] = {0}; HMODULE h2 = nullptr;
-        if (GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
-                               GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
-                               (LPCWSTR)v, &h2) && h2)
-            GetModuleFileNameA(h2, m2, sizeof(m2));
-        bool inPayload = g_plBase && v >= g_plBase && v < g_plBase + g_plSize;
-        DebugLog("[veh-heap]   栈[%d]=%p (%s%s)", i, (void*)v,
-                 m2[0] ? m2 : "?", inPayload ? " <<< payload" : "");
+    // CI 128：简单读栈帧对 fastfail 无效（栈顶是 fastfail 参数 0x21/0xC0000374/0x1，不是返回地址）。
+    // 改用 LogRealThrowSite（RtlVirtualUnwind 正经栈回溯，经 .pdata 展开调用链），从 ntdll!
+    // __fastfail 向上展开到 payload 的调用者。
+    if (g_plBase && g_plSize) {
+        DebugLog("[veh-heap] === RtlVirtualUnwind 栈回溯 ===");
+        LogRealThrowSite(ep, g_plBase, g_plBase + g_plSize);
+    } else {
+        // 兜底：payload 范围未设时用旧的栈帧扫描
+        uintptr_t rsp2 = ep->ContextRecord->Rsp;
+        for (int i = 0; i < 8; i++) {
+            uintptr_t v = 0;
+            __try { v = *(uintptr_t*)(rsp2 + (uintptr_t)i * 8); } __except (1) { break; }
+            if (!v) break;
+            char m2[256] = {0}; HMODULE h2 = nullptr;
+            if (GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+                                   GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                                   (LPCWSTR)v, &h2) && h2)
+                GetModuleFileNameA(h2, m2, sizeof(m2));
+            bool inPayload = g_plBase && v >= g_plBase && v < g_plBase + g_plSize;
+            DebugLog("[veh-heap]   栈[%d]=%p (%s%s)", i, (void*)v,
+                     m2[0] ? m2 : "?", inPayload ? " <<< payload" : "");
+        }
     }
     return EXCEPTION_CONTINUE_SEARCH;
 }
