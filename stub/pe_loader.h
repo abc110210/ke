@@ -235,17 +235,16 @@ static uintptr_t g_payloadTlsTemplate = 0;
 // → 两套 index 错位 → CRT 读不到我们挂的 TLS 数据 → gs:[0x58] 数组[旧index]=null
 // → payload 代码读 thread_local 变量 = null+偏移 → 野指针崩（"dmin"/fault=-1/rsp=0）。
 // 正解：读 idxAddr 的【现有值】（vcruntime140.dll 已分配的），直接用它挂槽，不改写 index。
-static bool SafeTlsMount(uintptr_t idxAddr, uintptr_t /*tplAddr*/,
+static bool SafeTlsMount(uintptr_t idxAddr, uintptr_t tplAddr,
                          void* tlsData, size_t tlsSize, DWORD* outIndex)
 {
     DWORD tlsIndex = 0;
     __try {
+        // 拷贝 PE TLS 模板（StartAddressOfRawData → EndAddressOfRawData），
+        // 含编译器初始化的 thread_local 变量值（POD→零、非POD→正确构造前哨）
+        memcpy(tlsData, reinterpret_cast<const void*>(tplAddr), tlsSize);
         // 读 vcruntime140.dll 已分配的 _tls_index（FixImports 后已指向正确地址）
         if (idxAddr) tlsIndex = *(volatile DWORD*)idxAddr;
-        // 【零填充分配】不拷贝模板——CRT 的 mainCRTStartup 看到「TLS 已挂但数据零」
-        // → 执行正常 TLS 初始化流程（拷贝模板 + 运行构造回调 + 初始化 thread_local）
-        // 若拷贝模板则 CRT 误判「已初始化」→ 跳过构造 → thread_local 对象未构造 → obf 解码垃圾。
-        memset(tlsData, 0, tlsSize);
         TlsSetValue(tlsIndex, tlsData);
     } __except (EXCEPTION_EXECUTE_HANDLER) {
         return false;
@@ -260,22 +259,17 @@ static bool SafeTlsMount(uintptr_t idxAddr, uintptr_t /*tplAddr*/,
 // null+偏移（如 this=0x20）→ 随机崩溃。此函数把槽挂到【当前调用线程】。
 // 命名空间作用域自由函数（__try 不能进类成员函数，C2712，CI 37 教训）。
 // CI 91：改用系统 TlsSetValue（与 TlsAlloc 分配的 index 配套，自动处理扩展槽）。
-// CI 102：改为【每线程独立 TLS 副本】——系统 loader 的 TLS 是每线程独立副本
-// （新线程创建时从模板拷贝并运行初始化回调）。之前所有线程共享 g_payloadTlsData
-// → thread_local 变量跨线程互相覆盖。
-// CI 103：分配【零填充】内存而非拷贝模板——CRT 的 mainCRTStartup 读 TlsGetValue
-// 判定「TLS 已挂载」→ 跳过初始化（不拷贝模板、不运行 TLS 构造回调）→ thread_local
-// 对象未构造 → obf::w 的静态缓冲是打包期的原始字节 → 解码输出垃圾 → 崩。
-// 零填充分配后 CRT 看到「TLS 有数据但需初始化」→ 正常构造对象 ✓。
+// CI 104：恢复模板拷贝——零填充分配导致 CRT 跳过初始化但 thread_local 对象未构造。
+// 正解组合：①正确 index（vcruntime140.dll 已分配，CI 102）②正确模板内容（memcpy，CI 104）
+// ③每线程独立副本。CRT 看到「TLS 已挂且内容正确」→ 直接使用（构造已由 RunTlsCallbacks 完成）。
 static void MountCurrentThreadTls()
 {
-    if (g_payloadTlsIndex == 0xFFFFFFFFu || g_payloadTlsSize == 0) return;
+    if (!g_payloadTlsTemplate || g_payloadTlsIndex == 0xFFFFFFFFu || g_payloadTlsSize == 0) return;
     __try {
-        // 当前线程已有（主线程由 SafeTlsMount 挂载）→ 不重复分配
         if (TlsGetValue(static_cast<DWORD>(g_payloadTlsIndex))) return;
-        // 零填充分配：让 CRT 的 TLS init 回调正常初始化 thread_local 对象
         void* p = VirtualAlloc(nullptr, g_payloadTlsSize, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
         if (!p) return;
+        memcpy(p, reinterpret_cast<const void*>(g_payloadTlsTemplate), g_payloadTlsSize);
         TlsSetValue(static_cast<DWORD>(g_payloadTlsIndex), p);
     } __except (EXCEPTION_EXECUTE_HANDLER) {
     }
@@ -896,6 +890,7 @@ public:
         g_payloadTlsIndex = tlsIndex;
         g_payloadTlsData  = tlsData;
         g_payloadTlsSize  = tlsSize;
+        g_payloadTlsTemplate = start;
     }
 
     // ---------- .pdata 异常展开表注册 ----------
