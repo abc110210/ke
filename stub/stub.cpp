@@ -183,27 +183,56 @@ static LONG WINAPI HeapCorruptionVeh(EXCEPTION_POINTERS* ep)
              (void*)ep->ContextRecord->Rsp, (void*)ep->ContextRecord->Rip,
              (void*)ep->ContextRecord->Rax, (void*)ep->ContextRecord->Rbx,
              (void*)ep->ContextRecord->Rcx);
-    // CI 128：简单读栈帧对 fastfail 无效（栈顶是 fastfail 参数 0x21/0xC0000374/0x1，不是返回地址）。
-    // 改用 LogRealThrowSite（RtlVirtualUnwind 正经栈回溯，经 .pdata 展开调用链），从 ntdll!
-    // __fastfail 向上展开到 payload 的调用者。
-    if (g_plBase && g_plSize) {
-        DebugLog("[veh-heap] === RtlVirtualUnwind 栈回溯 ===");
-        LogRealThrowSite(ep, g_plBase, g_plBase + g_plSize);
-    } else {
-        // 兜底：payload 范围未设时用旧的栈帧扫描
-        uintptr_t rsp2 = ep->ContextRecord->Rsp;
-        for (int i = 0; i < 8; i++) {
-            uintptr_t v = 0;
-            __try { v = *(uintptr_t*)(rsp2 + (uintptr_t)i * 8); } __except (1) { break; }
-            if (!v) break;
-            char m2[256] = {0}; HMODULE h2 = nullptr;
-            if (GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
-                                   GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
-                                   (LPCWSTR)v, &h2) && h2)
-                GetModuleFileNameA(h2, m2, sizeof(m2));
-            bool inPayload = g_plBase && v >= g_plBase && v < g_plBase + g_plSize;
-            DebugLog("[veh-heap]   栈[%d]=%p (%s%s)", i, (void*)v,
-                     m2[0] ? m2 : "?", inPayload ? " <<< payload" : "");
+    // CI 129：用 RtlVirtualUnwind 正经栈回溯（简单读栈帧对 fastfail 无效——栈顶是参数不是返回地址）。
+    // 直接内联实现（LogRealThrowSite 是 paged_loader.h 的 static，跨 TU 不可见）。
+    {
+        using PFN_Lookup = PRUNTIME_FUNCTION (NTAPI*)(ULONG64, PULONG64, PVOID);
+        using PFN_Unwind  = PVOID (NTAPI*)(ULONG, ULONG64, ULONG64, PRUNTIME_FUNCTION, PCONTEXT, PVOID*, PULONG64, PVOID);
+        static PFN_Lookup pLookup = nullptr;
+        static PFN_Unwind  pUnwind = nullptr;
+        if (!pLookup) {
+            if (HMODULE nt = GetModuleHandleA("ntdll.dll")) {
+                pLookup = (PFN_Lookup)GetProcAddress(nt, "RtlLookupFunctionEntry");
+                pUnwind = (PFN_Unwind)GetProcAddress(nt, "RtlVirtualUnwind");
+            }
+        }
+        if (pLookup && pUnwind && g_plBase) {
+            CONTEXT ctx;
+            memset(&ctx, 0, sizeof(ctx));
+            ctx.Rip = ep->ContextRecord->Rip;
+            ctx.Rsp = ep->ContextRecord->Rsp;
+            ctx.Rbp = ep->ContextRecord->Rbp;
+            ctx.Rbx = ep->ContextRecord->Rbx;
+            ctx.Rsi = ep->ContextRecord->Rsi;
+            ctx.Rdi = ep->ContextRecord->Rdi;
+            ctx.R12 = ep->ContextRecord->R12; ctx.R13 = ep->ContextRecord->R13;
+            ctx.R14 = ep->ContextRecord->R14; ctx.R15 = ep->ContextRecord->R15;
+            DebugLog("[veh-heap] === RtlVirtualUnwind 栈回溯 ===");
+            for (int d = 0; d < 16; d++) {
+                ULONG64 imgBase = 0;
+                PRUNTIME_FUNCTION fe = pLookup(ctx.Rip, &imgBase, nullptr);
+                if (!fe) {
+                    uintptr_t ret = 0;
+                    __try { ret = *(uintptr_t*)ctx.Rsp; } __except (1) { break; }
+                    DebugLog("[veh-heap]   #%d rip=%p 无 .pdata（叶子近似）", d, (void*)ctx.Rip);
+                    if (!ret) break;
+                    ctx.Rip = ret; ctx.Rsp += 8;
+                    continue;
+                }
+                ULONG64 est = 0; PVOID hd = nullptr;
+                pUnwind(0, imgBase, ctx.Rip, fe, &ctx, &hd, &est, nullptr);
+                char m[256] = {0}; HMODULE hm = nullptr;
+                if (GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+                                       GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                                       (LPCWSTR)ctx.Rip, &hm) && hm)
+                    GetModuleFileNameA(hm, m, sizeof(m));
+                bool inPayload = g_plBase && ctx.Rip >= g_plBase && ctx.Rip < g_plBase + g_plSize;
+                DebugLog("[veh-heap]   #%d rip=%p (%s%s%s)", d, (void*)ctx.Rip,
+                         m[0] ? m : "?", inPayload ? " <<< payload RVA=0x" : "",
+                         inPayload ? "" : "");
+                if (inPayload)
+                    DebugLog("[veh-heap]        payload RVA=0x%llX", (unsigned long long)(ctx.Rip - g_plBase));
+            }
         }
     }
     return EXCEPTION_CONTINUE_SEARCH;
