@@ -72,7 +72,8 @@ jobs:
             @{ name = "6_no_tls";          gating = $null;  watchdog = $null; inject = $null; tls = "1"; swallow = $null; fixedbase = $null },
             @{ name = "7_swallow_e06d";    gating = $null;  watchdog = $null; inject = $null; tls = $null; swallow = "1"; fixedbase = $null; fakeav = $null },
             @{ name = "8_fixed_base";      gating = $null;  watchdog = $null; inject = $null; tls = $null; swallow = $null; fixedbase = "1"; fakeav = $null },
-            @{ name = "9_nofakeav";        gating = $null;  watchdog = $null; inject = $null; tls = $null; swallow = $null; fixedbase = $null; fakeav = "1" }
+            @{ name = "9_nofakeav";        gating = $null;  watchdog = $null; inject = $null; tls = $null; swallow = $null; fixedbase = $null; fakeav = "1"; corrupt = $null },
+            @{ name = "10_nocorrupt";     gating = $null;  watchdog = $null; inject = $null; tls = $null; swallow = $null; fixedbase = $null; fakeav = $null; corrupt = "1" }
           )
           $tmp = $env:TEMP
           $anyGood = $false
@@ -88,7 +89,8 @@ jobs:
             $env:PEARMOR_SWALLOW_E06D7363    = if ($c.swallow)  { "1" } else { $null }
             $env:PEARMOR_FIXED_BASE          = if ($c.fixedbase){ "1" } else { $null }
             $env:PEARMOR_DISABLE_FAKEAV_SWALLOW = if ($c.fakeav){ "1" } else { $null }
-            Write-Host "env: GATING=$env:PEARMOR_DISABLE_GATING WATCHDOG=$env:PEARMOR_DISABLE_WATCHDOG INJECT=$env:PEARMOR_DISABLE_INJECT_BLOCK TLS=$env:PEARMOR_DISABLE_TLS SWALLOW=$env:PEARMOR_SWALLOW_E06D7363 FIXEDBASE=$env:PEARMOR_FIXED_BASE NOFAKEAV=$env:PEARMOR_DISABLE_FAKEAV_SWALLOW"
+            $env:PEARMOR_NO_CORRUPT_HEADER     = if ($c.corrupt){ "1" } else { $null }
+            Write-Host "env: GATING=$env:PEARMOR_DISABLE_GATING WATCHDOG=$env:PEARMOR_DISABLE_WATCHDOG INJECT=$env:PEARMOR_DISABLE_INJECT_BLOCK TLS=$env:PEARMOR_DISABLE_TLS SWALLOW=$env:PEARMOR_SWALLOW_E06D7363 FIXEDBASE=$env:PEARMOR_FIXED_BASE NOFAKEAV=$env:PEARMOR_DISABLE_FAKEAV_SWALLOW NOCORRUPT=$env:PEARMOR_NO_CORRUPT_HEADER"
             $timeoutSec = 20
             $errFile = "stderr_$($c.name).txt"
             Remove-Item $errFile -ErrorAction SilentlyContinue
@@ -117,6 +119,7 @@ jobs:
           Remove-Item Env:PEARMOR_SWALLOW_E06D7363 -ErrorAction SilentlyContinue
           Remove-Item Env:PEARMOR_FIXED_BASE -ErrorAction SilentlyContinue
           Remove-Item Env:PEARMOR_DISABLE_FAKEAV_SWALLOW -ErrorAction SilentlyContinue
+          Remove-Item Env:PEARMOR_NO_CORRUPT_HEADER -ErrorAction SilentlyContinue
 
           # 用户目标模式（test/ 有用户放入的 exe）：加壳成功即达标，运行结果仅作诊断
           # （真实程序的退出码/行为各异，不能按样例标准断言）
