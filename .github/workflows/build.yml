@@ -27,52 +27,8 @@ jobs:
           try { Set-MpPreference -DisableRealtimeMonitoring $true -Force } catch { Write-Host "Set-MpPreference 失败: $_" }
           Write-Host "Defender 排除+实时扫描已关闭: $env:GITHUB_WORKSPACE"
 
-          # CI 137：在 build.ps1 之前，先从 client/ 源码编译 HanbotSavesUploader.exe。
-          # build.ps1 只从 test/ 拿预编译 exe——如果不同步 client 源码编译，
-          # CMakeLists.txt 的编译选项改动（去 /GL /LTCG /GUARD:CF）不会生效。
-          $clientDir = "client"
-          if (Test-Path "$clientDir/CMakeLists.txt") {
-            Write-Host "[CI 137] 从 client/ 源码编译 HanbotSavesUploader.exe..."
-            $clientBuild = "build/client"
-            # 递归查找 WebView2 SDK（优先用仓库内已提交的 SDK 文件）
-            $wv2h = Get-ChildItem . -Recurse -Filter "WebView2.h" -ErrorAction SilentlyContinue | Select-Object -First 1
-            $wv2l = Get-ChildItem . -Recurse -Filter "WebView2LoaderStatic.lib" -ErrorAction SilentlyContinue | Select-Object -First 1
-            # 仓库里没有 → 从 NuGet 下载微软官方包 Microsoft.Web.WebView2（不带版本号=取最新稳定版，
-            # 布局 build/native/include + build/native/x64，与 CMakeLists 默认路径一致）
-            if (-not $wv2h -or -not $wv2l) {
-              Write-Host "[CI 137] 未找到已提交的 WebView2 SDK，从 NuGet 下载 Microsoft.Web.WebView2..."
-              $wv2zip = "$env:TEMP\wv2.zip"
-              try {
-                Invoke-WebRequest -Uri "https://www.nuget.org/api/v2/package/Microsoft.Web.WebView2" -OutFile $wv2zip -UseBasicParsing
-                Expand-Archive $wv2zip -DestinationPath "webview2sdk" -Force
-                $wv2h = Get-ChildItem "webview2sdk" -Recurse -Filter "WebView2.h" -ErrorAction SilentlyContinue | Select-Object -First 1
-                $wv2l = Get-ChildItem "webview2sdk" -Recurse -Filter "WebView2LoaderStatic.lib" -ErrorAction SilentlyContinue | Select-Object -First 1
-              } catch { Write-Host "  NuGet 下载失败: $_" }
-            }
-            if ($wv2h) { $env:WEBVIEW2_INCLUDE_DIR = $wv2h.DirectoryName; Write-Host "  WEBVIEW2_INCLUDE_DIR=$($wv2h.DirectoryName)" }
-            if ($wv2l) { $env:WEBVIEW2_LIB_DIR = $wv2l.DirectoryName; Write-Host "  WEBVIEW2_LIB_DIR=$($wv2l.DirectoryName)" }
-            if (-not $wv2h -or -not $wv2l) {
-              Write-Host "[CI 137] WebView2 SDK 获取失败，跳过 client 编译，用 test/ 下已有 exe" -ForegroundColor Yellow
-            } else {
-              & cmake -S $clientDir -B $clientBuild -A x64 2>&1 | Write-Host
-              if ($LASTEXITCODE -eq 0) {
-                & cmake --build $clientBuild --config Release --parallel 2>&1 | Write-Host
-                if ($LASTEXITCODE -eq 0) {
-                  $clientExe = "$clientBuild/Release/HanbotSavesUploader.exe"
-                  if (Test-Path $clientExe) {
-                    Copy-Item $clientExe "test/HanbotSavesUploader.exe" -Force
-                    $sz = (Get-Item "test/HanbotSavesUploader.exe").Length
-                    Write-Host "[CI 137] client 编译成功！已覆盖 test/HanbotSavesUploader.exe ($sz 字节)" -ForegroundColor Green
-                  }
-                } else {
-                  Write-Host "[CI 137] client 编译失败，用 test/ 下已有 exe" -ForegroundColor Yellow
-                }
-              } else {
-                Write-Host "[CI 137] client cmake configure 失败，用 test/ 下已有 exe" -ForegroundColor Yellow
-              }
-            }
-          }
-
+          # client 源码编译统一由 build.ps1 阶段 1.5 负责（含 WebView2 SDK 自动下载，
+          # CI 139 修复 arm64 误命中：lib 查找过滤 x64 目录），编译产物覆盖 test/ 后再加壳。
           .\build.ps1
 
       - name: 运行加壳后的程序（隔离实验：5 个保护组合自动对比）
