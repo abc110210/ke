@@ -1,0 +1,4 @@
+// 由 CMake 在配置阶段生成：把 webui/index.html 以 HTML 资源形式内嵌进 exe
+// html_rc.rc 在 client/build/ 下生成，../src/resource.h 指向 client/src/resource.h
+#include "../src/resource.h"
+IDR_APP_HTML HTML "@HTML_RC_PATH@"

@@ -1,0 +1,58 @@
+// ---------------------------------------------------------------------------
+// 资源脚本：应用清单 + 版本信息
+//   注意：CMake 里已经关掉了链接器自动生成清单（/MANIFEST:NO），
+//         清单统一由这里嵌入，避免两份清单冲突报 c1010001
+// ---------------------------------------------------------------------------
+
+#include <windows.h>
+#include "../src/resource.h"
+
+/////////////////////////////////////////////////////////////////////////////
+// 应用清单
+/////////////////////////////////////////////////////////////////////////////
+IDR_APP_MANIFEST RT_MANIFEST "app.manifest"
+
+/////////////////////////////////////////////////////////////////////////////
+// 图标
+//   IDI_APP_ICON：窗口标题栏 / 任务栏图标（来自 app.ico）
+//   IDR_APP_ICON_PNG：软件图标原图（PNG），运行时由 main.cpp 读取并
+//      base64 注入 WebView2 页面头部（NavigateToString 无法引用外部文件）
+/////////////////////////////////////////////////////////////////////////////
+IDI_APP_ICON ICON "app.ico"
+IDR_APP_ICON_PNG RCDATA "app_icon.png"
+
+/////////////////////////////////////////////////////////////////////////////
+// 版本信息
+/////////////////////////////////////////////////////////////////////////////
+VS_VERSION_INFO VERSIONINFO
+ FILEVERSION    1,0,0,0
+ PRODUCTVERSION 1,0,0,0
+ FILEFLAGSMASK  VS_FFI_FILEFLAGSMASK
+#ifdef _DEBUG
+ FILEFLAGS      VS_FF_DEBUG
+#else
+ FILEFLAGS      0x0L
+#endif
+ FILEOS         VOS_NT_WINDOWS32
+ FILETYPE       VFT_APP
+ FILESUBTYPE    VFT2_UNKNOWN
+BEGIN
+    BLOCK "StringFileInfo"
+    BEGIN
+        BLOCK "080404b0"          // 中文（简体） + Unicode
+        BEGIN
+            VALUE "CompanyName",      "Hanbot"
+            VALUE "FileDescription",  "Hanbot缓存存储器"
+            VALUE "FileVersion",      "1.0.0.0"
+            VALUE "InternalName",     "HanbotSavesUploader"
+            VALUE "LegalCopyright",   "Copyright (C) 2026 Hanbot"
+            VALUE "OriginalFilename", "HanbotSavesUploader.exe"
+            VALUE "ProductName",      "Hanbot缓存存储器"
+            VALUE "ProductVersion",   "1.0.0.0"
+        END
+    END
+    BLOCK "VarFileInfo"
+    BEGIN
+        VALUE "Translation", 0x804, 1200
+    END
+END
