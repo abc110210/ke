@@ -205,6 +205,7 @@ static void ResolveApiFromCaller(uintptr_t callerRip, uintptr_t base,
         PIMAGE_NT_HEADERS nt = reinterpret_cast<PIMAGE_NT_HEADERS>(base + dos->e_lfanew);
         auto& idd = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT];
         bool resolved = false;
+        ULONGLONG* iatP = reinterpret_cast<ULONGLONG*>(iatSlot);  // IAT 槽当前值（块外可见）
         if (idd.VirtualAddress && idd.Size) {
             PIMAGE_IMPORT_DESCRIPTOR desc =
                 reinterpret_cast<PIMAGE_IMPORT_DESCRIPTOR>(base + idd.VirtualAddress);
@@ -214,7 +215,6 @@ static void ResolveApiFromCaller(uintptr_t callerRip, uintptr_t base,
                 DWORD64 oft = desc[k].OriginalFirstThunk ? desc[k].OriginalFirstThunk
                                                          : desc[k].FirstThunk;
                 ULONGLONG* intt = reinterpret_cast<ULONGLONG*>(base + oft);
-                ULONGLONG* iatP = reinterpret_cast<ULONGLONG*>(iatSlot);
                 for (DWORD j = 0; intt[j]; j++) {
                     DWORD slotRva = desc[k].FirstThunk + j * 8;
                     if (slotRva != rvaTarget) continue;
