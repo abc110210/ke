@@ -114,10 +114,46 @@ static void ResolveExportName(uintptr_t addr, char* out, size_t outSz)
             break;
         }
     }
-    if (name)
+    if (name && name[0])
         sprintf(out, " %s+0x%X", name, (unsigned)(rvaAddr - best));
     else
         sprintf(out, " ordinal#%u+0x%X", (unsigned)(exp->Base + bestIdx), (unsigned)(rvaAddr - best));
+}
+
+// CI 118：扫描 payload 导入表，找 IAT 槽 == callee 的那个，返回 "DLL!ApiName"。
+// 这是【权威】定位 "payload 到底调了哪个系统 API"——不依赖 KERNELBASE 导出表解析（那条在
+// 崩溃 RIP 上行为有歧义）。base=手动映射的 payload 基址；callee=崩溃地址（KERNELBASE 某函数）。
+static void ResolveImportName(uintptr_t base, uintptr_t callee, char* out, size_t outSz)
+{
+    out[0] = 0;
+    if (!base || !callee) return;
+    PIMAGE_DOS_HEADER dos = reinterpret_cast<PIMAGE_DOS_HEADER>(base);
+    if (dos->e_magic != IMAGE_DOS_SIGNATURE) return;
+    PIMAGE_NT_HEADERS nt = reinterpret_cast<PIMAGE_NT_HEADERS>(base + dos->e_lfanew);
+    if (nt->Signature != IMAGE_NT_SIGNATURE) return;
+    auto& id = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT];
+    if (!id.VirtualAddress || !id.Size) return;
+    PIMAGE_IMPORT_DESCRIPTOR desc =
+        reinterpret_cast<PIMAGE_IMPORT_DESCRIPTOR>(base + id.VirtualAddress);
+    for (DWORD i = 0; desc[i].OriginalFirstThunk || desc[i].FirstThunk; i++) {
+        if (!desc[i].FirstThunk) continue;
+        const char* dll = reinterpret_cast<const char*>(base + desc[i].Name);
+        ULONGLONG* iat = reinterpret_cast<ULONGLONG*>(base + desc[i].FirstThunk);
+        DWORD64 oft = desc[i].OriginalFirstThunk ? desc[i].OriginalFirstThunk : desc[i].FirstThunk;
+        ULONGLONG* intt = reinterpret_cast<ULONGLONG*>(base + oft);
+        for (DWORD j = 0; iat[j]; j++) {
+            if (iat[j] == callee) {  // 命中：这个 IAT 槽装的正是崩溃地址
+                if (IMAGE_SNAP_BY_ORDINAL64(intt[j])) {
+                    sprintf(out, " %s!ordinal#%u", dll, (unsigned)IMAGE_ORDINAL64(intt[j]));
+                } else {
+                    PIMAGE_IMPORT_BY_NAME ibn =
+                        reinterpret_cast<PIMAGE_IMPORT_BY_NAME>(base + (DWORD)intt[j]);
+                    sprintf(out, " %s!%s", dll, ibn->Name);
+                }
+                return;
+            }
+        }
+    }
 }
 
 // 正经走栈：从异常现场（通常停在 KERNELBASE!RaiseException 内）用 RtlVirtualUnwind 逐帧展开，
@@ -1138,6 +1174,24 @@ private:
                         pe2 = pb2 + (size_t)g_instance->pageBase.size() * g_instance->pageSize;
                     }
                     LogRealThrowSite(ep, pb2, pe2);
+                }
+                // CI 118：权威定位 payload 调了哪个系统 API——直接扫 payload 导入表，
+                // 找 IAT 槽 == 崩溃地址(KERNELBASE 0x1019B7) 的条目，报 "DLL!ApiName"。
+                // 同时用导出表解析(KERNELBASE!Api+off)交叉验证。下一轮日志据此一锤定因。
+                {
+                    uintptr_t pb3 = 0;
+                    if (g_instance && !g_instance->pageBase.empty())
+                        pb3 = reinterpret_cast<uintptr_t>(g_instance->pageBase[0]);
+                    char impName[320] = {0};
+                    ResolveImportName(pb3, reinterpret_cast<uintptr_t>(rec->ExceptionAddress),
+                                      impName, sizeof(impName));
+                    DebugLog("[veh] 崩溃API(导入表)=%s",
+                             impName[0] ? impName : " (未在 payload 导入表找到该地址)");
+                    char expName2[256] = {0};
+                    ResolveExportName(reinterpret_cast<uintptr_t>(rec->ExceptionAddress),
+                                       expName2, sizeof(expName2));
+                    DebugLog("[veh] 崩溃API(导出表)=%s",
+                             expName2[0] ? expName2 : " (无匹配导出)");
                 }
                 // CI 89：崩溃线程 TLS 槽检查——工作线程 TEB 里 payload TLS 槽应为
                 // 非 null（CI 100 起每线程独立副本，主线程才是 g_payloadTlsData）；
