@@ -235,19 +235,17 @@ static uintptr_t g_payloadTlsTemplate = 0;
 // → 两套 index 错位 → CRT 读不到我们挂的 TLS 数据 → gs:[0x58] 数组[旧index]=null
 // → payload 代码读 thread_local 变量 = null+偏移 → 野指针崩（"dmin"/fault=-1/rsp=0）。
 // 正解：读 idxAddr 的【现有值】（vcruntime140.dll 已分配的），直接用它挂槽，不改写 index。
-static bool SafeTlsMount(uintptr_t idxAddr, uintptr_t tplAddr,
+static bool SafeTlsMount(uintptr_t idxAddr, uintptr_t /*tplAddr*/,
                          void* tlsData, size_t tlsSize, DWORD* outIndex)
 {
     DWORD tlsIndex = 0;
     __try {
-        memcpy(tlsData, reinterpret_cast<const void*>(tplAddr), tlsSize);
         // 读 vcruntime140.dll 已分配的 _tls_index（FixImports 后已指向正确地址）
         if (idxAddr) tlsIndex = *(volatile DWORD*)idxAddr;
-        if (tlsIndex == 0) {
-            // /MT 静态 CRT 回退：index=0 是 .tls 链接初值且无其他 DLL 占用，直接用
-            // （系统 loader 会在进程启动时分配 0→?，但 /MT 的 _tls_index 在 exe 自身 .rdata
-            // 非导入变量，与系统 TlsAlloc 不冲突）
-        }
+        // 【零填充分配】不拷贝模板——CRT 的 mainCRTStartup 看到「TLS 已挂但数据零」
+        // → 执行正常 TLS 初始化流程（拷贝模板 + 运行构造回调 + 初始化 thread_local）
+        // 若拷贝模板则 CRT 误判「已初始化」→ 跳过构造 → thread_local 对象未构造 → obf 解码垃圾。
+        memset(tlsData, 0, tlsSize);
         TlsSetValue(tlsIndex, tlsData);
     } __except (EXCEPTION_EXECUTE_HANDLER) {
         return false;
@@ -262,21 +260,22 @@ static bool SafeTlsMount(uintptr_t idxAddr, uintptr_t tplAddr,
 // null+偏移（如 this=0x20）→ 随机崩溃。此函数把槽挂到【当前调用线程】。
 // 命名空间作用域自由函数（__try 不能进类成员函数，C2712，CI 37 教训）。
 // CI 91：改用系统 TlsSetValue（与 TlsAlloc 分配的 index 配套，自动处理扩展槽）。
-// CI 100：改为【每线程独立 TLS 副本】——系统 loader 的 TLS 是每线程独立副本（新线程
-// 创建时从模板拷贝）；之前所有线程共享 g_payloadTlsData → thread_local 变量（obf::w
-// 的 32 槽缓冲）跨线程互相覆盖 → 解码错乱 → 业务拿垃圾字符串 → 真实 AV（fault="ndows"）。
-// 现在：若当前线程槽已有值（主线程 SafeTlsMount 已挂）→ 不重复；否则从模板分配独立
-// 副本（VirtualAlloc + memcpy，TLS 模板含未构造的 thread_local 对象区，首次访问时
-// MSVC 的 _Init_thread_header 机制会构造它）。线程退出不释放（每线程 0x950 字节，可接受）。
+// CI 102：改为【每线程独立 TLS 副本】——系统 loader 的 TLS 是每线程独立副本
+// （新线程创建时从模板拷贝并运行初始化回调）。之前所有线程共享 g_payloadTlsData
+// → thread_local 变量跨线程互相覆盖。
+// CI 103：分配【零填充】内存而非拷贝模板——CRT 的 mainCRTStartup 读 TlsGetValue
+// 判定「TLS 已挂载」→ 跳过初始化（不拷贝模板、不运行 TLS 构造回调）→ thread_local
+// 对象未构造 → obf::w 的静态缓冲是打包期的原始字节 → 解码输出垃圾 → 崩。
+// 零填充分配后 CRT 看到「TLS 有数据但需初始化」→ 正常构造对象 ✓。
 static void MountCurrentThreadTls()
 {
-    if (!g_payloadTlsTemplate || g_payloadTlsIndex == 0xFFFFFFFFu || g_payloadTlsSize == 0) return;
+    if (g_payloadTlsIndex == 0xFFFFFFFFu || g_payloadTlsSize == 0) return;
     __try {
         // 当前线程已有（主线程由 SafeTlsMount 挂载）→ 不重复分配
         if (TlsGetValue(static_cast<DWORD>(g_payloadTlsIndex))) return;
+        // 零填充分配：让 CRT 的 TLS init 回调正常初始化 thread_local 对象
         void* p = VirtualAlloc(nullptr, g_payloadTlsSize, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
         if (!p) return;
-        memcpy(p, reinterpret_cast<const void*>(g_payloadTlsTemplate), g_payloadTlsSize);
         TlsSetValue(static_cast<DWORD>(g_payloadTlsIndex), p);
     } __except (EXCEPTION_EXECUTE_HANDLER) {
     }
@@ -897,8 +896,6 @@ public:
         g_payloadTlsIndex = tlsIndex;
         g_payloadTlsData  = tlsData;
         g_payloadTlsSize  = tlsSize;
-        // CI 100：保存 TLS 模板（每线程独立副本的来源）——修正后的 StartAddressOfRawData
-        g_payloadTlsTemplate = start;
     }
 
     // ---------- .pdata 异常展开表注册 ----------
