@@ -235,10 +235,21 @@ static void ResolveApiFromCaller(uintptr_t callerRip, uintptr_t base,
         char one[256];
         sprintf(one, "[FF15@RVA 0x%llX -> IAT RVA 0x%X", (unsigned long long)(instrAddr - base), (unsigned)rvaTarget);
         // 也打印 IAT 槽当前值（FixImports 后应是真实 API 地址）
-        if (iatP && resolved) {
-            sprintf(one + strlen(one), " = %p => %s]", (void*)*iatP, api);
+        // CI 122：IAT 槽可能不在标准导入表（延迟导入/绑定导入），但槽值仍是真实 API 地址。
+        // 对槽值调 ResolveExportName 解析 "DLL!ApiName+off"，一锤定音是哪个 API。
+        if (iatP) {
+            ULONGLONG slotVal = *iatP;
+            char apiByExport[200] = {0};
+            ResolveExportName(static_cast<uintptr_t>(slotVal), apiByExport, sizeof(apiByExport));
+            if (resolved) {
+                sprintf(one + strlen(one), " = %p => %s%s]", (void*)slotVal, api,
+                        apiByExport[0] ? apiByExport : "");
+            } else {
+                sprintf(one + strlen(one), " = %p (导入表未匹配,导出表解析%s)]",
+                        (void*)slotVal, apiByExport[0] ? apiByExport : "无");
+            }
         } else {
-            sprintf(one + strlen(one), " = %p (未匹配导入表)]", iatP ? (void*)*iatP : (void*)0);
+            sprintf(one + strlen(one), " (iatP=null)]");
         }
         if (hits[0]) strcat(hits, " | ");
         strncat(hits, one, sizeof(hits) - strlen(hits) - 2);
