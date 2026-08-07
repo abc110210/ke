@@ -494,6 +494,20 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int)
                  (void*)selfMod2, (void*)pearmor::ModuleFake::gPayloadBase,
                  (selfMod2 == (HMODULE)pearmor::ModuleFake::gPayloadBase) ? 1 : 0);
     }
+    // CI 121：跳 OEP 前 dump PEB 关键字段（崩溃在 KERNELBASE GetSystemTimeAdjustment
+    // 内部 add [rcx-0x77],al，rcx=1 像是读 PEB/TEB 某字段拿到脏值）。对照系统正常值判断
+    // 哪个字段被我们改坏/漏设。关键字段偏移（x64 PEB）：
+    // 0x10 ImageBaseAddress / 0x18 Ldr / 0x20 ProcessParameters / 0x58 KernelCallbackTable
+    // 0x68 ApiSetMap / 0x80 AtlThunkSListPtr / 0xF0 TebMappedUpperBound 等。
+    {
+        BYTE* peb = reinterpret_cast<BYTE*>(__readgsqword(0x60));
+        auto rdQ = [&](int off) -> void* { return *reinterpret_cast<void**>(peb + off); };
+        auto rdD = [&](int off) -> DWORD { return *reinterpret_cast<DWORD*>(peb + off); };
+        DebugLog("[stub] PEB dump: ImageBase=%p Ldr=%p ProcessParams=%p KernelCallbackTable=%p ApiSetMap=%p",
+                 rdQ(0x10), rdQ(0x18), rdQ(0x20), rdQ(0x58), rdQ(0x68));
+        DebugLog("[stub] PEB dump2: NumberOfProcessors=%u SystemRoot=%p Reserved3[0]=%p TlsBitmap=%p",
+                 rdD(0xB8), rdQ(0x38), rdQ(0x48), rdQ(0x80));
+    }
 
     int rc = loader.CallEntry(entryRva);
     DebugLog("[stub] OEP 返回 rc=%d", rc);

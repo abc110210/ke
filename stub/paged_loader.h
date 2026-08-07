@@ -173,20 +173,39 @@ static void ResolveApiFromCaller(uintptr_t callerRip, uintptr_t base,
 {
     out[0] = 0;
     if (!callerRip || !base) return;
-    unsigned char buf[16] = {0};
-    uintptr_t start = callerRip > 16 ? callerRip - 16 : 0;
-    if (!SafeReadBytes(start, buf, sizeof(buf))) return;
-    // 从末尾往回扫 FF 15（call [rip+disp32]）
+    // CI 120：扫描窗口从 16 扩到 64（MSVC 编译器常在 call 前插入多条栈准备指令，
+    // FF 15 距 callerRip 可能 40+ 字节）。同时打印窗口内所有 FF 15 候选，便于人工核对。
+    const int WIN = 64;
+    unsigned char buf[WIN];
+    memset(buf, 0, sizeof(buf));
+    uintptr_t start = callerRip > WIN ? callerRip - WIN : 0;
+    if (!start) return;
+    if (!SafeReadBytes(start, buf, sizeof(buf))) {
+        // CI 121：读失败（很可能按需解密门控把这页 NOACCESS 了，或页已重加密）。
+        // 查 VirtualQuery 拿真实保护状态打印，供分析门控是否误伤诊断读。
+        MEMORY_BASIC_INFORMATION mbi;
+        DWORD prot = 0;
+        if (VirtualQuery(reinterpret_cast<LPCVOID>(start), &mbi, sizeof(mbi)))
+            prot = mbi.Protect;
+        sprintf(out, " (读 callerRip 前区域失败: start=%p 保护=0x%X)", (void*)start, (unsigned)prot);
+        return;
+    }
+    char hits[512] = {0};   // 累积所有 FF 15 命中的描述
+    int hitCount = 0;
     for (int i = (int)sizeof(buf) - 2; i >= 0; i--) {
-        if (buf[i] == 0xFF && buf[i + 1] == 0x15) {
-            uintptr_t instrAddr = start + (uintptr_t)i;
-            int32_t disp = *reinterpret_cast<int32_t*>(buf + i + 2);
-            uintptr_t iatSlot = instrAddr + 6 + (intptr_t)disp;
-            DWORD rvaTarget = (DWORD)(iatSlot - base);
-            PIMAGE_DOS_HEADER dos = reinterpret_cast<PIMAGE_DOS_HEADER>(base);
-            PIMAGE_NT_HEADERS nt = reinterpret_cast<PIMAGE_NT_HEADERS>(base + dos->e_lfanew);
-            auto& idd = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT];
-            if (!idd.VirtualAddress || !idd.Size) return;
+        if (buf[i] != 0xFF || buf[i + 1] != 0x15) continue;
+        hitCount++;
+        uintptr_t instrAddr = start + (uintptr_t)i;
+        int32_t disp = *reinterpret_cast<int32_t*>(buf + i + 2);
+        uintptr_t iatSlot = instrAddr + 6 + (intptr_t)disp;
+        DWORD rvaTarget = (DWORD)(iatSlot - base);
+        // 查 payload 导入表，找哪个 FirstThunk + j*8 == rvaTarget
+        char api[200] = {0};
+        PIMAGE_DOS_HEADER dos = reinterpret_cast<PIMAGE_DOS_HEADER>(base);
+        PIMAGE_NT_HEADERS nt = reinterpret_cast<PIMAGE_NT_HEADERS>(base + dos->e_lfanew);
+        auto& idd = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT];
+        bool resolved = false;
+        if (idd.VirtualAddress && idd.Size) {
             PIMAGE_IMPORT_DESCRIPTOR desc =
                 reinterpret_cast<PIMAGE_IMPORT_DESCRIPTOR>(base + idd.VirtualAddress);
             for (DWORD k = 0; desc[k].OriginalFirstThunk || desc[k].FirstThunk; k++) {
@@ -195,24 +214,47 @@ static void ResolveApiFromCaller(uintptr_t callerRip, uintptr_t base,
                 DWORD64 oft = desc[k].OriginalFirstThunk ? desc[k].OriginalFirstThunk
                                                          : desc[k].FirstThunk;
                 ULONGLONG* intt = reinterpret_cast<ULONGLONG*>(base + oft);
+                ULONGLONG* iatP = reinterpret_cast<ULONGLONG*>(iatSlot);
                 for (DWORD j = 0; intt[j]; j++) {
                     DWORD slotRva = desc[k].FirstThunk + j * 8;
                     if (slotRva != rvaTarget) continue;
+                    // 命中
                     if (IMAGE_SNAP_BY_ORDINAL64(intt[j])) {
-                        sprintf(out, " %s!ordinal#%u", dll, (unsigned)IMAGE_ORDINAL64(intt[j]));
+                        sprintf(api, "%s!ordinal#%u", dll, (unsigned)IMAGE_ORDINAL64(intt[j]));
                     } else {
                         PIMAGE_IMPORT_BY_NAME ibn =
                             reinterpret_cast<PIMAGE_IMPORT_BY_NAME>(base + (DWORD)intt[j]);
-                        sprintf(out, " %s!%s", dll, ibn->Name);
+                        sprintf(api, "%s!%s", dll, ibn->Name);
                     }
-                    return;
+                    resolved = true;
+                    break;
                 }
+                if (resolved) break;
             }
-            sprintf(out, " (FF15 IAT槽=0x%X 未匹配导入表)", (unsigned)rvaTarget);
-            return;
+        }
+        char one[256];
+        sprintf(one, "[FF15@RVA 0x%llX -> IAT RVA 0x%X", (unsigned long long)(instrAddr - base), (unsigned)rvaTarget);
+        // 也打印 IAT 槽当前值（FixImports 后应是真实 API 地址）
+        if (iatP && resolved) {
+            sprintf(one + strlen(one), " = %p => %s]", (void*)*iatP, api);
+        } else {
+            sprintf(one + strlen(one), " = %p (未匹配导入表)]", iatP ? (void*)*iatP : (void*)0);
+        }
+        if (hits[0]) strcat(hits, " | ");
+        strncat(hits, one, sizeof(hits) - strlen(hits) - 2);
+        if (!out[0] && resolved) {
+            // 第一个解析成功的作为主结果
+            sprintf(out, " %s", api);
         }
     }
-    sprintf(out, " (未找到 FF 15 call 指令)");
+    if (hitCount == 0) {
+        sprintf(out, " (未找到 FF 15 call 指令，扫描 RVA 0x%llX 前 %d 字节)",
+                 (unsigned long long)(callerRip - base), WIN);
+    } else {
+        DebugLog("[veh] FF15 扫描全部命中: %s", hits);
+        if (!out[0])
+            sprintf(out, " (找到 %d 个 FF15 但无导入表匹配，见上方全部命中)", hitCount);
+    }
 }
 
 // 正经走栈：从异常现场（通常停在 KERNELBASE!RaiseException 内）用 RtlVirtualUnwind 逐帧展开，
@@ -1264,6 +1306,19 @@ private:
                     DebugLog("[veh] 崩溃API(payload调用点反推)=%s (callerRip=RVA 0x%llX)",
                              callerApi[0] ? callerApi : " (未能反推)",
                              callerRip && pb3 ? (unsigned long long)(callerRip - pb3) : 0ULL);
+                    // CI 120：dump callerRip 前 64 字节（独立十六进制串），供本地 capstone 精确反汇编
+                    // 真实崩溃 call 指令（callerRip 可能距 call 指令几十字节）。
+                    {
+                        unsigned char cb[64] = {0};
+                        uintptr_t cs = callerRip > 64 ? callerRip - 64 : 0;
+                        if (cs) {
+                            SafeReadBytes(cs, cb, sizeof(cb));
+                            char hex[256] = {0};
+                            for (int k = 0; k < 64; k++) sprintf(hex + k * 3, "%02X ", cb[k]);
+                            DebugLog("[veh] callerRip前64(RVA 0x%llX起)=%s",
+                                     (unsigned long long)(cs - pb3), hex);
+                        }
+                    }
                     // 旧两条保留作交叉参考（但已知导出表对 forwarder 有误报）
                     char impName[320] = {0};
                     ResolveImportName(pb3, reinterpret_cast<uintptr_t>(rec->ExceptionAddress),
