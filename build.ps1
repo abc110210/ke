@@ -39,6 +39,40 @@ if (Test-Path (Join-Path $Root "test\test_payload.cpp")) { $Targets += "test_pay
 & cmake --build $Build --config Release --target $Targets --parallel
 if ($LASTEXITCODE -ne 0) { throw "cmake build 失败" }
 
+# ---- 阶段 1.5：编译 client（如果源码存在，编译后覆盖 test/ 下的 exe） ----
+# CI 135：之前 test/HanbotSavesUploader.exe 是预编译的旧版，client/CMakeLists.txt 改动不生效。
+# 改为 CI 从 client/ 源码编译，保证 CMakeLists.txt 的编译选项变更能自动反映到加壳目标。
+$clientDir = Join-Path $Root "client"
+if (Test-Path (Join-Path $clientDir "CMakeLists.txt")) {
+    Write-Host "[1.5/3] 编译 client (HanbotSavesUploader)..." -ForegroundColor Cyan
+    $clientBuild = Join-Path $Build "client"
+    # 递归查找 WebView2 SDK（CI runner 可能在不同路径）
+    $wv2Include = Get-ChildItem $Root -Recurse -Filter "WebView2.h" -ErrorAction SilentlyContinue | Select-Object -First 1
+    $wv2Lib = Get-ChildItem $Root -Recurse -Filter "WebView2LoaderStatic.lib" -ErrorAction SilentlyContinue | Select-Object -First 1
+    $wv2Env = @{}
+    if ($wv2Include) { $wv2Env["WEBVIEW2_INCLUDE_DIR"] = $wv2Include.DirectoryName }
+    if ($wv2Lib) { $wv2Env["WEBVIEW2_LIB_DIR"] = $wv2Lib.DirectoryName }
+    foreach ($k in $wv2Env.Keys) {
+        Set-Item -Path "Env:$k" -Value $wv2Env[$k]
+        Write-Host "  $k = $($wv2Env[$k])"
+    }
+    & cmake -S $clientDir -B $clientBuild -A x64 2>&1 | Write-Host
+    if ($LASTEXITCODE -ne 0) {
+        Write-Host "[1.5/3] client cmake configure 失败，跳过（用 test/ 下已有 exe）" -ForegroundColor Yellow
+    } else {
+        & cmake --build $clientBuild --config Release --parallel 2>&1 | Write-Host
+        if ($LASTEXITCODE -ne 0) {
+            Write-Host "[1.5/3] client 编译失败，跳过（用 test/ 下已有 exe）" -ForegroundColor Yellow
+        } else {
+            # 找编译出的 exe 并覆盖到 test/
+            $clientExe = Join-Path $clientBuild "Release\HanbotSavesUploader.exe"
+            if (Test-Path $clientExe) {
+                Copy-Item $clientExe (Join-Path $Root "test\HanbotSavesUploader.exe") -Force
+                Write-Host "[1.5/3] client 编译成功，已覆盖 test/HanbotSavesUploader.exe" -ForegroundColor Green
+            }
+        }
+    }
+}
 # ---- 阶段 2：确定目标并加壳 ----
 # 目标优先级：显式 -Target > test/ 下用户放入的 exe > 样例 test_payload（可选，cpp 被删则跳过）
 if (-not $Target) {
