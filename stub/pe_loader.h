@@ -89,6 +89,26 @@ struct NtApiTable {
     pRtlDeleteInvertedFunctionTable RtlDeleteInvertedFunctionTable = nullptr;
 };
 
+// CI 108：判断 RVA 是否落在模块【代码节】（Characteristics 含 IMAGE_SCN_CNT_CODE 且
+// 可执行）。自研导出解析时，用「落到代码节」来校验候选函数地址，避免把 .rdata 数据
+// 地址（名字/转发字符串）当函数填进 IAT → 满屏"导入解析异常/不可执行"。
+static inline bool rvaInCodeSection(uintptr_t base, DWORD rva)
+{
+    auto* dos = reinterpret_cast<const IMAGE_DOS_HEADER*>(base);
+    if (dos->e_magic != IMAGE_DOS_SIGNATURE) return false;
+    auto* nt = reinterpret_cast<const IMAGE_NT_HEADERS*>(base + dos->e_lfanew);
+    if (nt->Signature != IMAGE_NT_SIGNATURE) return false;
+    auto* sec = IMAGE_FIRST_SECTION(nt);
+    for (WORD i = 0; i < nt->FileHeader.NumberOfSections; i++) {
+        if (rva >= sec[i].VirtualAddress &&
+            rva < sec[i].VirtualAddress + sec[i].Misc.VirtualSize) {
+            return (sec[i].Characteristics & IMAGE_SCN_CNT_CODE) &&
+                   (sec[i].Characteristics & IMAGE_SCN_MEM_EXECUTE);
+        }
+    }
+    return false;
+}
+
 static inline void* peExportAddress(uintptr_t base, const char* exportName)
 {
     // 手工解析导出表（PEB 无 GetProcAddress 时使用）
@@ -108,12 +128,20 @@ static inline void* peExportAddress(uintptr_t base, const char* exportName)
     for (DWORD i = 0; i < exp->NumberOfNames; i++) {
         const char* nm = reinterpret_cast<const char*>(base + names[i]);
         if (strcmp(nm, exportName) == 0) {
-            // 【CI 107 回退】PE 规范：AddressOfNameOrdinals[i] 存的是 unbiased ordinal，
-            // 本身就是 AddressOfFunctions 的直接下标，【不减 Base】。
-            // （只有 biased ordinal——如 "#123" 序数形式，见下方序数分支——才需 -Base。）
-            // CI106 误改成 -Base：Base=1 的 DLL（kernel32/ntdll 等几乎全部）会整体错位一个
-            // 函数 → ntdll Nt* API 全解析错位 → 加载器一调用就 fastfail（0xC0000409）秒崩。
-            DWORD fnRva = funcs[ords[i]];
+            // CI 108：PE 规范 AddressOfNameOrdinals[i] 是 biased ordinal，funcs 下标应为
+            // ords[i]-Base；但部分 DLL（Base==0）或歧义下 ords[i] 即下标。两候选都试，
+            // 选【落在代码节】的那个，杜绝把数据地址当函数（消除"导入解析异常"噪音 + 保证正确）。
+            DWORD idxA = (exp->Base > 0 && ords[i] >= exp->Base) ? ords[i] - exp->Base : ords[i];
+            DWORD idxB = ords[i];
+            DWORD fnRva = 0;
+            for (DWORD idx : {idxA, idxB}) {
+                if (idx < exp->NumberOfFunctions && funcs[idx] &&
+                    rvaInCodeSection(base, funcs[idx])) {
+                    fnRva = funcs[idx];
+                    break;
+                }
+            }
+            if (!fnRva) fnRva = (idxA < exp->NumberOfFunctions) ? funcs[idxA] : 0; // 兜底（转发串也返回）
             if (fnRva >= expRva && fnRva < expRva + expSz) {
                 // 转发函数（forwarder）→ 简单返回 RVA（由调用方决定）
                 return reinterpret_cast<void*>(base + fnRva);
@@ -198,10 +226,18 @@ static inline void* resolveExportFromBase(uintptr_t moduleBase, const char* expo
     for (DWORD i = 0; i < exp->NumberOfNames; i++) {
         const char* nm = reinterpret_cast<const char*>(moduleBase + names[i]);
         if (strcmp(nm, exportName) == 0) {
-            // 【CI 107 回退】ords[i] 是 unbiased ordinal，直接作 funcs 下标，【不减 Base】。
-            // CI106 误改成 -Base 导致 IAT 整体错位（详见 peExportAddress 同处注释）。
-            DWORD fnRva = funcs[ords[i]];
-            // CI 63 诊断：自研解析成功时打印关键值，便于核对是否把名字字符串 RVA 当函数 RVA
+            // CI 108：同 peExportAddress——两候选下标，选落在代码节的，杜绝数据地址误填。
+            DWORD idxA = (exp->Base > 0 && ords[i] >= exp->Base) ? ords[i] - exp->Base : ords[i];
+            DWORD idxB = ords[i];
+            DWORD fnRva = 0;
+            for (DWORD idx : {idxA, idxB}) {
+                if (idx < exp->NumberOfFunctions && funcs[idx] &&
+                    rvaInCodeSection(moduleBase, funcs[idx])) {
+                    fnRva = funcs[idx];
+                    break;
+                }
+            }
+            if (!fnRva) fnRva = (idxA < exp->NumberOfFunctions) ? funcs[idxA] : 0;
             DebugLog("[loader] 导出解析: %s -> rva=0x%X addr=%p (exp: funcs=0x%X names=0x%X ords=0x%X numF=%u numN=%u)",
                      exportName, fnRva, reinterpret_cast<void*>(moduleBase + fnRva),
                      (unsigned)exp->AddressOfFunctions, (unsigned)exp->AddressOfNames,

@@ -440,6 +440,23 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int)
     }
 
     // 6.3) 跳原始入口（经 VEH 控制流混淆演示一次跳转；首执行触发按需解密）
+    // CI 108 诊断：跳 OEP 前确认系统视角的"当前主模块"是否等同于 payload 基址。
+    // 手动映射的 payload 不在 PEB LDR 模块表，GetModuleHandle(NULL) 返回 stub 基址；
+    // CRT 启动期若经 ntdll 内部（Ldr*/RtlPcToFileHeader 等）找"自身模块"会拿到 stub 信息
+    // → 数据错位 → 全局构造期写野指针。此探针用于确认该假设。
+    {
+        HMODULE selfMod = GetModuleHandleW(nullptr);
+        DebugLog("[stub] 跳OEP前: GetModuleHandle(NULL)=%p payloadBase=%p 一致=%d",
+                 (void*)selfMod, (void*)pearmor::ModuleFake::gPayloadBase,
+                 (selfMod == (HMODULE)pearmor::ModuleFake::gPayloadBase) ? 1 : 0);
+        // TEB 栈信息（x64: gs:0x30=TEB, +0x08=StackBase, +0x10=StackLimit）
+        __try {
+            BYTE* teb = reinterpret_cast<BYTE*>(__readgsqword(0x30));
+            void* stackBase  = *reinterpret_cast<void**>(teb + 0x08);
+            void* stackLimit = *reinterpret_cast<void**>(teb + 0x10);
+            DebugLog("[stub] TEB 栈: base=%p limit=%p", stackBase, stackLimit);
+        } __except (EXCEPTION_EXECUTE_HANDLER) {}
+    }
     int rc = loader.CallEntry(entryRva);
     DebugLog("[stub] OEP 返回 rc=%d", rc);
     if (rc == 0) {

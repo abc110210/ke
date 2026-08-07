@@ -593,6 +593,7 @@ public:
                 }
                 uintptr_t rbx = ep->ContextRecord ? ep->ContextRecord->Rbx : 0;
                 uintptr_t rax = ep->ContextRecord ? ep->ContextRecord->Rax : 0;
+                uintptr_t rsp = ep->ContextRecord ? ep->ContextRecord->Rsp : 0;
                 unsigned char buf[16] = {0};
                 bool readable = false;
                 MEMORY_BASIC_INFORMATION mbi;
@@ -602,11 +603,22 @@ public:
                     __except (EXCEPTION_EXECUTE_HANDLER) { readable = false; }
                 }
                 DebugLog("[oep] 崩溃在 payload 内偏移=0x%llX 节=%s rbx=0x%llX rax=0x%llX "
-                         "rbx可读=%d qword0=0x%llX qword1=0x%llX",
+                         "rsp=0x%llX rbx可读=%d qword0=0x%llX qword1=0x%llX",
                          (unsigned long long)off, secName, (unsigned long long)rbx,
-                         (unsigned long long)rax, (int)readable,
+                         (unsigned long long)rax, (unsigned long long)rsp, (int)readable,
                          readable ? *(unsigned long long*)buf : 0ULL,
                          readable ? *(unsigned long long*)(buf + 8) : 0ULL);
+                // CI 108：dump 崩溃点机器码 16 字节，下轮用于精确反汇编（手推指令边界会错位）
+                unsigned char code[16] = {0};
+                bool codeOk = false;
+                if (addr && VirtualQuery(addr, &mbi, sizeof(mbi)) && mbi.State == MEM_COMMIT) {
+                    __try { memcpy(code, addr, 16); codeOk = true; } __except (EXCEPTION_EXECUTE_HANDLER) {}
+                }
+                if (codeOk)
+                    DebugLog("[oep] 崩溃点机器码: %02X %02X %02X %02X %02X %02X %02X %02X "
+                             "%02X %02X %02X %02X %02X %02X %02X %02X",
+                             code[0],code[1],code[2],code[3],code[4],code[5],code[6],code[7],
+                             code[8],code[9],code[10],code[11],code[12],code[13],code[14],code[15]);
             }
         }
         return EXCEPTION_EXECUTE_HANDLER;
