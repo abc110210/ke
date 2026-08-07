@@ -458,6 +458,26 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int)
         void* stackLimit = *reinterpret_cast<void**>(teb + 0x10);
         DebugLog("[stub] TEB 栈: base=%p limit=%p", stackBase, stackLimit);
     }
+    // 6.3b) CI 112：跳 OEP 前把 payload 注册进 PEB LDR 模块表（头插，成为主模块）。
+    // 第五轮.txt 实锤：未注册时 GetModuleHandle(NULL) 返回 stub 基址，CRT 启动期经
+    // ntdll 内部(RtlPcToFileHeader/Ldr*/GetModuleHandleEx FROM_ADDRESS)找"自身模块"拿到
+    // stub 信息 → 解引用 -1 在 KERNELBASE AV 崩（fault=0xFFFFFFFFFFFFFFFF）。
+    // 注册后 GetModuleHandle(NULL) 与其内部路径均返回 payload（与 IAT 伪装一致）。
+    // RegisterLdrModule 内部已 __try 包裹，失败仅返回 false，IAT 伪装仍作兜底，加载继续。
+    {
+        auto* dos = reinterpret_cast<IMAGE_DOS_HEADER*>(pearmor::ModuleFake::gPayloadBase);
+        auto* nt  = reinterpret_cast<IMAGE_NT_HEADERS*>(
+                        pearmor::ModuleFake::gPayloadBase + dos->e_lfanew);
+        DWORD sizeOfImage = nt->OptionalHeader.SizeOfImage;
+        if (!pearmor::ModuleFake::RegisterLdrModule(
+                reinterpret_cast<void*>(pearmor::ModuleFake::gPayloadBase),
+                sizeOfImage, pearmor::ModuleFake::gFakePath)) {
+            DebugLog("[stub] RegisterLdrModule 失败（IAT 伪装仍作兜底，继续）");
+        } else {
+            DebugLog("[stub] RegisterLdrModule OK：payload 已注册为 PEB 主模块");
+        }
+    }
+
     int rc = loader.CallEntry(entryRva);
     DebugLog("[stub] OEP 返回 rc=%d", rc);
     if (rc == 0) {

@@ -495,19 +495,25 @@ namespace ModuleFake {
             };
             setUs(e + 0x48, fullCopy ? fullCopy : L"");        // FullDllName
             setUs(e + 0x58, baseCopy ? baseCopy : L"");        // BaseDllName
-            // 4) 重建三条链（复制来的 Flink/Blink 指向 stub 的链，必须重置为自身）+ 尾插
-            auto insertTail = [](LIST_ENTRY* h, LIST_ENTRY* entry) {
-                entry->Flink = h;
-                entry->Blink = h->Blink;
-                h->Blink->Flink = entry;
-                h->Blink = entry;
+            // 4) 重建三条链（复制来的 Flink/Blink 指向 stub 的链，必须重置为自身）+ 头插。
+            // 【CI 112 修正】改用头插：GetModuleHandle(NULL) 返回 InLoadOrderModuleList 的
+            // 第一个模块（即主 exe）；尾插时 payload 仍是末位 → GetModuleHandle(NULL) 仍返回
+            // stub（第五轮.txt 实锤：CRT 启动期经 ntdll 内部 RtlPcToFileHeader/Ldr* 找"自身模块"
+            // 拿到 stub 信息 → 解引用 -1 在 KERNELBASE AV 崩）。头插使 payload 成为第一模块。
+            *reinterpret_cast<void**>(e + 0x38) = nullptr;  // EntryPoint=0：避免 ntdll 把 payload
+                                                         // 当 DLL 重新调用 DllMain/入口
+            auto insertHead = [](LIST_ENTRY* h, LIST_ENTRY* entry) {
+                entry->Flink = h->Flink;
+                entry->Blink = h;
+                h->Flink->Blink = entry;
+                h->Flink = entry;
             };
             // entry 内部三链布局：+0x00 / +0x10 / +0x20
-            insertTail(reinterpret_cast<LIST_ENTRY*>(ldr + 0x10),
+            insertHead(reinterpret_cast<LIST_ENTRY*>(ldr + 0x10),
                        reinterpret_cast<LIST_ENTRY*>(e + 0x00));
-            insertTail(reinterpret_cast<LIST_ENTRY*>(ldr + 0x20),
+            insertHead(reinterpret_cast<LIST_ENTRY*>(ldr + 0x20),
                        reinterpret_cast<LIST_ENTRY*>(e + 0x10));
-            insertTail(reinterpret_cast<LIST_ENTRY*>(ldr + 0x30),
+            insertHead(reinterpret_cast<LIST_ENTRY*>(ldr + 0x30),
                        reinterpret_cast<LIST_ENTRY*>(e + 0x20));
             return true;
         } __except (EXCEPTION_EXECUTE_HANDLER) {
