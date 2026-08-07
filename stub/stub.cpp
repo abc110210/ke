@@ -143,6 +143,64 @@ static void ProbeGetSystemTimeAsFileTime()
     }
 }
 
+// CI 127：堆探针（独立 SEH 函数——wWinMain 含 C++ 对象不能用 __try，C2712）。
+static void ProbeHeap()
+{
+    __try {
+        HANDLE hProc = GetProcessHeap();
+        void* p = HeapAlloc(hProc, 0, 256);
+        if (p) {
+            memset(p, 0xCC, 256);
+            HeapFree(hProc, 0, p);
+            DebugLog("[stub] 堆探针成功: GetProcessHeap=%p alloc+free OK", (void*)hProc);
+        } else {
+            DebugLog("[stub] 堆探针: HeapAlloc 返回 null（堆正常但无内存？）");
+        }
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        DebugLog("[stub] 堆探针崩溃(0x%X)！进程堆已损坏", (unsigned)GetExceptionCode());
+    }
+}
+
+// CI 127：堆损坏 VEH 捕获器（独立函数——不能用 lambda，C2713 两种异常处理共存）。
+// 在 payload CRT 启动期 ntdll 抛 STATUS_HEAP_CORRUPTION 时被调，打印 RIP/fault/栈回溯。
+static LONG WINAPI HeapCorruptionVeh(EXCEPTION_POINTERS* ep)
+{
+    DWORD code = ep->ExceptionRecord->ExceptionCode;
+    if (code != 0xC0000374 && code != 0xC0000005 && code != 0xC0000409)
+        return EXCEPTION_CONTINUE_SEARCH;
+    void* addr = ep->ExceptionRecord->ExceptionAddress;
+    char mod[256] = {0};
+    HMODULE hMod = nullptr;
+    if (GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+                           GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                           (LPCWSTR)addr, &hMod) && hMod)
+        GetModuleFileNameA(hMod, mod, sizeof(mod));
+    uintptr_t base = reinterpret_cast<uintptr_t>(hMod);
+    DebugLog("[veh-heap] 堆损坏第一现场: code=0x%08X addr=%p (%s 偏移=0x%llX) "
+             "rsp=%p rip=%p rax=%p rbx=%p rcx=%p",
+             (unsigned)code, addr, mod[0] ? mod : "?",
+             base ? (unsigned long long)((uintptr_t)addr - base) : 0ULL,
+             (void*)ep->ContextRecord->Rsp, (void*)ep->ContextRecord->Rip,
+             (void*)ep->ContextRecord->Rax, (void*)ep->ContextRecord->Rbx,
+             (void*)ep->ContextRecord->Rcx);
+    // 栈顶 8 个返回地址
+    uintptr_t rsp = ep->ContextRecord->Rsp;
+    for (int i = 0; i < 8; i++) {
+        uintptr_t v = 0;
+        if (!SafeReadBytes(rsp + i * 8, &v, sizeof(v))) break;
+        if (!v) break;
+        char m2[256] = {0}; HMODULE h2 = nullptr;
+        if (GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+                               GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                               (LPCWSTR)v, &h2) && h2)
+            GetModuleFileNameA(h2, m2, sizeof(m2));
+        bool inPayload = g_plBase && v >= g_plBase && v < g_plBase + g_plSize;
+        DebugLog("[veh-heap]   栈[%d]=%p (%s%s)", i, (void*)v,
+                 m2[0] ? m2 : "?", inPayload ? " <<< payload" : "");
+    }
+    return EXCEPTION_CONTINUE_SEARCH;
+}
+
 int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int)
 {
     // 【CI 107 早期探针】无条件写 stderr（CI 用 -RedirectStandardError 捕获）+ 立即 flush。
@@ -533,67 +591,13 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int)
     //   - 成功 → stub 环境正常，崩因在 payload 执行后的状态变化
     //   - 失败/崩 → stub 环境本身已被 LDR 头插/PEB 改写破坏
     ProbeGetSystemTimeAsFileTime();
-    // CI 127：堆探针——第17轮 exit_code=0xC0000374(STATUS_HEAP_CORRUPTION)。跳 OEP 前
-    // 手动调 GetProcessHeap + HeapAlloc + HeapFree，确认进程堆是否正常。如果崩在这里，
-    // 说明壳环境堆已坏；如果成功，说明堆损坏在 payload CRT 启动期。
+    // CI 127：堆探针 + VEH 堆损坏捕获器（抽成独立函数——wWinMain 含 C++ 对象不能 __try/lambda VEH）
+    ProbeHeap();
     {
-        __try {
-            HANDLE hProc = GetProcessHeap();
-            void* p = HeapAlloc(hProc, 0, 256);
-            if (p) {
-                memset(p, 0xCC, 256);
-                HeapFree(hProc, 0, p);
-                DebugLog("[stub] 堆探针成功: GetProcessHeap=%p alloc+free OK", (void*)hProc);
-            } else {
-                DebugLog("[stub] 堆探针: HeapAlloc 返回 null（堆正常但无内存？）");
-            }
-        } __except (EXCEPTION_EXECUTE_HANDLER) {
-            DebugLog("[stub] 堆探针崩溃(0x%X)！进程堆已损坏", (unsigned)GetExceptionCode());
-        }
-    }
-    // CI 127：用 VEH 捕获 0xC0000374(fastfail 堆损坏) 的第一现场。
-    // OepThunk 的 __try 抓不住 fastfail，但 VEH 是第一机会处理器，在 ntdll 抛
-    // STATUS_HEAP_CORRUPTION 时会被调到——打印 RIP/fault/栈回溯定位是哪个函数写坏了堆。
-    {
-        auto h = AddVectoredExceptionHandler(1, [](PEXCEPTION_POINTERS ep) -> LONG {
-            DWORD code = ep->ExceptionRecord->ExceptionCode;
-            // 只关心堆损坏和 AV，其他放行
-            if (code != 0xC0000374 && code != 0xC0000005 && code != 0xC0000409)
-                return EXCEPTION_CONTINUE_SEARCH;
-            void* addr = ep->ExceptionRecord->ExceptionAddress;
-            char mod[256] = {0};
-            HMODULE hMod = nullptr;
-            if (GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
-                                   GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
-                                   (LPCWSTR)addr, &hMod) && hMod)
-                GetModuleFileNameA(hMod, mod, sizeof(mod));
-            uintptr_t base = reinterpret_cast<uintptr_t>(hMod);
-            DebugLog("[veh-heap] 堆损坏第一现场: code=0x%08X addr=%p (%s 偏移=0x%llX) "
-                     "rsp=%p rip=%p rax=%p rbx=%p rcx=%p",
-                     (unsigned)code, addr, mod[0] ? mod : "?",
-                     base ? (unsigned long long)((uintptr_t)addr - base) : 0ULL,
-                     (void*)ep->ContextRecord->Rsp, (void*)ep->ContextRecord->Rip,
-                     (void*)ep->ContextRecord->Rax, (void*)ep->ContextRecord->Rbx,
-                     (void*)ep->ContextRecord->Rcx);
-            // 打印栈顶 8 个返回地址（定位调用链）
-            uintptr_t rsp = ep->ContextRecord->Rsp;
-            for (int i = 0; i < 8; i++) {
-                uintptr_t v = 0;
-                if (!SafeReadBytes(rsp + i * 8, &v, sizeof(v))) break;
-                if (!v) break;
-                char m2[256] = {0}; HMODULE h2 = nullptr;
-                if (GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
-                                       GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
-                                       (LPCWSTR)v, &h2) && h2)
-                    GetModuleFileNameA(h2, m2, sizeof(m2));
-                bool inPayload = g_plBase && v >= g_plBase && v < g_plBase + g_plSize;
-                DebugLog("[veh-heap]   栈[%d]=%p (%s%s)", i, (void*)v,
-                         m2[0] ? m2 : "?", inPayload ? " <<< payload" : "");
-            }
-            return EXCEPTION_CONTINUE_SEARCH;  // 不吞，让进程终止（fastfail 不能恢复）
-        });
+        auto h = AddVectoredExceptionHandler(1, HeapCorruptionVeh);
         if (h) DebugLog("[stub] 已装堆损坏 VEH 捕获器（第一机会）");
     }
+
     // CI 121：跳 OEP 前 dump PEB 关键字段（崩溃在 KERNELBASE GetSystemTimeAdjustment
     // 内部 add [rcx-0x77],al，rcx=1 像是读 PEB/TEB 某字段拿到脏值）。对照系统正常值判断
     // 哪个字段被我们改坏/漏设。关键字段偏移（x64 PEB）：
