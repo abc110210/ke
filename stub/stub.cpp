@@ -486,7 +486,7 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int)
         // 关键修复：改写 PEB.ImageBaseAddress（x64: PEB@gs:[0x60], 偏移 0x10），
         // 让 GetModuleHandle(NULL) 返回 payload 基址。读取不会抛 SEH，直接写。
         BYTE* peb = reinterpret_cast<BYTE*>(__readgsqword(0x60));
-        *reinterpret_cast<void**>(peb + 0x10) = pearmor::ModuleFake::gPayloadBase;
+        *reinterpret_cast<void**>(peb + 0x10) = reinterpret_cast<void*>(pearmor::ModuleFake::gPayloadBase);
         DebugLog("[stub] 已改写 PEB.ImageBaseAddress = payload 基址");
         // 复测：确认 GetModuleHandle(NULL) 现在返回 payload（一致应=1）
         HMODULE selfMod2 = GetModuleHandleW(nullptr);
