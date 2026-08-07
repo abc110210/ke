@@ -47,8 +47,25 @@ if (Test-Path (Join-Path $clientDir "CMakeLists.txt")) {
     Write-Host "[1.5/3] 编译 client (HanbotSavesUploader)..." -ForegroundColor Cyan
     $clientBuild = Join-Path $Build "client"
     # 递归查找 WebView2 SDK（CI runner 可能在不同路径）
+    # CI 139：WebView2LoaderStatic.lib 必须过滤 x64 目录——NuGet 包含 arm64/x64/win32 多架构，
+    # 不过滤时第一个命中是 arm64（字母序 a<x），链接报 LNK4272 架构冲突。
     $wv2Include = Get-ChildItem $Root -Recurse -Filter "WebView2.h" -ErrorAction SilentlyContinue | Select-Object -First 1
-    $wv2Lib = Get-ChildItem $Root -Recurse -Filter "WebView2LoaderStatic.lib" -ErrorAction SilentlyContinue | Select-Object -First 1
+    $wv2Lib = Get-ChildItem $Root -Recurse -Filter "WebView2LoaderStatic.lib" -ErrorAction SilentlyContinue |
+              Where-Object { $_.FullName -match "[\\/]x64[\\/]" } | Select-Object -First 1
+    # 仓库里没有 → 从 NuGet 下载微软官方包（不带版本号=取最新稳定版，
+    # 布局 build/native/include + build/native/x64，与 CMakeLists 默认路径一致）
+    if (-not $wv2Include -or -not $wv2Lib) {
+        Write-Host "  [1.5/3] 未找到已提交的 WebView2 SDK，从 NuGet 下载 Microsoft.Web.WebView2..."
+        $wv2zip = Join-Path $env:TEMP "wv2.zip"
+        try {
+            Invoke-WebRequest -Uri "https://www.nuget.org/api/v2/package/Microsoft.Web.WebView2" -OutFile $wv2zip -UseBasicParsing
+            $sdkRoot = Join-Path $Root "webview2sdk"
+            Expand-Archive $wv2zip -DestinationPath $sdkRoot -Force
+            $wv2Include = Get-ChildItem $sdkRoot -Recurse -Filter "WebView2.h" -ErrorAction SilentlyContinue | Select-Object -First 1
+            $wv2Lib = Get-ChildItem $sdkRoot -Recurse -Filter "WebView2LoaderStatic.lib" -ErrorAction SilentlyContinue |
+                      Where-Object { $_.FullName -match "[\\/]x64[\\/]" } | Select-Object -First 1
+        } catch { Write-Host "  NuGet 下载失败: $_" }
+    }
     $wv2Env = @{}
     if ($wv2Include) { $wv2Env["WEBVIEW2_INCLUDE_DIR"] = $wv2Include.DirectoryName }
     if ($wv2Lib) { $wv2Env["WEBVIEW2_LIB_DIR"] = $wv2Lib.DirectoryName }
