@@ -440,10 +440,11 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int)
     }
 
     // 6.3) 跳原始入口（经 VEH 控制流混淆演示一次跳转；首执行触发按需解密）
-    // CI 108 诊断：跳 OEP 前确认系统视角的"当前主模块"是否等同于 payload 基址。
-    // 手动映射的 payload 不在 PEB LDR 模块表，GetModuleHandle(NULL) 返回 stub 基址；
-    // CRT 启动期若经 ntdll 内部（Ldr*/RtlPcToFileHeader 等）找"自身模块"会拿到 stub 信息
-    // → 数据错位 → 全局构造期写野指针。此探针用于确认该假设。
+    // CI 108/113 诊断：跳 OEP 前确认系统视角的"当前主模块"是否等同于 payload 基址。
+    // GetModuleHandle(NULL) 内核实现返回 PEB->ImageBaseAddress（=stub），故手动映射的
+    // payload 即便不在 LDR 表、或仅头插 LDR 表，该 API 仍返回 stub 基址；必须改写
+    // PEB.ImageBaseAddress（6.3b）才能让 CRT 启动期经 ntdll 内部找"自身模块"拿到正确信息。
+    // 此探针为"修复前"基线（预期一致=0），6.3b 注册后会再打印一次"修复后"复测。
     {
         HMODULE selfMod = GetModuleHandleW(nullptr);
         DebugLog("[stub] 跳OEP前: GetModuleHandle(NULL)=%p payloadBase=%p 一致=%d",
@@ -457,12 +458,18 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int)
         void* stackBase  = *reinterpret_cast<void**>(teb + 0x08);
         void* stackLimit = *reinterpret_cast<void**>(teb + 0x10);
         DebugLog("[stub] TEB 栈: base=%p limit=%p", stackBase, stackLimit);
+        // 打印当前 RSP（与崩溃时 VEH 报的 rsp=0 对比，判断栈是否在 payload 执行期被清零）
+        DebugLog("[stub] 跳OEP前 RSP=%p", (void*)__readgsqword(0x08));
     }
-    // 6.3b) CI 112：跳 OEP 前把 payload 注册进 PEB LDR 模块表（头插，成为主模块）。
-    // 第五轮.txt 实锤：未注册时 GetModuleHandle(NULL) 返回 stub 基址，CRT 启动期经
-    // ntdll 内部(RtlPcToFileHeader/Ldr*/GetModuleHandleEx FROM_ADDRESS)找"自身模块"拿到
-    // stub 信息 → 解引用 -1 在 KERNELBASE AV 崩（fault=0xFFFFFFFFFFFFFFFF）。
-    // 注册后 GetModuleHandle(NULL) 与其内部路径均返回 payload（与 IAT 伪装一致）。
+    // 6.3b) CI 112/113：跳 OEP 前把 payload 注册为系统"主模块"。
+    // 第五轮.txt 实锤：未注册时 GetModuleHandle(NULL) 返回 stub 基址 → CRT 启动期
+    // 经 ntdll 内部(RtlPcToFileHeader/Ldr*/GetModuleHandleEx FROM_ADDRESS)找"自身模块"
+    // 拿到 stub 信息 → KERNELBASE 内解引用 -1 崩（fault=0xFFFFFFFFFFFFFFFF）。
+    // ⚠️ 关键认知修正（第六轮.txt 验证）：GetModuleHandle(NULL) 在内核实现上返回的是
+    //    PEB->ImageBaseAddress（=进程真正 EXE 基址=stub），【不是】LDR 链表头！
+    //    光头插 LDR 链表无法改变它的返回值（第六轮头插后崩溃点原封不动即铁证）。
+    //    必须【同时】改写 PEB->ImageBaseAddress 才能让 GetModuleHandle(NULL) 与其
+    //    内部路径都拿到 payload 基址。LDR 头插仍保留：覆盖"按地址反查模块"的路径。
     // RegisterLdrModule 内部已 __try 包裹，失败仅返回 false，IAT 伪装仍作兜底，加载继续。
     {
         auto* dos = reinterpret_cast<IMAGE_DOS_HEADER*>(pearmor::ModuleFake::gPayloadBase);
@@ -474,8 +481,18 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int)
                 sizeOfImage, pearmor::ModuleFake::gFakePath)) {
             DebugLog("[stub] RegisterLdrModule 失败（IAT 伪装仍作兜底，继续）");
         } else {
-            DebugLog("[stub] RegisterLdrModule OK：payload 已注册为 PEB 主模块");
+            DebugLog("[stub] RegisterLdrModule OK：payload 已头插 LDR 模块表");
         }
+        // 关键修复：改写 PEB.ImageBaseAddress（x64: PEB@gs:[0x60], 偏移 0x10），
+        // 让 GetModuleHandle(NULL) 返回 payload 基址。读取不会抛 SEH，直接写。
+        BYTE* peb = reinterpret_cast<BYTE*>(__readgsqword(0x60));
+        *reinterpret_cast<void**>(peb + 0x10) = pearmor::ModuleFake::gPayloadBase;
+        DebugLog("[stub] 已改写 PEB.ImageBaseAddress = payload 基址");
+        // 复测：确认 GetModuleHandle(NULL) 现在返回 payload（一致应=1）
+        HMODULE selfMod2 = GetModuleHandleW(nullptr);
+        DebugLog("[stub] 注册后: GetModuleHandle(NULL)=%p payloadBase=%p 一致=%d",
+                 (void*)selfMod2, (void*)pearmor::ModuleFake::gPayloadBase,
+                 (selfMod2 == (HMODULE)pearmor::ModuleFake::gPayloadBase) ? 1 : 0);
     }
 
     int rc = loader.CallEntry(entryRva);
