@@ -97,11 +97,17 @@ static void ResolveExportName(uintptr_t addr, char* out, size_t outSz)
         reinterpret_cast<PIMAGE_EXPORT_DIRECTORY>(base + ed.VirtualAddress);
     DWORD rvaAddr = (DWORD)(addr - base);
     DWORD* fns   = reinterpret_cast<DWORD*>(base + exp->AddressOfFunctions);
+    // CI 119：forwarder 项的 RVA 落在 export directory 范围内（指向转发字符串），
+    // 必须跳过——否则会把代码地址误报成 "GetSystemTimeAdjustment"（forwarder 字符串的最近下界）。
+    DWORD expDirStart = ed.VirtualAddress;
+    DWORD expDirEnd   = ed.VirtualAddress + ed.Size;
     DWORD  best  = 0;
     DWORD  bestIdx = 0;          // 函数表索引（= 序号 - Base），供名字反查
     bool   found = false;
     for (DWORD i = 0; i < exp->NumberOfFunctions; i++) {
         DWORD f = fns[i];
+        if (f == 0) continue;                          // 空槽
+        if (f >= expDirStart && f < expDirEnd) continue; // forwarder，跳过
         if (f <= rvaAddr && (!found || f > best)) { best = f; bestIdx = i; found = true; }
     }
     if (!found) { sprintf(out, " <无匹配导出>"); return; }
@@ -156,6 +162,59 @@ static void ResolveImportName(uintptr_t base, uintptr_t callee, char* out, size_
     }
 }
 
+// CI 119：从 payload 调用点(栈回溯 #0 帧 RIP，即 KERNELBASE 返回 payload 的地址)反推它调了哪个
+// 系统 API。原理：#0 帧 RIP 是 KERNELBASE 把控制权还给 payload 的地方，往前回扫最多 16 字节
+// 找 FF 15 xx xx xx xx（call qword ptr [rip+disp32]），用 disp32 算出 IAT 槽 VA，再查 payload 导入表
+// 报 DLL!ApiName。这条路径【不经过】KERNELBASE 导出表，比从崩溃地址反推权威得多——
+// KERNELBASE 用 forwarder 转发项会让 ResolveExportName 误报（如把 0x1019B7 报成 GetSystemTimeAdjustment）。
+// callerRip=payload 调用点 VA；base=payload 基址。
+static void ResolveApiFromCaller(uintptr_t callerRip, uintptr_t base,
+                                 char* out, size_t outSz)
+{
+    out[0] = 0;
+    if (!callerRip || !base) return;
+    unsigned char buf[16] = {0};
+    uintptr_t start = callerRip > 16 ? callerRip - 16 : 0;
+    if (!SafeReadBytes(start, buf, sizeof(buf))) return;
+    // 从末尾往回扫 FF 15（call [rip+disp32]）
+    for (int i = (int)sizeof(buf) - 2; i >= 0; i--) {
+        if (buf[i] == 0xFF && buf[i + 1] == 0x15) {
+            uintptr_t instrAddr = start + (uintptr_t)i;
+            int32_t disp = *reinterpret_cast<int32_t*>(buf + i + 2);
+            uintptr_t iatSlot = instrAddr + 6 + (intptr_t)disp;
+            DWORD rvaTarget = (DWORD)(iatSlot - base);
+            PIMAGE_DOS_HEADER dos = reinterpret_cast<PIMAGE_DOS_HEADER*>(base);
+            PIMAGE_NT_HEADERS nt = reinterpret_cast<PIMAGE_NT_HEADERS*>(base + dos->e_lfanew);
+            auto& idd = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT];
+            if (!idd.VirtualAddress || !idd.Size) return;
+            PIMAGE_IMPORT_DESCRIPTOR desc =
+                reinterpret_cast<PIMAGE_IMPORT_DESCRIPTOR*>(base + idd.VirtualAddress);
+            for (DWORD k = 0; desc[k].OriginalFirstThunk || desc[k].FirstThunk; k++) {
+                if (!desc[k].FirstThunk) continue;
+                const char* dll = reinterpret_cast<const char*>(base + desc[k].Name);
+                DWORD64 oft = desc[k].OriginalFirstThunk ? desc[k].OriginalFirstThunk
+                                                         : desc[k].FirstThunk;
+                ULONGLONG* intt = reinterpret_cast<ULONGLONG*>(base + oft);
+                for (DWORD j = 0; intt[j]; j++) {
+                    DWORD slotRva = desc[k].FirstThunk + j * 8;
+                    if (slotRva != rvaTarget) continue;
+                    if (IMAGE_SNAP_BY_ORDINAL64(intt[j])) {
+                        sprintf(out, " %s!ordinal#%u", dll, (unsigned)IMAGE_ORDINAL64(intt[j]));
+                    } else {
+                        PIMAGE_IMPORT_BY_NAME ibn =
+                            reinterpret_cast<PIMAGE_IMPORT_BY_NAME*>(base + (DWORD)intt[j]);
+                        sprintf(out, " %s!%s", dll, ibn->Name);
+                    }
+                    return;
+                }
+            }
+            sprintf(out, " (FF15 IAT槽=0x%X 未匹配导入表)", (unsigned)rvaTarget);
+            return;
+        }
+    }
+    sprintf(out, " (未找到 FF 15 call 指令)");
+}
+
 // 正经走栈：从异常现场（通常停在 KERNELBASE!RaiseException 内）用 RtlVirtualUnwind 逐帧展开，
 // 打印完整调用链。CI 67 前 payload 无 .pdata，展开到第一个 payload 帧即停（定位 throw 站点）；
 // CI 66 起 .pdata 已注册（RtlAddFunctionTable count=1102），RtlVirtualUnwind 能展开 payload
@@ -163,8 +222,12 @@ static void ResolveImportName(uintptr_t base, uintptr_t callee, char* out, size_
 // 用于判断 throw 来自 Hanbot 哪个业务函数（环境失败 vs 加壳破坏）。
 // 无 .pdata 的帧（如纯汇编）用叶子近似（ret=*Rsp; Rsp+=8）继续，最多 16 帧。
 // pb/pe 为 payload 基址区间（由 VehHandler 计算传入）。
-static void LogRealThrowSite(EXCEPTION_POINTERS* ep, uintptr_t pb, uintptr_t pe)
+// CI 119：firstPayloadRip 为 out 参数，输出栈回溯 #0 帧的 payload RIP（即 KERNELBASE 返回 payload 的地址），
+// 供调用方（VEH AV 分支）传给 ResolveApiFromCaller 反推 payload 调了哪个 API。nullptr 则忽略。
+static void LogRealThrowSite(EXCEPTION_POINTERS* ep, uintptr_t pb, uintptr_t pe,
+                             uintptr_t* firstPayloadRip = nullptr)
 {
+    if (firstPayloadRip) *firstPayloadRip = 0;
     using PFN_Lookup = PRUNTIME_FUNCTION (NTAPI*)(ULONG64, PULONG64, PVOID);
     using PFN_Unwind  = PVOID (NTAPI*)(ULONG, ULONG64, ULONG64, PRUNTIME_FUNCTION, PCONTEXT, PVOID*, PULONG64, PVOID);
     static PFN_Lookup pLookup = nullptr;
@@ -218,6 +281,8 @@ static void LogRealThrowSite(EXCEPTION_POINTERS* ep, uintptr_t pb, uintptr_t pe)
                                (LPCWSTR)ctx.Rip, &hMod) && hMod)
             GetModuleFileNameA(hMod, mod, sizeof(mod));
         bool inPayload = (ctx.Rip >= pb && ctx.Rip < pe);
+        if (inPayload && firstPayloadRip && *firstPayloadRip == 0)
+            *firstPayloadRip = (uintptr_t)ctx.Rip;   // 捕获第一个 payload 帧（#0 帧）的 RIP
         char extra[384] = {0};
         if (inPayload) {
             sprintf(extra, "  <<< payload RVA=0x%llX", (unsigned long long)(ctx.Rip - pb));
@@ -1173,24 +1238,42 @@ private:
                         pb2 = reinterpret_cast<uintptr_t>(g_instance->pageBase[0]);
                         pe2 = pb2 + (size_t)g_instance->pageBase.size() * g_instance->pageSize;
                     }
-                    LogRealThrowSite(ep, pb2, pe2);
+                    LogRealThrowSite(ep, pb2, pe2);  // #0 帧 RIP 经 firstCallerRip 捕获
                 }
-                // CI 118：权威定位 payload 调了哪个系统 API——直接扫 payload 导入表，
-                // 找 IAT 槽 == 崩溃地址(KERNELBASE 0x1019B7) 的条目，报 "DLL!ApiName"。
-                // 同时用导出表解析(KERNELBASE!Api+off)交叉验证。下一轮日志据此一锤定因。
+                // CI 119：从 payload 调用点（栈回溯 #0 帧 RIP，KERNELBASE 返回 payload 的地址）
+                // 反推 payload 调了哪个系统 API——往前回扫找 FF 15 call[rip+disp32] → 算 IAT 槽 RVA
+                // → 查导入表报 DLL!ApiName。这条路径不经 KERNELBASE 导出表，是【最权威】定位。
+                // CI 118 的 ResolveImportName（按崩溃地址精确匹配 IAT 槽）在「API 内部崩」时必漏，
+                // 因 IAT 里存的是 API 入口不等于崩溃 RIP；CI 119 改走 callerRip 路径。
                 {
                     uintptr_t pb3 = 0;
                     if (g_instance && !g_instance->pageBase.empty())
                         pb3 = reinterpret_cast<uintptr_t>(g_instance->pageBase[0]);
+                    // 重跑栈回溯拿 #0 帧 RIP（用临时副本，避免修改 LogRealThrowSite 输出语义）
+                    uintptr_t callerRip = 0;
+                    {
+                        uintptr_t p2 = 0, e2 = 0;
+                        if (g_instance && !g_instance->pageBase.empty()) {
+                            p2 = reinterpret_cast<uintptr_t>(g_instance->pageBase[0]);
+                            e2 = p2 + (size_t)g_instance->pageBase.size() * g_instance->pageSize;
+                        }
+                        LogRealThrowSite(ep, p2, e2, &callerRip);  // 仅取 firstPayloadRip
+                    }
+                    char callerApi[320] = {0};
+                    ResolveApiFromCaller(callerRip, pb3, callerApi, sizeof(callerApi));
+                    DebugLog("[veh] 崩溃API(payload调用点反推)=%s (callerRip=RVA 0x%llX)",
+                             callerApi[0] ? callerApi : " (未能反推)",
+                             callerRip && pb3 ? (unsigned long long)(callerRip - pb3) : 0ULL);
+                    // 旧两条保留作交叉参考（但已知导出表对 forwarder 有误报）
                     char impName[320] = {0};
                     ResolveImportName(pb3, reinterpret_cast<uintptr_t>(rec->ExceptionAddress),
                                       impName, sizeof(impName));
-                    DebugLog("[veh] 崩溃API(导入表)=%s",
+                    DebugLog("[veh] 崩溃API(导入表按崩溃址精确匹配)=%s",
                              impName[0] ? impName : " (未在 payload 导入表找到该地址)");
                     char expName2[256] = {0};
                     ResolveExportName(reinterpret_cast<uintptr_t>(rec->ExceptionAddress),
                                        expName2, sizeof(expName2));
-                    DebugLog("[veh] 崩溃API(导出表)=%s",
+                    DebugLog("[veh] 崩溃API(KERNELBASE导出表,可能含forwarder误报)=%s",
                              expName2[0] ? expName2 : " (无匹配导出)");
                 }
                 // CI 89：崩溃线程 TLS 槽检查——工作线程 TEB 里 payload TLS 槽应为
