@@ -1073,6 +1073,17 @@ private:
                     }
                     DebugLog("[veh] RIP前64=%s", hex);
                 }
+                // CI 115：对 KERNELBASE 崩溃也走 RtlVirtualUnwind 栈回溯，定位 payload 里
+                // 是哪个函数调进 KERNELBASE 0x1019B7（fault=-1=INVALID_HANDLE_VALUE）。
+                // 关键调用链=payload函数→KERNELBASE API，借此反推崩因（缺哪份 OS 状态/哪个句柄=-1）。
+                {
+                    uintptr_t pb2 = 0, pe2 = 0;
+                    if (g_instance && !g_instance->pageBase.empty()) {
+                        pb2 = reinterpret_cast<uintptr_t>(g_instance->pageBase[0]);
+                        pe2 = pb2 + (size_t)g_instance->pageBase.size() * g_instance->pageSize;
+                    }
+                    LogRealThrowSite(ep, pb2, pe2);
+                }
                 // CI 89：崩溃线程 TLS 槽检查——工作线程 TEB 里 payload TLS 槽应为
                 // 非 null（CI 100 起每线程独立副本，主线程才是 g_payloadTlsData）；
                 // null → 工作线程 TLS 未挂载实锤（业务 __declspec(thread) 变量地址
