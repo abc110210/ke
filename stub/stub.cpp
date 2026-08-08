@@ -205,12 +205,15 @@ static LONG WINAPI HeapCorruptionVeh(EXCEPTION_POINTERS* ep)
         GetModuleFileNameA(hMod, mod, sizeof(mod));
     uintptr_t base = reinterpret_cast<uintptr_t>(hMod);
     DebugLog("[veh-heap] 堆损坏第一现场: code=0x%08X addr=%p (%s 偏移=0x%llX) "
-             "rsp=%p rip=%p rax=%p rbx=%p rcx=%p",
+             "rsp=%p rip=%p rax=%p rbx=%p rcx=%p rdx=%p rdi=%p rsi=%p r14=%p r15=%p tid=%u",
              (unsigned)code, addr, mod[0] ? mod : "?",
              base ? (unsigned long long)((uintptr_t)addr - base) : 0ULL,
              (void*)ep->ContextRecord->Rsp, (void*)ep->ContextRecord->Rip,
              (void*)ep->ContextRecord->Rax, (void*)ep->ContextRecord->Rbx,
-             (void*)ep->ContextRecord->Rcx);
+             (void*)ep->ContextRecord->Rcx, (void*)ep->ContextRecord->Rdx,
+             (void*)ep->ContextRecord->Rdi, (void*)ep->ContextRecord->Rsi,
+             (void*)ep->ContextRecord->R14, (void*)ep->ContextRecord->R15,
+             (unsigned)GetCurrentThreadId());
     // CI 129：用 RtlVirtualUnwind 正经栈回溯（简单读栈帧对 fastfail 无效——栈顶是参数不是返回地址）。
     // 直接内联实现（LogRealThrowSite 是 paged_loader.h 的 static，跨 TU 不可见）。
     {
@@ -267,8 +270,45 @@ static LONG WINAPI HeapCorruptionVeh(EXCEPTION_POINTERS* ep)
                     char hex[128] = {0};
                     for (int k = 0; k < 32; k++) sprintf(hex + k * 3, "%02X ", ib[k]);
                     DebugLog("[veh-heap]        前32字节: %s", hex);
+                    // CI 144：解析 RIP 前一条 E8 call rel32 的目标（RIP 停在返回地址）
+                    if (ib[27] == 0xE8) {
+                        int32_t rel = 0;
+                        memcpy(&rel, ib + 28, 4);
+                        uintptr_t tgt = ctx.Rip + (intptr_t)rel;
+                        char tm[256] = {0};
+                        HMODULE thm = nullptr;
+                        if (GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+                                               GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                                               (LPCWSTR)tgt, &thm) && thm)
+                            GetModuleFileNameA(thm, tm, sizeof(tm));
+                        bool tInPayload = g_plBase && tgt >= g_plBase && tgt < g_plBase + g_plSize;
+                        DebugLog("[veh-heap]        RIP前call目标=%p (%s%s%s)",
+                                 (void*)tgt, tm[0] ? tm : "?",
+                                 tInPayload ? " <<< payload RVA=0x" : "",
+                                 tInPayload ? "" : "");
+                        if (tInPayload)
+                            DebugLog("[veh-heap]        目标payload RVA=0x%llX",
+                                     (unsigned long long)(tgt - g_plBase));
+                    }
                 }
             }
+        }
+    }
+    // CI 143：dump 栈顶 64 字节——HeapFree 崩前，被释放指针常留在调用者栈帧里；
+    // 标注指向 payload 内存的 qword（判段归属：.data/.bss=全局对象析构，堆=局部）。
+    {
+        unsigned char sb[64] = {0};
+        __try { memcpy(sb, (void*)ep->ContextRecord->Rsp, sizeof(sb)); } __except (1) {}
+        DebugLog("[veh-heap] 栈顶64字节(RSP=%p):", (void*)ep->ContextRecord->Rsp);
+        for (int k = 0; k < 64; k += 8) {
+            uintptr_t qv = 0; memcpy(&qv, sb + k, 8);
+            char tag[96] = {0};
+            if (g_plBase && qv >= g_plBase && qv < g_plBase + g_plSize)
+                sprintf(tag, " <-- payload RVA=0x%llX", (unsigned long long)(qv - g_plBase));
+            else if (qv >= 0x10000 && qv < 0x7FFFFFFFFFFFULL)
+                strcat(tag, " (堆/系统指针?)");
+            DebugLog("[veh-heap]   +%02d: %016llX %s", k,
+                     (unsigned long long)qv, tag[0] ? tag : "");
         }
     }
     return EXCEPTION_CONTINUE_SEARCH;

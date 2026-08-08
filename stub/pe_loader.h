@@ -236,11 +236,21 @@ static inline void* resolveExportFromBase(uintptr_t moduleBase, const char* expo
             DWORD idxB = ords[i];                    // PE 规范正确下标（优先）
             DWORD idxA = (exp->Base > 0 && ords[i] >= exp->Base) ? ords[i] - exp->Base : ords[i];  // 偏移兜底
             DWORD fnRva = 0;
-            for (DWORD idx : {idxB, idxA}) {         // 先 idxB（正确），后 idxA（兜底）
-                if (idx < exp->NumberOfFunctions && funcs[idx] &&
-                    rvaInCodeSection(moduleBase, funcs[idx])) {
-                    fnRva = funcs[idx];
-                    break;
+            // CI 149（根因修复）：forwarder 检测必须【优先于】rvaInCodeSection——
+            // forwarder 项的 RVA 指向 export 目录内（.rdata）的 "DLL.Func" 转发字符串，
+            // 不在代码节。旧逻辑先要求 rvaInCodeSection（idxB 因在 .rdata 被拒）→ 兜底
+            // idxA → 解析到相邻函数。实锤：DeleteCriticalSection 是 kernel32→KERNELBASE
+            // 的 forwarder（RVA 0xA47B3 在 .rdata），被解析成相邻的 DeleteBoundaryDescriptor
+            // （RVA 0x1F630 在 .text）→ payload 锁清理调用错误函数 → 释放 DebugInfo=-1
+            // → 0xC0000374 堆损坏（CI 140-148 全链路排查最终定位）。
+            for (DWORD idx : {idxB, idxA}) {
+                if (idx < exp->NumberOfFunctions && funcs[idx]) {
+                    DWORD r = funcs[idx];
+                    if (r >= dir.VirtualAddress && r < dir.VirtualAddress + dir.Size) {
+                        fnRva = r;   // forwarder：命中，交由下方统一解析转发目标
+                        break;
+                    }
+                    if (rvaInCodeSection(moduleBase, r)) { fnRva = r; break; }
                 }
             }
             if (!fnRva) fnRva = (idxB < exp->NumberOfFunctions) ? funcs[idxB] : 0;
@@ -351,6 +361,14 @@ static bool SafeTlsMount(uintptr_t idxAddr, uintptr_t tplAddr,
             tlsIndex = TlsAlloc();
             if (tlsIndex == TLS_OUT_OF_INDEXES) return false;
             if (idxAddr) *(volatile DWORD*)idxAddr = tlsIndex;
+            // CI 142：拷贝 TLS 模板（系统加载器 LdrpInitializeTls 行为：把
+            // StartAddressOfRawData→EndAddressOfRawData 拷到每线程 TLS 块）。
+            // 零填充会让 /MT 静态 CRT 的 __acrt_thread_data 预置字段缺失
+            // （如 _pInvalidParameterHandler 默认处理函数指针=0）→ 参数校验
+            // 失败时调 0 地址 / 堆路径逻辑错乱。模板内 thread_local 对象区域
+            // 是「未构造标记 0」，拷贝后 CRT 首次访问仍正常构造，不会跳过。
+            if (tplAddr && tlsSize && tlsData)
+                memcpy(tlsData, reinterpret_cast<const void*>(tplAddr), tlsSize);
         }
         TlsSetValue(tlsIndex, tlsData);
     } __except (EXCEPTION_EXECUTE_HANDLER) {
@@ -376,8 +394,11 @@ static void MountCurrentThreadTls()
         if (TlsGetValue(static_cast<DWORD>(g_payloadTlsIndex))) return;
         void* p = VirtualAlloc(nullptr, g_payloadTlsSize, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
         if (!p) return;
-        // 零填充分配（同 SafeTlsMount，CI 103 正解）：先挂零 TLS，让 CRT 在新线程内
-        // 正常初始化 thread_local 对象；不再 memcpy 模板（避免 CRT 跳过构造）。
+        // CI 142：工作线程同样拷贝 TLS 模板（与主线程 SafeTlsMount 一致——系统
+        // 加载器 LdrpInitializeTls 行为；零填充会让 __acrt_thread_data 预置字段
+        // 缺失 → 堆路径逻辑错乱，CI 140 堆损坏嫌疑之一）。
+        if (g_payloadTlsTemplate && g_payloadTlsSize)
+            memcpy(p, reinterpret_cast<const void*>(g_payloadTlsTemplate), g_payloadTlsSize);
         TlsSetValue(static_cast<DWORD>(g_payloadTlsIndex), p);
     } __except (EXCEPTION_EXECUTE_HANDLER) {
     }
@@ -439,6 +460,11 @@ struct LoadResult {
 //   - GetModuleHandleW/A(NULL)   -> 返回 payload 基址（手动映射的镜像）
 // 非 NULL 参数一律转发真函数（stub 自身仍是已注册模块）。
 // 注意：必须放在命名空间作用域（ManualPeLoader 类外）——C++ 不允许类内嵌 namespace。
+// CI 145：诊断开关 PEARMOR_DISABLE_MODULEFAKE=1 关闭模块伪装（隔离其影响）。
+static const bool g_moduleFakeDisabled = []() {
+    char v[8] = {0};
+    return GetEnvironmentVariableA("PEARMOR_DISABLE_MODULEFAKE", v, sizeof(v)) && v[0] == '1';
+}();
 namespace ModuleFake {
     // 全局：payload 基址 + 原版文件名（Load 时设置）
     inline uintptr_t gPayloadBase = 0;
@@ -901,7 +927,8 @@ public:
                 }
                 // CI 74 模块伪装：把 payload 对“自身信息”的查询替换成伪装实现。
                 // 仅当 ModuleFake 已初始化（gPayloadBase != 0）时替换，且只针对 4 个函数名。
-                if (ModuleFake::gPayloadBase != 0) {
+                // CI 145：诊断开关 PEARMOR_DISABLE_MODULEFAKE=1 关闭伪装（隔离其影响）。
+                if (ModuleFake::gPayloadBase != 0 && !g_moduleFakeDisabled) {
                     if (fnName && fnName[0] != '?' &&
                         (strcmp(fnName, "GetModuleFileNameW") == 0 ||
                          strcmp(fnName, "GetModuleFileNameA") == 0 ||
@@ -948,8 +975,8 @@ public:
                         fnName = reinterpret_cast<const char*>(imp->Name);
                         fn = ResolveSystemImport(hMod, fnName, 0);
                     }
-                    // CI 74 模块伪装（延迟导入同样替换）
-                    if (fn && ModuleFake::gPayloadBase != 0 && fnName && fnName[0] != '?') {
+                    // CI 74 模块伪装（延迟导入同样替换）；CI 145 诊断开关关闭
+                    if (fn && ModuleFake::gPayloadBase != 0 && fnName && fnName[0] != '?' && !g_moduleFakeDisabled) {
                         if (strcmp(fnName, "GetModuleFileNameW") == 0) fn = reinterpret_cast<void*>(&ModuleFake::FakeGetModuleFileNameW);
                         else if (strcmp(fnName, "GetModuleFileNameA") == 0) fn = reinterpret_cast<void*>(&ModuleFake::FakeGetModuleFileNameA);
                         else if (strcmp(fnName, "GetModuleHandleW") == 0) fn = reinterpret_cast<void*>(&ModuleFake::FakeGetModuleHandleW);

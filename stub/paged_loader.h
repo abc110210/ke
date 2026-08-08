@@ -599,7 +599,15 @@ public:
         // 但异常无法展开 → 未捕获崩溃——必须正确搬运并注册 payload 的 .pdata 才能展开。
         // RegisterPdata 已含逐条防御校验（Begin/End/UnwindData RVA 越界则整体不注册），
         // 覆盖链接器生成的全部条目，对真实目标的完整 .pdata 安全。
-        ManualPeLoader::RegisterPdata(workBase, opt);
+        // CI 145：诊断开关 PEARMOR_DISABLE_PDATA=1 不注册展开表（隔离 SEH 展开影响）
+        static bool pdataDisabled = []() {
+            char v[8] = {0};
+            return GetEnvironmentVariableA("PEARMOR_DISABLE_PDATA", v, sizeof(v)) && v[0] == '1';
+        }();
+        if (pdataDisabled)
+            DebugLog("[loader] .pdata 注册跳过（PEARMOR_DISABLE_PDATA=1 诊断）");
+        else
+            ManualPeLoader::RegisterPdata(workBase, opt);
 
         imageSize = sizeOfImage;
 
@@ -717,11 +725,20 @@ public:
         dumpMon.Init();
 
         // ---- 启动监控线程（重加密 + 钩子扫描 + 自校验） ----
-        DebugLog("[loader] ckpt: 启动监控线程前");
+        // CI 145：诊断开关 PEARMOR_DISABLE_MONITOR=1 不启动监控线程（隔离其影响）
+        static bool monitorDisabled = []() {
+            char v[8] = {0};
+            return GetEnvironmentVariableA("PEARMOR_DISABLE_MONITOR", v, sizeof(v)) && v[0] == '1';
+        }();
+        DebugLog("[loader] ckpt: 启动监控线程前%s", monitorDisabled ? " (PEARMOR_DISABLE_MONITOR=1 跳过)" : "");
         stopMonitor = false;
-        monitorThread = CreateThread(nullptr, 0, &PagedLoader::MonitorThreadProc,
-                                     this, 0, nullptr);
-        DebugLog("[loader] ckpt: 监控线程已启动 hwnd=%p", (void*)monitorThread);
+        if (!monitorDisabled) {
+            monitorThread = CreateThread(nullptr, 0, &PagedLoader::MonitorThreadProc,
+                                         this, 0, nullptr);
+            DebugLog("[loader] ckpt: 监控线程已启动 hwnd=%p", (void*)monitorThread);
+        } else {
+            DebugLog("[loader] ckpt: 监控线程跳过（诊断）");
+        }
 
         outEntryRva = opt.AddressOfEntryPoint;
         DebugLog("[loader] Load 成功: pages=%u nonContig=%d (kNonContig=%d) entryRva=0x%llX",
