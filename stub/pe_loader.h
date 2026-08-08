@@ -307,6 +307,10 @@ static size_t    g_payloadTlsSize  = 0;
 // → 真实 AV。TlsMountWrapper 必须为【每个新线程】从模板分配独立副本。
 static uintptr_t g_payloadTlsTemplate = 0;
 
+// CI 141：payload CRT 模式——导入表含 vcruntime140.dll / ucrtbase.dll = /MD 动态 CRT；
+// 否则 /MT 静态 CRT。TLS 挂载必须按模式区分（详见 SafeTlsMount 注释）。
+static bool g_payloadUsesDynamicCrt = false;
+
 // 独立 SEH 辅助：TLS 数据挂载——分配空闲 TLS 槽 + 拷贝模板 + 写入 TEB 槽。
 // 参数全 POD、内部才用 __try（CI 37 教训：__try 不能进类内成员函数，否则 C2712；
 // 本函数放命名空间作用域）。x64: TEB+0x58=ThreadLocalStoragePointer（指向槽数组），
@@ -330,13 +334,24 @@ static bool SafeTlsMount(uintptr_t idxAddr, uintptr_t tplAddr,
 {
     DWORD tlsIndex = 0;
     __try {
-        // CI 104→回退为 CI 103 正解：【零填充分配】不拷贝 TLS 模板。
-        // VirtualAlloc 分配的 tlsData 已零填充。CRT 的 mainCRTStartup 读 TlsGetValue
-        // 看到「TLS 已挂载但数据全零」→ 执行正常 TLS 初始化（拷贝模板 + 运行构造
-        // 回调 + 初始化 thread_local 对象）。若 memcpy 模板则 CRT 误判「已初始化」
-        // → 跳过构造 → thread_local 对象（如 obf::w 的 32 槽缓冲）未构造 → 解码垃圾。
-        // 读 vcruntime140.dll 已分配的 _tls_index（FixImports 后已指向正确地址）
-        if (idxAddr) tlsIndex = *(volatile DWORD*)idxAddr;
+        if (g_payloadUsesDynamicCrt) {
+            // /MD（CI 102 正解，勿改写）：_tls_index 由 vcruntime140.dll 持有且已被
+            // 系统加载器分配，FixImports 已把 IAT 指向它；读现有值直接挂槽。若用
+            // TlsAlloc 新槽写回会覆盖 vcruntime140.dll 的 _tls_index → CRT 读旧值、
+            // 我们挂新值 → 两套 index 错位 → gs:[0x58] 数组[旧index]=null。
+            if (idxAddr) tlsIndex = *(volatile DWORD*)idxAddr;
+        } else {
+            // /MT（CI 141 修复）：payload 不导入 vcruntime140.dll，其 _tls_index
+            // 链接初值 0 =「从未被系统加载器分配」。直接读 0 会把 stub（主 exe，
+            // 同为 /MT 静态 CRT，系统已为它分配槽 0）的 TLS 槽覆盖成 payload 数据
+            // → stub 静态 CRT 线程数据错乱 → 堆损坏（CI 140 实锤：崩溃在 payload
+            // _cexit 清理期，两轮不同编译选项逐字节同栈）。正解：TlsAlloc 分配新槽
+            //（与系统加载器共用进程 TLS 位图，天然避开 stub/系统 DLL 已占槽），
+            // 并写回 payload 的 _tls_index，保证 payload CRT 读到的 index 与挂载一致。
+            tlsIndex = TlsAlloc();
+            if (tlsIndex == TLS_OUT_OF_INDEXES) return false;
+            if (idxAddr) *(volatile DWORD*)idxAddr = tlsIndex;
+        }
         TlsSetValue(tlsIndex, tlsData);
     } __except (EXCEPTION_EXECUTE_HANDLER) {
         return false;
@@ -844,6 +859,12 @@ public:
         auto* desc = reinterpret_cast<IMAGE_IMPORT_DESCRIPTOR*>(base + dir.VirtualAddress);
         for (; desc->Name; desc++) {
             const char* dllNameA = reinterpret_cast<const char*>(base + desc->Name);
+
+            // CI 141：检测 payload CRT 模式（/MD 导入 vcruntime140.dll / ucrtbase.dll；
+            // /MT 静态链接则不导入——SafeTlsMount 据此决定 TLS 槽分配策略）
+            if (!g_payloadUsesDynamicCrt &&
+                (strstr(dllNameA, "vcruntime140") || strstr(dllNameA, "ucrtbase")))
+                g_payloadUsesDynamicCrt = true;
 
             // 转宽字符
             wchar_t dllNameW[64];
