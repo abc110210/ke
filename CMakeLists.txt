@@ -10,7 +10,10 @@ add_executable(packer
 )
 target_compile_definitions(packer PRIVATE _CRT_SECURE_NO_WARNINGS NOMINMAX)
 if(MSVC)
-    target_compile_options(packer PRIVATE /O2 /W3)
+    # /utf-8：源码 UTF-8 无 BOM，中文系统（代码页 936 双字节）下缺此选项会把
+    # UTF-8 中文误组合成 GBK 字符吞掉后续字节 → 注释/字符串语法错乱（C2001/C2447）。
+    # CI 英文系统 1252 单字节误读不破坏结构才侥幸通过；本地中文系统必炸（2026-08-08 实锤）。
+    target_compile_options(packer PRIVATE /O2 /W3 /utf-8)
 endif()
 set_target_properties(packer PROPERTIES
     OUTPUT_NAME "pearmor-packer"
